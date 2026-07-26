@@ -1,0 +1,7 @@
+.devspace/
+tmp/
+# Local Codex/agent run logs
+.codex/
+local_memos/
+__pycache__/
+*.py[cod]

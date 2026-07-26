@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arcaia</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans JP", sans-serif;
+      --arcaia-accent: #0f6fff;
+      --arcaia-accent-hover: #005ce6;
+      --arcaia-page: #f4f6f8;
+      --arcaia-surface: #ffffff;
+      --arcaia-header-surface: #ffffff;
+      --arcaia-section-surface: #ffffff;
+      --arcaia-surface-soft: #f7f8fa;
+      --arcaia-border: #dde1e6;
+      --arcaia-divider: #e8eaed;
+      --arcaia-section-band: #eaf3ff;
+      --arcaia-section-border: #cfdff2;
+      --arcaia-text: #16181d;
+      --arcaia-muted: #6f7782;
+      --arcaia-disabled: #aeb4bc;
+      --arcaia-success: #0f9f6e;
+      --arcaia-danger: #d14343;
+      --arcaia-control-bg: #ffffff;
+      --arcaia-control-border: #ccd1d7;
+      --arcaia-control-disabled-bg: #f4f5f6;
+      --arcaia-control-disabled-border: #dfe2e6;
+      --arcaia-toggle-off: #c7cbd1;
+      --arcaia-toggle-on: #0f6fff;
+      --arcaia-toggle-knob: #ffffff;
+      --arcaia-icon: #20242a;
+      --arcaia-sub-setting-line: #d9e7ff;
+      --arcaia-range-track: #cfd3d8;
+      --arcaia-output: #353a42;
+      --arcaia-focus-ring: rgba(15, 111, 255, 0.35);
+      --arcaia-focus-soft: rgba(15, 111, 255, 0.12);
+      --arcaia-grain-opacity: 0;
+      --arcaia-control-height: 28px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --arcaia-accent: #4773b7;
+        --arcaia-accent-hover: #5683c6;
+        --arcaia-page: #2a2d31;
+        --arcaia-surface: #1b1f23;
+        --arcaia-header-surface: #1c2024;
+        --arcaia-section-surface: #20252a;
+        --arcaia-surface-soft: #252b31;
+        --arcaia-border: #353c43;
+        --arcaia-divider: #2e353b;
+        --arcaia-section-band: #1d2227;
+        --arcaia-section-border: #353c43;
+        --arcaia-text: #e5e7eb;
+        --arcaia-muted: #a7adb4;
+        --arcaia-disabled: #747b84;
+        --arcaia-success: #22c55e;
+        --arcaia-danger: #f87171;
+        --arcaia-control-bg: #282e34;
+        --arcaia-control-border: #404850;
+        --arcaia-control-disabled-bg: #2b3035;
+        --arcaia-control-disabled-border: #3b4249;
+        --arcaia-toggle-off: #4a5158;
+        --arcaia-toggle-on: #4f6f9f;
+        --arcaia-toggle-knob: #d9dee5;
+        --arcaia-icon: #a7adb4;
+        --arcaia-sub-setting-line: #59616a;
+        --arcaia-range-track: #505861;
+        --arcaia-output: #d8dce1;
+        --arcaia-focus-ring: rgba(71, 115, 183, 0.42);
+        --arcaia-focus-soft: rgba(71, 115, 183, 0.16);
+        --arcaia-grain-opacity: 0.035;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      width: 400px;
+      max-height: 600px;
+      margin: 0;
+      padding: 0;
+      overflow-x: hidden;
+      overflow-y: auto;
+      background: var(--arcaia-page);
+      color: var(--arcaia-text);
+    }
+
+    button,
+    input,
+    select { font: inherit; }
+
+    button { color: inherit; }
+
+    .options-panel {
+      position: relative;
+      isolation: isolate;
+      width: 100%;
+      min-height: 100%;
+      padding-bottom: 10px;
+      background: var(--arcaia-page);
+    }
+
+    .options-panel::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: 20;
+      pointer-events: none;
+      opacity: var(--arcaia-grain-opacity);
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' viewBox='0 0 180 180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.58'/%3E%3C/svg%3E");
+      background-repeat: repeat;
+      mix-blend-mode: soft-light;
+    }
+
+    .extension-state {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+      align-items: center;
+      gap: 9px;
+      min-height: 54px;
+      margin: 10px 12px;
+      padding: 8px 10px 8px 12px;
+      border: 1px solid var(--arcaia-border);
+      border-radius: 11px;
+      background: var(--arcaia-header-surface);
+    }
+
+    .master-switch-label {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      justify-self: end;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .master-title {
+      font-size: 15px;
+      font-weight: 760;
+      white-space: nowrap;
+    }
+
+    .mode-status {
+      min-width: 0;
+      overflow: hidden;
+      color: var(--arcaia-muted);
+      font-size: 11px;
+      line-height: 1.25;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .menu-version {
+      color: var(--arcaia-muted);
+      font-size: 10px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+
+    .save-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--arcaia-muted);
+      font-size: 10px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+
+    .save-state[hidden] { display: none; }
+
+    .save-state-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--arcaia-success);
+    }
+
+    .save-state[data-state="saving"] .save-state-dot {
+      background: var(--arcaia-accent);
+      animation: save-pulse 720ms ease-in-out infinite alternate;
+    }
+
+    .save-state[data-state="error"] { color: var(--arcaia-danger); }
+    .save-state[data-state="error"] .save-state-dot { background: var(--arcaia-danger); }
+
+    @keyframes save-pulse { to { opacity: 0.35; transform: scale(0.7); } }
+
+    .menu {
+      display: grid;
+      gap: 10px;
+      padding: 0 12px;
+    }
+
+    .settings-section {
+      overflow: hidden;
+      border: 1px solid var(--arcaia-section-border);
+      border-radius: 10px;
+      background: var(--arcaia-section-surface);
+    }
+
+    .section-band {
+      display: grid;
+      grid-template-columns: 22px minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+      min-height: 35px;
+      padding: 6px 11px;
+      border-bottom: 1px solid var(--arcaia-section-border);
+      background: var(--arcaia-section-band);
+    }
+
+    .section-icon {
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      color: var(--arcaia-icon);
+    }
+
+    .section-icon svg {
+      width: 18px;
+      height: 18px;
+    }
+
+    .section-copy {
+      min-width: 0;
+    }
+
+    .section-title {
+      font-size: 12px;
+      font-weight: 750;
+      line-height: 1.25;
+    }
+
+    .settings-stack {
+      background: var(--arcaia-section-surface);
+    }
+
+    .switch-row,
+    .select-row,
+    .sound-control-row {
+      min-height: 35px;
+      border-top: 1px solid var(--arcaia-divider);
+    }
+
+    .settings-stack > :first-child { border-top: 0; }
+
+    .switch-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-areas: "title hint toggle";
+      align-items: center;
+      column-gap: 9px;
+      padding: 0 14px;
+      transition: background 120ms ease, opacity 120ms ease;
+    }
+
+    .switch-row:not(.is-disabled):hover,
+    .switch-row:not(.is-disabled):focus-within,
+    .select-row:not(.is-disabled):hover,
+    .select-row:not(.is-disabled):focus-within,
+    .sound-control-row:not(.is-disabled):hover,
+    .sound-control-row:not(.is-disabled):focus-within {
+      background: var(--arcaia-surface-soft);
+    }
+
+    .switch-label { display: contents; }
+
+    .switch-title {
+      grid-area: title;
+      min-width: 0;
+      overflow: hidden;
+      font-size: 12px;
+      font-weight: 520;
+      line-height: 1.25;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .switch-hint {
+      grid-area: hint;
+      max-width: 116px;
+      overflow: hidden;
+      color: var(--arcaia-muted);
+      font-size: 9px;
+      line-height: 1.2;
+      text-align: right;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .switch-input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .switch-track {
+      position: relative;
+      display: inline-block;
+      flex: 0 0 auto;
+      width: 34px;
+      height: 20px;
+      border: 1px solid var(--arcaia-toggle-off);
+      border-radius: 999px;
+      background: var(--arcaia-toggle-off);
+      cursor: pointer;
+      transition: background 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+    }
+
+    .switch-track { grid-area: toggle; }
+
+    .switch-track::after {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--arcaia-toggle-knob);
+      transition: transform 140ms cubic-bezier(.2,.8,.2,1);
+    }
+
+    .master-switch-track {
+      position: relative;
+      display: inline-block;
+      flex: 0 0 auto;
+      width: 48px;
+      height: 28px;
+      border: 1px solid var(--arcaia-toggle-off);
+      border-radius: 999px;
+      background: var(--arcaia-toggle-off);
+      cursor: pointer;
+      transition: background 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+    }
+
+    .master-switch-track::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: var(--arcaia-toggle-knob);
+      transition: transform 140ms cubic-bezier(.2,.8,.2,1);
+    }
+
+    .switch-input:checked + .switch-track,
+    .switch-input:checked + .master-switch-track {
+      border-color: var(--arcaia-toggle-on);
+      background: var(--arcaia-toggle-on);
+    }
+
+    .switch-input:checked + .switch-track::after { transform: translateX(14px); }
+    .switch-input:checked + .master-switch-track::after { transform: translateX(20px); }
+
+    .switch-input:focus-visible + .switch-track,
+    .switch-input:focus-visible + .master-switch-track {
+      outline: 2px solid var(--arcaia-focus-ring);
+      outline-offset: 2px;
+    }
+
+    .switch-row.sub-setting,
+    .select-row.sub-setting {
+      position: relative;
+      padding-left: 34px;
+    }
+
+    .switch-row.sub-setting::before,
+    .select-row.sub-setting::before {
+      content: "";
+      position: absolute;
+      top: 8px;
+      bottom: 8px;
+      left: 21px;
+      width: 2px;
+      border-radius: 999px;
+      background: var(--arcaia-sub-setting-line);
+    }
+
+    .select-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      padding: 0 14px;
+      transition: background 120ms ease, opacity 120ms ease;
+    }
+
+    .setting-copy {
+      display: grid;
+      min-width: 0;
+      gap: 1px;
+    }
+
+    .setting-title {
+      overflow: hidden;
+      font-size: 12px;
+      font-weight: 520;
+      line-height: 1.25;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .setting-hint { display: none; }
+
+    select {
+      min-width: 76px;
+      height: var(--arcaia-control-height);
+      padding: 0 28px 0 10px;
+      border: 1px solid var(--arcaia-control-border);
+      border-radius: 7px;
+      appearance: none;
+      background:
+        linear-gradient(45deg, transparent 50%, var(--arcaia-muted) 50%) calc(100% - 13px) 13px / 5px 5px no-repeat,
+        linear-gradient(135deg, var(--arcaia-muted) 50%, transparent 50%) calc(100% - 9px) 13px / 5px 5px no-repeat,
+        var(--arcaia-control-bg);
+      color: var(--arcaia-text);
+      font-size: 11px;
+      cursor: pointer;
+      transition: border-color 120ms ease, box-shadow 120ms ease;
+    }
+
+    select:hover,
+    select:focus-visible {
+      border-color: var(--arcaia-accent);
+      box-shadow: 0 0 0 2px var(--arcaia-focus-soft);
+      outline: none;
+    }
+
+    select:disabled {
+      border-color: var(--arcaia-control-disabled-border);
+      background-color: var(--arcaia-control-disabled-bg);
+      color: var(--arcaia-disabled);
+      cursor: not-allowed;
+    }
+
+    .sound-control-row {
+      display: grid;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 4px 14px;
+      font-size: 12px;
+      transition: background 120ms ease, opacity 120ms ease;
+    }
+
+    .sound-control-row[data-sound-select-row] {
+      grid-template-columns: minmax(0, 1fr) 144px 58px;
+    }
+
+    .sound-control-row[data-sound-volume-row] {
+      grid-template-columns: minmax(0, 1fr) 18px minmax(100px, 1fr) 38px;
+    }
+
+    .sound-control-row > label {
+      min-width: 0;
+      overflow: hidden;
+      font-size: 12px;
+      font-weight: 520;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .sound-select-wrap { min-width: 0; }
+
+    .sound-select-icon,
+    .sound-select-chevron { display: none; }
+
+    .sound-control-row select {
+      width: 100%;
+      min-width: 0;
+    }
+
+    #assistantCompletionSoundTest {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      height: var(--arcaia-control-height);
+      padding: 0 8px;
+      border: 1px solid var(--arcaia-accent);
+      border-radius: 7px;
+      background: var(--arcaia-control-bg);
+      color: var(--arcaia-accent);
+      font-size: 10px;
+      font-weight: 750;
+      cursor: pointer;
+      transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+    }
+
+    #assistantCompletionSoundTest:hover,
+    #assistantCompletionSoundTest:focus-visible,
+    #assistantCompletionSoundTest.is-playing {
+      border-color: var(--arcaia-accent-hover);
+      background: var(--arcaia-accent);
+      color: var(--arcaia-toggle-knob);
+      outline: none;
+    }
+
+    #assistantCompletionSoundTest .test-icon {
+      display: grid;
+      place-items: center;
+      width: 12px;
+      height: 12px;
+    }
+
+    #assistantCompletionSoundTest svg { width: 11px; height: 11px; }
+
+    .volume-icon {
+      display: grid;
+      place-items: center;
+      color: var(--arcaia-icon);
+    }
+
+    .volume-icon svg { width: 16px; height: 16px; }
+
+    input[type="range"] {
+      --range-progress: 50%;
+      width: 100%;
+      height: 24px;
+      appearance: none;
+      background: transparent;
+      cursor: pointer;
+    }
+
+    input[type="range"]::-webkit-slider-runnable-track {
+      height: 3px;
+      border-radius: 999px;
+      background: linear-gradient(90deg,
+        var(--arcaia-accent) 0,
+        var(--arcaia-accent) var(--range-progress),
+        var(--arcaia-range-track) var(--range-progress),
+        var(--arcaia-range-track) 100%);
+    }
+
+    input[type="range"]::-webkit-slider-thumb {
+      width: 12px;
+      height: 12px;
+      margin-top: -4.5px;
+      border: 2px solid var(--arcaia-accent);
+      border-radius: 50%;
+      appearance: none;
+      background: var(--arcaia-toggle-knob);
+    }
+
+    input[type="range"]:focus-visible { outline: none; }
+    input[type="range"]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px var(--arcaia-focus-soft); }
+
+    output {
+      color: var(--arcaia-output);
+      font-size: 11px;
+      font-weight: 650;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+
+    .is-disabled { opacity: 0.48; }
+    .is-disabled .switch-title,
+    .is-disabled .switch-track,
+    .is-disabled select,
+    .is-disabled input,
+    .is-disabled button { cursor: not-allowed; }
+
+    button:disabled {
+      border-color: var(--arcaia-control-disabled-border) !important;
+      background: var(--arcaia-control-disabled-bg) !important;
+      color: var(--arcaia-disabled) !important;
+      cursor: not-allowed !important;
+    }
+  </style>
+</head>
+<body>
+  <section id="menuView" class="options-panel">
+    <div class="extension-state">
+      <span class="master-title">Arcaia</span>
+      <span id="operationModeStatus" class="mode-status" data-mode="normal"></span>
+      <span class="menu-version">v0.1.275</span>
+      <span id="settingsSaveState" class="save-state" data-state="idle" aria-live="polite" hidden><span class="save-state-dot" aria-hidden="true"></span><span></span></span>
+      <label class="master-switch-label" for="arcaiaEnabledToggle" aria-label="Arcaia全体を有効にする">
+        <input id="arcaiaEnabledToggle" class="switch-input" type="checkbox" role="switch" checked>
+        <span class="master-switch-track" aria-hidden="true"></span>
+      </label>
+    </div>
+
+    <div class="menu">
+      <section class="settings-section" data-section="display">
+        <div class="section-band">
+          <span class="section-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+          <span class="section-copy"><span class="section-title">表示</span></span>
+        </div>
+        <div class="settings-stack">
+          <div class="switch-row" data-feature-row="liteView">
+            <label class="switch-label" for="liteViewToggle"><input id="liteViewToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">Recent View</span></label>
+            <span class="switch-hint">直近ターン</span>
+          </div>
+          <label class="select-row sub-setting" for="liteTurnCountSelect">
+            <span class="setting-copy"><span class="setting-title">ターン数</span><span class="setting-hint">Recent Viewで保持する直近ターン数</span></span>
+            <select id="liteTurnCountSelect"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option></select>
+          </label>
+          <div class="switch-row sub-setting" data-feature-row="liteImages" title="Recent Viewの保持対象ターン内で画像を表示します。">
+            <label class="switch-label" for="liteShowImagesToggle"><input id="liteShowImagesToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">画像を表示</span></label>
+            <span id="liteShowImagesHint" class="switch-hint">画像表示</span>
+          </div>
+          <div class="switch-row" data-feature-row="messageTimestamps">
+            <label class="switch-label" for="messageTimestampsToggle"><input id="messageTimestampsToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">メッセージ日時</span></label>
+            <span class="switch-hint">表示</span>
+          </div>
+          <div class="switch-row" data-feature-row="modelDecoration">
+            <label class="switch-label" for="modelDecorationToggle"><input id="modelDecorationToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">モデル表示装飾</span></label>
+            <span class="switch-hint">GPT-5.6</span>
+          </div>
+          <div class="switch-row" data-feature-row="blockCollapser">
+            <label class="switch-label" for="blockCollapserToggle"><input id="blockCollapserToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">長いブロックを折りたたむ</span></label>
+            <span class="switch-hint">コード / Markdown</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-section" data-section="operation">
+        <div class="section-band">
+          <span class="section-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 8h18c0-1-3-1-3-8"/><path d="M10 20h4"/></svg></span>
+          <span class="section-copy"><span class="section-title">操作・通知</span></span>
+        </div>
+        <div class="settings-stack">
+          <div class="switch-row" data-feature-row="ctrlEnterSend">
+            <label class="switch-label" for="ctrlEnterSendToggle"><input id="ctrlEnterSendToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">Ctrl+Enterで送信</span></label>
+            <span class="switch-hint">Enter送信 OFF</span>
+          </div>
+          <div class="switch-row" data-feature-row="loadingTitle">
+            <label class="switch-label" for="loadingTitleToggle"><input id="loadingTitleToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">回答中のタイトル表示</span></label>
+            <span class="switch-hint">⋯</span>
+          </div>
+          <div class="switch-row" data-feature-row="completionSound" title="ChatGPT回答完了時に通知音を鳴らします。">
+            <label class="switch-label" for="assistantCompletionSoundToggle"><input id="assistantCompletionSoundToggle" class="switch-input" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span><span class="switch-title">回答完了通知音</span></label>
+            <span id="assistantCompletionSoundHint" class="switch-hint">OFF</span>
+          </div>
+          <div class="sound-control-row is-disabled" data-sound-select-row>
+            <label for="assistantCompletionSoundSelect">通知音</label>
+            <span class="sound-select-wrap">
+              <span class="sound-select-icon" aria-hidden="true"></span>
+              <select id="assistantCompletionSoundSelect" disabled>
+                <option value="classic_chime" selected>通知音1</option>
+                <option value="soft_chime">通知音2</option>
+              </select>
+              <span class="sound-select-chevron" aria-hidden="true"></span>
+            </span>
+            <button id="assistantCompletionSoundTest" type="button" title="選択中の通知音を現在の音量で再生します。" disabled><span class="test-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="m8 5 11 7-11 7z"/></svg></span><span class="test-label">試聴</span></button>
+          </div>
+          <div class="sound-control-row is-disabled" data-sound-volume-row>
+            <label for="assistantCompletionSoundVolume">音量</label>
+            <span class="volume-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 10v4h4l5 4V6L8 10z"/><path d="M16 9a4 4 0 0 1 0 6M18.5 6.5a8 8 0 0 1 0 11"/></svg></span>
+            <input id="assistantCompletionSoundVolume" type="range" min="0" max="100" step="1" value="50" disabled>
+            <output id="assistantCompletionSoundVolumeHint" for="assistantCompletionSoundVolume">50%</output>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-section" data-section="sidebar">
+        <div class="section-band">
+          <span class="section-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 3v18M11 8h7M11 12h7M11 16h5"/></svg></span>
+          <span class="section-copy"><span class="section-title">サイドバー</span></span>
+        </div>
+        <div class="settings-stack">
+          <div class="switch-row" data-feature-row="pinnedSort">
+            <label class="switch-label" for="pinnedSortToggle"><input id="pinnedSortToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">ピン留め並べ替え</span></label>
+            <span class="switch-hint">範囲内のみ</span>
+          </div>
+          <div class="switch-row" data-feature-row="pinnedIcons">
+            <label class="switch-label" for="pinnedIconsToggle"><input id="pinnedIconsToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">ピン留めアイコン変更</span></label>
+            <span class="switch-hint">チャットのみ</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-section" data-section="save">
+        <div class="section-band">
+          <span class="section-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 3.5h8l4 4V20H6z"/><path d="M14 3.5V8h4M9 13h6M9 16h4"/></svg></span>
+          <span class="section-copy"><span class="section-title">保存・出力</span></span>
+        </div>
+        <div class="settings-stack">
+          <div class="switch-row" data-feature-row="turnMarkdownButtons">
+            <label class="switch-label" for="turnMarkdownButtonsToggle"><input id="turnMarkdownButtonsToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">各ターン</span></label>
+            <span class="switch-hint">Markdown保存</span>
+          </div>
+          <div class="switch-row" data-feature-row="headerMarkdownButton">
+            <label class="switch-label" for="headerMarkdownButtonToggle"><input id="headerMarkdownButtonToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">ヘッダー（全部）</span></label>
+            <span class="switch-hint">会話全体を保存</span>
+          </div>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>

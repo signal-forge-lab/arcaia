@@ -1,0 +1,63 @@
+{
+  "manifest_version": 3,
+  "name": "Arcaia ChatGPT Toolkit",
+  "short_name": "Arcaia",
+  "version": "0.1.275",
+  "description": "Customize ChatGPT with Recent View, timestamps, pinned chat icons, and Markdown export.",
+  "action": {
+    "default_title": "Arcaia ChatGPT Toolkit",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/toolbar/icon16.png",
+      "32": "icons/toolbar/icon32.png",
+      "48": "icons/toolbar/icon48.png",
+      "128": "icons/toolbar/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/main/icon16.png",
+    "32": "icons/main/icon32.png",
+    "48": "icons/main/icon48.png",
+    "128": "icons/main/icon128.png"
+  },
+  "permissions": [
+    "activeTab",
+    "offscreen",
+    "scripting",
+    "tabs",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": [
+    "https://chatgpt.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "content_toolbar.js",
+        "content_diagnostics.js",
+        "content_markdown.js",
+        "content_filename.js",
+        "content_model_selector.js",
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "injected-main.js"
+      ],
+      "matches": [
+        "https://chatgpt.com/*"
+      ]
+    }
+  ]
+}

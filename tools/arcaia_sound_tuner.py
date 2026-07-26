@@ -1,0 +1,366 @@
+"""Arcaia answer-completion sound tuner.
+
+Windows-only preview uses the standard-library winsound module.
+No third-party packages are required.
+
+Run from the repository root:
+
+    py tools/arcaia_sound_tuner.py
+
+The exported JavaScript preset values are shaped to be copied into
+offscreen.js COMPLETION_SOUND_PRESETS.soft_chime.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import math
+import struct
+import sys
+import tempfile
+import wave
+from dataclasses import dataclass, asdict
+from io import BytesIO
+from pathlib import Path
+from tkinter import BOTH, END, HORIZONTAL, LEFT, RIGHT, Button, Frame, Label, StringVar, Tk, filedialog, messagebox
+from tkinter import Text
+from tkinter.ttk import Combobox, Scale
+
+try:
+    import winsound
+except ImportError:  # pragma: no cover - Windows target only.
+    winsound = None
+
+
+SAMPLE_RATE = 8000
+MAX_INT16 = 32767
+
+
+@dataclass
+class SoundParams:
+    waveform: str = "sine"
+    duration_seconds: float = 0.225
+    master_volume: float = 0.066
+    note1_at_ms: float = 0.0
+    note1_frequency: float = 880.0
+    note1_duration_ms: float = 90.0
+    note1_gain: float = 0.75
+    note2_at_ms: float = 95.0
+    note2_frequency: float = 1175.0
+    note2_duration_ms: float = 130.0
+    note2_gain: float = 0.75
+    attack_ms: float = 10.0
+    release_ms: float = 55.0
+    stereo_spread: float = 0.0
+    noise_amount: float = 0.0
+    soften: float = 0.0
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def waveform_value(kind: str, phase: float) -> float:
+    sine = math.sin(phase)
+    if kind == "sine":
+        return sine
+    if kind == "triangle":
+        return 2.0 * math.asin(sine) / math.pi
+    if kind == "square-soft":
+        return math.tanh(2.8 * sine)
+    if kind == "bell-soft":
+        return 0.78 * sine + 0.18 * math.sin(phase * 2.01) + 0.04 * math.sin(phase * 3.03)
+    return sine
+
+
+def envelope(local_t: float, duration: float, attack: float, release: float) -> float:
+    if local_t < 0 or local_t > duration:
+        return 0.0
+    attack = min(max(attack, 0.001), duration / 2.0)
+    release = min(max(release, 0.001), duration / 2.0)
+    if local_t < attack:
+        return local_t / attack
+    if local_t > duration - release:
+        return max(0.0, (duration - local_t) / release)
+    return 1.0
+
+
+def deterministic_noise(sample_index: int) -> float:
+    # Tiny deterministic pseudo-random value in [-1, 1].
+    x = (sample_index * 1103515245 + 12345) & 0x7FFFFFFF
+    return (x / 0x3FFFFFFF) - 1.0
+
+
+def synthesize_samples(params: SoundParams, sample_rate: int = SAMPLE_RATE) -> list[tuple[int, int]]:
+    duration_seconds = clamp(params.duration_seconds, 0.05, 2.0)
+    sample_count = max(1, math.ceil(sample_rate * duration_seconds))
+    attack = params.attack_ms / 1000.0
+    release = params.release_ms / 1000.0
+    notes = [
+        (params.note1_at_ms / 1000.0, params.note1_frequency, params.note1_duration_ms / 1000.0, params.note1_gain),
+        (params.note2_at_ms / 1000.0, params.note2_frequency, params.note2_duration_ms / 1000.0, params.note2_gain),
+    ]
+    stereo_spread = clamp(params.stereo_spread, 0.0, 1.0)
+    noise_amount = clamp(params.noise_amount, 0.0, 1.0)
+    soften = clamp(params.soften, 0.0, 1.0)
+    master = clamp(params.master_volume, 0.0, 1.0)
+
+    result: list[tuple[int, int]] = []
+    previous = 0.0
+    for sample_index in range(sample_count):
+        t = sample_index / sample_rate
+        amplitude = 0.0
+        pan = 0.0
+        for note_index, (start, frequency, length, gain) in enumerate(notes):
+            local_t = t - start
+            env = envelope(local_t, max(0.01, length), attack, release)
+            if not env:
+                continue
+            phase = 2.0 * math.pi * frequency * local_t
+            value = waveform_value(params.waveform, phase) * gain * env
+            amplitude += value
+            pan += ((-1.0 if note_index == 0 else 1.0) * stereo_spread * value * 0.18)
+        if noise_amount:
+            amplitude += deterministic_noise(sample_index) * noise_amount * 0.04
+        amplitude = clamp(amplitude, -1.0, 1.0)
+        if soften:
+            amplitude = previous * soften + amplitude * (1.0 - soften)
+            previous = amplitude
+        left = clamp((amplitude - pan) * master, -1.0, 1.0)
+        right = clamp((amplitude + pan) * master, -1.0, 1.0)
+        result.append((int(left * MAX_INT16), int(right * MAX_INT16)))
+    return result
+
+
+def make_wav_bytes(params: SoundParams, sample_rate: int = SAMPLE_RATE) -> bytes:
+    samples = synthesize_samples(params, sample_rate)
+    buffer = BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(2)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"".join(struct.pack("<hh", left, right) for left, right in samples))
+    return buffer.getvalue()
+
+
+def make_js_preset(params: SoundParams) -> str:
+    preset = {
+        "id": "soft_chime",
+        "sampleRate": SAMPLE_RATE,
+        "durationSeconds": round(params.duration_seconds, 3),
+        "volume": round(params.master_volume, 4),
+        "waveform": params.waveform,
+        "attackMs": round(params.attack_ms, 1),
+        "releaseMs": round(params.release_ms, 1),
+        "stereoSpread": round(params.stereo_spread, 3),
+        "noiseAmount": round(params.noise_amount, 3),
+        "soften": round(params.soften, 3),
+        "notes": [
+            {
+                "atMs": round(params.note1_at_ms, 1),
+                "frequency": round(params.note1_frequency, 2),
+                "durationMs": round(params.note1_duration_ms, 1),
+                "gain": round(params.note1_gain, 3),
+            },
+            {
+                "atMs": round(params.note2_at_ms, 1),
+                "frequency": round(params.note2_frequency, 2),
+                "durationMs": round(params.note2_duration_ms, 1),
+                "gain": round(params.note2_gain, 3),
+            },
+        ],
+    }
+    return json.dumps(preset, ensure_ascii=False, indent=2)
+
+
+class SoundTunerApp:
+    def __init__(self) -> None:
+        self.root = Tk()
+        self.root.title("Arcaia Sound Tuner")
+        self.root.geometry("980x760")
+        self.waveform = StringVar(value="sine")
+        self.scales: dict[str, Scale] = {}
+        self.labels: dict[str, Label] = {}
+        self.status = StringVar(value="Ready")
+        self.preview_file_path: Path | None = None
+
+        self._build_ui()
+        self._update_output()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _add_slider(self, parent: Frame, key: str, title: str, from_: float, to: float, default: float, resolution: float = 1.0) -> None:
+        row = Frame(parent)
+        row.pack(fill="x", padx=6, pady=2)
+        Label(row, text=title, width=26, anchor="w").pack(side=LEFT)
+        value_label = Label(row, text="", width=10, anchor="e")
+        value_label.pack(side=RIGHT)
+        scale = Scale(row, from_=from_, to=to, orient=HORIZONTAL, command=lambda _value: self._on_change())
+        scale.pack(fill="x", expand=True, padx=8)
+        scale.set(default)
+        self.scales[key] = scale
+        self.labels[key] = value_label
+        scale.configure(length=560)
+        # ttk Scale does not support resolution; round on read/output.
+        setattr(scale, "_arcaia_resolution", resolution)
+
+    def _build_ui(self) -> None:
+        top = Frame(self.root)
+        top.pack(fill="x", padx=8, pady=8)
+        Button(top, text="▶ Preview", command=self.preview).pack(side=LEFT, padx=4)
+        Button(top, text="Export WAV", command=self.export_wav).pack(side=LEFT, padx=4)
+        Button(top, text="Save preset JSON", command=self.save_json).pack(side=LEFT, padx=4)
+        Button(top, text="Reset original", command=self.reset_original).pack(side=LEFT, padx=4)
+        Label(top, textvariable=self.status, anchor="w").pack(side=LEFT, padx=14)
+
+        wf = Frame(self.root)
+        wf.pack(fill="x", padx=8, pady=2)
+        Label(wf, text="Waveform", width=26, anchor="w").pack(side=LEFT)
+        combo = Combobox(wf, textvariable=self.waveform, values=["sine", "bell-soft", "triangle", "square-soft"], state="readonly", width=18)
+        combo.pack(side=LEFT, padx=8)
+        combo.bind("<<ComboboxSelected>>", lambda _event: self._on_change())
+
+        sliders = Frame(self.root)
+        sliders.pack(fill="x", padx=8, pady=4)
+        self._add_slider(sliders, "duration_seconds", "Total duration sec", 0.05, 0.8, 0.225, 0.001)
+        self._add_slider(sliders, "master_volume", "Master volume", 0.0, 0.5, 0.066, 0.001)
+        self._add_slider(sliders, "note1_at_ms", "Note 1 start ms", 0, 300, 0, 1)
+        self._add_slider(sliders, "note1_frequency", "Note 1 frequency Hz", 200, 2200, 880, 1)
+        self._add_slider(sliders, "note1_duration_ms", "Note 1 duration ms", 20, 400, 90, 1)
+        self._add_slider(sliders, "note1_gain", "Note 1 gain", 0.0, 1.5, 0.75, 0.001)
+        self._add_slider(sliders, "note2_at_ms", "Note 2 start ms", 0, 400, 95, 1)
+        self._add_slider(sliders, "note2_frequency", "Note 2 frequency Hz", 200, 2600, 1175, 1)
+        self._add_slider(sliders, "note2_duration_ms", "Note 2 duration ms", 20, 500, 130, 1)
+        self._add_slider(sliders, "note2_gain", "Note 2 gain", 0.0, 1.5, 0.75, 0.001)
+        self._add_slider(sliders, "attack_ms", "Attack ms", 1, 80, 10, 1)
+        self._add_slider(sliders, "release_ms", "Release ms", 1, 200, 55, 1)
+        self._add_slider(sliders, "stereo_spread", "Stereo spread", 0.0, 1.0, 0.0, 0.001)
+        self._add_slider(sliders, "noise_amount", "Noise amount", 0.0, 1.0, 0.0, 0.001)
+        self._add_slider(sliders, "soften", "Soften / low-pass", 0.0, 0.95, 0.0, 0.001)
+
+        Label(self.root, text="Current params / copy into offscreen.js after adapting synth options if needed", anchor="w").pack(fill="x", padx=10, pady=(8, 2))
+        self.output = Text(self.root, height=15, wrap="none")
+        self.output.pack(fill=BOTH, expand=True, padx=8, pady=8)
+
+    def _get_float(self, key: str) -> float:
+        scale = self.scales[key]
+        resolution = getattr(scale, "_arcaia_resolution", 0.001)
+        value = float(scale.get())
+        if resolution >= 1:
+            return round(value)
+        decimals = max(0, min(4, len(str(resolution).split(".")[-1])))
+        return round(value, decimals)
+
+    def params(self) -> SoundParams:
+        return SoundParams(
+            waveform=self.waveform.get(),
+            duration_seconds=self._get_float("duration_seconds"),
+            master_volume=self._get_float("master_volume"),
+            note1_at_ms=self._get_float("note1_at_ms"),
+            note1_frequency=self._get_float("note1_frequency"),
+            note1_duration_ms=self._get_float("note1_duration_ms"),
+            note1_gain=self._get_float("note1_gain"),
+            note2_at_ms=self._get_float("note2_at_ms"),
+            note2_frequency=self._get_float("note2_frequency"),
+            note2_duration_ms=self._get_float("note2_duration_ms"),
+            note2_gain=self._get_float("note2_gain"),
+            attack_ms=self._get_float("attack_ms"),
+            release_ms=self._get_float("release_ms"),
+            stereo_spread=self._get_float("stereo_spread"),
+            noise_amount=self._get_float("noise_amount"),
+            soften=self._get_float("soften"),
+        )
+
+    def _on_change(self) -> None:
+        for key, scale in self.scales.items():
+            self.labels[key].configure(text=str(self._get_float(key)))
+        self._update_output()
+
+    def _update_output(self) -> None:
+        params = self.params()
+        payload = {
+            "pythonParams": asdict(params),
+            "offscreenPresetDraft": json.loads(make_js_preset(params)),
+            "wavDataUriPreviewBytes": len(make_wav_bytes(params)),
+        }
+        self.output.delete("1.0", END)
+        self.output.insert("1.0", json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def preview(self) -> None:
+        if winsound is None:
+            messagebox.showerror("Preview unavailable", "winsound is available on Windows only.")
+            return
+        wav_bytes = make_wav_bytes(self.params())
+        try:
+            self._cleanup_preview_file(stop_sound=True)
+            with tempfile.NamedTemporaryFile(prefix="arcaia_sound_tuner_", suffix=".wav", delete=False) as tmp:
+                tmp.write(wav_bytes)
+                self.preview_file_path = Path(tmp.name)
+            winsound.PlaySound(str(self.preview_file_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            self.status.set(f"Previewed {len(wav_bytes)} bytes")
+        except Exception as error:  # pragma: no cover - GUI error path.
+            messagebox.showerror("Preview failed", str(error))
+            self.status.set(f"Preview failed: {error}")
+
+    def _cleanup_preview_file(self, stop_sound: bool = False) -> None:
+        if winsound is not None and stop_sound:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+        if self.preview_file_path is not None:
+            try:
+                self.preview_file_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.preview_file_path = None
+
+    def close(self) -> None:
+        self._cleanup_preview_file(stop_sound=True)
+        self.root.destroy()
+
+    def export_wav(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Export WAV",
+            defaultextension=".wav",
+            filetypes=[("WAV files", "*.wav"), ("All files", "*.*")],
+            initialfile="arcaia-soft-chime.wav",
+        )
+        if not path:
+            return
+        Path(path).write_bytes(make_wav_bytes(self.params()))
+        self.status.set(f"Exported WAV: {path}")
+
+    def save_json(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Save preset JSON",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile="arcaia-soft-chime-preset.json",
+        )
+        if not path:
+            return
+        Path(path).write_text(make_js_preset(self.params()), encoding="utf-8")
+        self.status.set(f"Saved preset JSON: {path}")
+
+    def reset_original(self) -> None:
+        original = SoundParams()
+        self.waveform.set(original.waveform)
+        for key, value in asdict(original).items():
+            if key == "waveform":
+                continue
+            self.scales[key].set(float(value))
+        self._on_change()
+        self.status.set("Reset to original soft_chime values")
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+def main() -> int:
+    SoundTunerApp().run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
