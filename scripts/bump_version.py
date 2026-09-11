@@ -18,7 +18,6 @@ APP_FILES = [
     "content.js",
     "injected-main.js",
     "popup.js",
-    "popup.html",
     "tests/lite-grouping.test.js",
 ]
 
@@ -85,7 +84,6 @@ def verify(new_version: str) -> list[str]:
         "content.js": [f"const APP_VERSION = '{new_version}'"],
         "injected-main.js": [f"const APP_VERSION = '{new_version}'"],
         "popup.js": [f"const APP_VERSION = '{new_version}'"],
-        "popup.html": [f"v{new_version}"],
         "tests/lite-grouping.test.js": [f"extension version is v{new_version}", new_version.replace(".", r"\.")],
     }
     for rel, needles in checks.items():

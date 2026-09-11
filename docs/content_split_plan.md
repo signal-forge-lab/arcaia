@@ -1,6 +1,6 @@
-# Arcaia content.js Split History and Current Structure v0.1.275
+# Arcaia content.js Split History and Current Structure v0.1.281
 
-## Current status in v0.1.275
+## Current status in v0.1.281
 
 This document is a historical split log that started at v0.1.112. Sections describing `content_zip.js`, diagnostic ZIP generation, and generic Debug runtime are retained only as implementation history; they are not the current runtime architecture.
 
@@ -8,7 +8,6 @@ The current manifest content-script order is:
 
 ```text
 content_toolbar.js
-content_diagnostics.js
 content_markdown.js
 content_filename.js
 content_model_selector.js
@@ -18,22 +17,22 @@ content.js
 Current status:
 
 - `content_zip.js` has been removed and is not loaded by the manifest.
+- `content_diagnostics.js` was removed after its pure helpers became unused by normal runtime.
 - Generic Debug UI/runtime, persistent diagnostic logging, and diagnostic ZIP generation have been removed.
-- `content_diagnostics.js` remains only for small pure/manual helpers required by normal code or explicit probes.
 - Model-selector normal status is lightweight; detailed investigation is performed by standalone scripts under `tools/`.
 - Assistant generation completion is conversation-bound. Final stream removal is deferred for one render opportunity so a pending `page_navigation` can cancel it; navigation away from an active generation is treated as `navigation_abandon`, not normal completion.
 - Model-selector discovery is localized to the Composer, its direct parent, surface controls, the live trigger, the visible Picker, and the actual thinking slider. The former persistent `documentElement` observer has been removed.
 - Confirmed Picker selection mutations are resolved from the retained Picker reference before Portal teardown, including GPT-5.6 to GPT-5.5 transitions.
 - The shared conversation observer remains available to block, timestamp, and Markdown features, while Recent View only schedules regrouping for probe-confirmed turn, role, message-id, and roleless empty/non-empty transitions.
 - Header Markdown startup temporarily observes the header only until the native Share action appears, then rebinds the same observer to the direct actions container; route changes reuse the existing page-state event path and no polling is used.
-- SPA navigation keeps one pending conversation-DOM sync keyed by route and DOM identity. Existing conversation/header observers trigger one follow-up only after the replacement header and Composer are ready; displaced main-world History wrappers are repaired during the existing conversation sync request.
-- While that pending sync is active on a conversation route, one temporary child-list observer covers the replacement DOM gap. Its callback ignores unrelated conversation mutations and reacts only to header／Composer replacement or header-local child changes.
+- SPA navigation and initial render keep one pending conversation-DOM sync keyed by route and DOM identity. Replacement header／Composer readiness triggers the first follow-up, and later conversation content-root readiness can trigger one second follow-up through the same sync path; displaced main-world History wrappers are repaired during the existing conversation sync request.
+- While that pending sync is active on a conversation route, one temporary child-list observer covers the replacement DOM gap. Its callback ignores unrelated conversation mutations and reacts only to header／Composer replacement, header-local child changes, or the first conversation-section/content-root appearance.
 - Conversation-DOM readiness requires the replacement Composer, not the model trigger. A delayed trigger remains the responsibility of the existing Composer-local model-selector observer, so header Markdown restoration is not coupled to model decoration timing.
 - User and assistant timestamp badges use the same non-italic type style. Provisional timestamps remain distinguishable by their lower opacity and explicit provisional attribute.
 - Recent View inserts its history controls immediately before the first visible turn, so the controls naturally appear only when the user reaches the top. It does not add a scroll listener.
 - Progressive history loading keeps the popup-configured base turn count unchanged and applies a session-scoped override only to the current conversation, in steps of up to 10 turns with a staged maximum of 50.
-- Full-history loading and progressive loading use the probe-confirmed native SPA round trip: click the native new-chat control, wait for the non-conversation state to settle, set the scoped main-world request, then click the original native conversation link and wait for a replacement content root.
-- The round trip is bounded by event-driven DOM/navigation waits and timeouts. It adds no direct conversation fetch, interval, or page reload. During the transition, a content-area overlay masks the temporary route and the first visible-turn anchor is restored afterward.
+- Full-history loading and progressive loading persist a conversation-scoped request and use a same-conversation document reload. A successful cloned conversation request returns HTTP 200 but does not update ChatGPT React state, so a plain refetch is not a valid UI refresh path.
+- The action performs no Content-side conversation fetch, interval, scroll listener, or temporary route round trip. The scoped request is consumed by the normal page-load conversation response.
 - Failed Recent View history actions render one temporary, accessible notice only from the failure path. The notice distinguishes whether the original conversation is currently visible and removes itself after seven seconds; successful actions render no notice.
 
 ## Purpose

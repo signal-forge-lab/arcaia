@@ -1,7 +1,6 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
@@ -9,7 +8,6 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
 const contentToolbarSourceFile = fs.readFileSync(path.join(__dirname, '..', 'content_toolbar.js'), 'utf8');
-const contentDiagnosticsSource = fs.readFileSync(path.join(__dirname, '..', 'content_diagnostics.js'), 'utf8');
 const contentMarkdownSource = fs.readFileSync(path.join(__dirname, '..', 'content_markdown.js'), 'utf8');
 const contentFilenameSource = fs.readFileSync(path.join(__dirname, '..', 'content_filename.js'), 'utf8');
 const contentModelSelectorSource = fs.readFileSync(path.join(__dirname, '..', 'content_model_selector.js'), 'utf8');
@@ -17,14 +15,26 @@ const injectedSource = fs.readFileSync(path.join(__dirname, '..', 'injected-main
 const backgroundSource = fs.readFileSync(path.join(__dirname, '..', 'background.js'), 'utf8');
 const offscreenHtmlSource = fs.readFileSync(path.join(__dirname, '..', 'offscreen.html'), 'utf8');
 const offscreenSource = fs.readFileSync(path.join(__dirname, '..', 'offscreen.js'), 'utf8');
-const completionSoundAssetPath = path.join(__dirname, '..', 'sounds', 'assistant-complete.ogg');
+const completionSoundAssetPaths = Array.from({ length: 2 }, (_, index) => (
+  path.join(__dirname, '..', 'sounds', `notification-${String(index + 1).padStart(2, '0')}.wav`)
+));
+const completionSoundOpusAssetPaths = Array.from({ length: 12 }, (_, index) => (
+  path.join(__dirname, '..', 'sounds', `notification-${String(index + 3).padStart(2, '0')}.opus`)
+));
+const completionSoundNormalization = JSON.parse(fs.readFileSync(
+  path.join(__dirname, '..', 'sounds', 'completion-sound-normalization.json'),
+  'utf8'
+));
 const popupSource = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8');
 const popupHtmlSource = fs.readFileSync(path.join(__dirname, '..', 'popup.html'), 'utf8');
 const toolbarIconPngPaths = [16, 32, 48, 128].map((size) => path.join(__dirname, '..', 'icons', 'toolbar', 'icon' + size + '.png'));
 const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest.json'), 'utf8'));
+const agentsSource = fs.readFileSync(path.join(__dirname, '..', 'AGENTS.md'), 'utf8');
+const toolHistoryCompactionContractSource = fs.readFileSync(
+  path.join(__dirname, '..', 'docs', 'tool_history_compaction_runtime_contract.md'),
+  'utf8'
+);
 const MESSAGE_SECTION_SELECTOR = 'section[data-testid^="conversation-turn-"]';
-const PROMPT_TOC_BUTTON_SELECTOR = 'button[aria-label^="Prompt "]';
-const PROMPT_TOC_HIDE_ROOT_ATTR = 'data-arcaia-prompt-toc-hidden';
 const LITE_GROUPING_STRATEGY = 'latest_user_started_turns_hard_prune_v1';
 const LITE_RETAIN_MODE = 'latest_user_started_turns_hard_prune';
 const LITE_BAR_ID = 'arcaia-lite-display-bar';
@@ -60,6 +70,35 @@ function extractFunction(name) {
     }
   }
   throw new Error(`unterminated function ${name}`);
+}
+
+function extractInjectedFunction(name) {
+  const marker = `  function ${name}(`;
+  const start = injectedSource.indexOf(marker);
+  assert.notEqual(start, -1, `missing injected function ${name}`);
+  const bodyStart = injectedSource.indexOf('{', start);
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = bodyStart; index < injectedSource.length; index += 1) {
+    const char = injectedSource[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '{') depth += 1;
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return injectedSource.slice(start + 2, index + 1);
+    }
+  }
+  throw new Error(`unterminated injected function ${name}`);
 }
 
 class FakeRoleNode {
@@ -131,51 +170,12 @@ class FakeSection {
   }
 }
 
-class FakePromptTocButton {
-  constructor(label, parent) {
-    this.attrs = new Map([['aria-label', label]]);
-    this.parentElement = parent;
-    this.parentNode = parent;
-    this.isConnected = true;
-    this.className = 'h-0.5 w-4.5 shrink-0 rounded-full transition-all';
-    this.style = { visibility: '', opacity: '', pointerEvents: '' };
-  }
-
-  getAttribute(name) {
-    return this.attrs.get(name) ?? null;
-  }
-
-  setAttribute(name, value) {
-    this.attrs.set(name, String(value));
-  }
-
-  remove() {
-    this.isConnected = false;
-  }
-
-  removeAttribute(name) {
-    this.attrs.delete(name);
-  }
-
-  hasAttribute(name) {
-    return this.attrs.has(name);
-  }
-}
-
-class FakePromptTocParent {
-  constructor() {
-    this.className = 'no-scrollbar flex max-h-[50lvh] w-9 flex-col items-center gap-2 overflow-y-auto py-1';
-  }
-}
-
 class FakeDocument {
-  constructor(sections, promptTocButtons = []) {
+  constructor(sections) {
     this.sections = sections;
-    this.promptTocButtons = promptTocButtons;
   }
 
   querySelectorAll(selector) {
-    if (selector === PROMPT_TOC_BUTTON_SELECTOR) return this.promptTocButtons;
     if (selector === MESSAGE_SECTION_SELECTOR) return this.sections;
     if (selector.includes(ROLLING_HIDE_ATTR) || selector.includes(ROLLING_PRUNE_MODE_ATTR) || selector.includes(ROLLING_ORIGINAL_DISPLAY_ATTR)) {
       return this.sections.filter((section) =>
@@ -202,8 +202,6 @@ const context = {
   LITE_RETAIN_MODE,
   LITE_BAR_ID,
   NATIVE_LITE_TURN_COUNT,
-  PROMPT_TOC_BUTTON_SELECTOR,
-  PROMPT_TOC_HIDE_ROOT_ATTR,
   ROLLING_HIDE_ATTR,
   ROLLING_ORIGINAL_DISPLAY_ATTR,
   ROLLING_PRUNE_MODE_ATTR,
@@ -211,7 +209,6 @@ const context = {
 };
 vm.createContext(context);
 for (const name of [
-  'redactSnapshotUrl',
   'isTopLevelMessageSection',
   'getSectionOwnedRoleNodes',
   'getSectionMessageId',
@@ -220,7 +217,6 @@ for (const name of [
   'buildLiteGroupingPlan',
   'unhideRollingLiteContainer',
   'hideRollingLiteContainer',
-  'setPromptTocHiddenActive',
   'reconcileRollingLiteSections',
   'shouldNoopLiteForShortConversation',
   'unhideRollingLiteContainers'
@@ -231,7 +227,6 @@ for (const name of [
 const {
   buildLiteGroupingPlan,
   reconcileRollingLiteSections,
-  redactSnapshotUrl,
   shouldNoopLiteForShortConversation,
   unhideRollingLiteContainers
 } = context;
@@ -239,13 +234,6 @@ const {
 function makeSections(roles) {
   return roles.map((role, index) => new FakeSection(`conversation-turn-${index + 1}`, role, `message-${index + 1}`));
 }
-
-test('diagnostic URL redaction helper is defined and removes conversation ids and secrets', () => {
-  const value = redactSnapshotUrl('https://chatgpt.com/c/12345678-abcd?token=secret&arcaia_soft_refresh=123');
-  assert.equal(value.includes('12345678-abcd'), false);
-  assert.equal(value.includes('secret'), false);
-  assert.match(value, /<conversationId>/);
-});
 
 test('34 sections retain the latest three user-started turns as six sections', () => {
   const sections = makeSections(Array.from({ length: 34 }, (_, index) => index % 2 === 0 ? 'user' : 'assistant'));
@@ -402,11 +390,11 @@ test('default Lite CSS-hides old non-retained turns without removing ChatGPT DOM
   assert.equal(sections.slice(2).every((section) => section.isConnected), true);
 });
 
-test('prompt TOC hide CSS is installed for all prompt jump markers', () => {
-  assert.match(source, /PROMPT_TOC_HIDE_ROOT_ATTR/);
-  assert.match(source, /display:\s*none\s*!important/);
-  assert.match(source, /setPromptTocHiddenActive\(true\)/);
-  assert.match(source, /setPromptTocHiddenActive\(false\)/);
+test('Recent View leaves the native Prompt jump list untouched', () => {
+  assert.doesNotMatch(source, /data-arcaia-prompt-toc-hidden/);
+  assert.doesNotMatch(source, /PROMPT_TOC_HIDE_ROOT_ATTR|PROMPT_TOC_BUTTON_SELECTOR/);
+  assert.doesNotMatch(source, /setPromptTocHiddenActive/);
+  assert.doesNotMatch(source, /promptTocPrune/);
 });
 
 test('generic debug mode, stored logs, and diagnostic-only state are removed', () => {
@@ -434,7 +422,7 @@ test('operation mode restores normal or off settings and primes main-world state
 
   const startupSource = source.slice(
     source.indexOf('  async function syncStartupSettingsFromStorage() {'),
-    source.indexOf('  function trimLargeForDebug', source.indexOf('  async function syncStartupSettingsFromStorage() {'))
+    source.indexOf('  function tryExtractConversationIdFromUrl', source.indexOf('  async function syncStartupSettingsFromStorage() {'))
   );
   assert.match(startupSource, /await syncUiSettingsFromStorage\(\)/);
   assert.match(startupSource, /primeMainWorldStorageForUiSettings\(\)/);
@@ -507,11 +495,14 @@ test('page conversation monitor consumes main-world navigation events with a bou
   assert.doesNotMatch(source, /installPageConversationHistoryHooks/);
   assert.match(monitorSource, /pageConversationPendingDomSync = null/);
   assert.match(monitorSource, /pageConversationPendingDomObserver = new MutationObserver/);
-  assert.match(monitorSource, /!pending\?\.conversationId/);
+  assert.match(monitorSource, /newChatTransitionFromConversation/);
+  assert.match(monitorSource, /\(!pending\.conversationId && !pending\.newChatTransitionFromConversation\)/);
   assert.match(monitorSource, /isPageConversationPendingDomMutationRelevant\(mutations\)/);
   assert.match(monitorSource, /observe\(target, \{ childList: true, subtree: true \}\)/);
   assert.match(monitorSource, /disconnectPageConversationPendingDomObserver\(\)/);
-  assert.doesNotMatch(monitorSource, /setInterval|setTimeout/);
+  assert.doesNotMatch(monitorSource, /setInterval/);
+  assert.match(monitorSource, /PAGE_CONVERSATION_PENDING_DOM_TIMEOUT_MS = 30000/);
+  assert.match(monitorSource, /pageConversationPendingDomObserverTimer = setTimeout\(/);
 });
 
 test('Lite display main-world status is short-term cached for repeated non-manual apply calls', () => {
@@ -621,22 +612,9 @@ test('rolling Lite monitoring follows the probe-backed hierarchy without time fa
   assert.doesNotMatch(source, /rollingLiteContentObserver|rollingLiteStableAnchorObserver/);
 });
 
-test('scroll container diagnostics expose scroll burden and Lite descendant counts', () => {
-  const layoutStart = source.indexOf('  function getComputedLayoutSummary(');
-  const layoutEnd = source.indexOf('  function isRuntimeLayoutVisible', layoutStart);
-  const layoutSource = source.slice(layoutStart, layoutEnd);
-  assert.match(layoutSource, /scrollTop/);
-  assert.match(layoutSource, /maxScrollTop/);
-  assert.match(layoutSource, /verticalOverflowPx/);
-
-  const scrollStart = source.indexOf('  function collectScrollContainerDiagnostics(');
-  const scrollEnd = source.indexOf('  function collectLiteRuntimeLayoutDiagnostics', scrollStart);
-  const scrollSource = source.slice(scrollStart, scrollEnd);
-  assert.match(scrollSource, /scrollBurdenScore/);
-  assert.match(scrollSource, /sectionDescendantCount/);
-  assert.match(scrollSource, /hiddenSectionDescendantCount/);
-  assert.match(scrollSource, /visibleSectionDescendantCount/);
-  assert.match(scrollSource, /hiddenSectionLayoutLeakCount/);
+test('resolved Lite layout and turn-boundary diagnostics are absent from normal runtime', () => {
+  assert.doesNotMatch(source, /getComputedLayoutSummary|collectScrollContainerDiagnostics|collectLiteRuntimeLayoutDiagnostics/);
+  assert.doesNotMatch(source, /collectTurnBoundaryDiagnostics|getLitePruneDiagnosticSnapshot|summarizeLiteTurnForLog/);
 });
 
 test('message timestamp display format includes date and time', () => {
@@ -650,6 +628,95 @@ test('message timestamp badge is anchored to the chat content role element', () 
   assert.match(source, /roleEl\.matches\?\.\('\[data-message-author-role\]'\)/);
   assert.match(source, /const container = getMessageTimeBadgeContainer\(roleEl\)/);
   assert.doesNotMatch(source, /\.arcaia-message-time-user \{ margin-left: auto/);
+});
+
+test('message timestamp badge stays timestamp-only until the delayed turn index is available', () => {
+  const badgeStart = source.indexOf('  function ensureMessageTimeBadge(');
+  const badgeEnd = source.indexOf('  function shouldDeferAssistantTimestampForGeneration', badgeStart);
+  const badgeSource = source.slice(badgeStart, badgeEnd);
+  assert.match(badgeSource, /isArcaiaFeatureEnabled\('turnNumbers'\)/);
+  assert.match(badgeSource, /badge\.textContent = hasTurnNumber \? `Turn \$\{absoluteTurnNumber\} · \$\{timeLabel\}` : timeLabel/);
+  assert.match(badgeSource, /if \(hasTurnNumber\) badge\.dataset\.arcaiaTurnNumber/);
+  assert.match(badgeSource, /else delete badge\.dataset\.arcaiaTurnNumber/);
+  assert.doesNotMatch(badgeSource, /arcaiaTotalTurnCount =/);
+  const indexStart = injectedSource.indexOf('  function buildMessageTimestampIndexFromConversation(');
+  const indexEnd = injectedSource.indexOf('  function getChangedMessageTimestampIds', indexStart);
+  const indexSource = injectedSource.slice(indexStart, indexEnd);
+  assert.doesNotMatch(indexSource, /turnNumber|turnIndex|turnCount|buildMessageTurnAssignmentFromConversation/);
+});
+
+test('provisional timestamps do not assign turn numbers', () => {
+  const provisionalStart = source.indexOf('  function getOrCreateProvisionalTimestampInfo(');
+  const provisionalEnd = source.indexOf('  function getRoleNodesForTimestampBadges', provisionalStart);
+  const provisionalSource = source.slice(provisionalStart, provisionalEnd);
+  assert.doesNotMatch(provisionalSource, /turnNumber|assignProvisionalMessageTurnNumber/);
+  assert.doesNotMatch(source, /function assignProvisionalMessageTurnNumber/);
+});
+
+test('attachment-only user messages remain in Recent View and Markdown export turn boundaries', () => {
+  const helperNames = [
+    'findRootNode',
+    'getLeafNodes',
+    'collectReachableNodeIds',
+    'findLatestLeafNodeForLite',
+    'buildPathFromLeaf',
+    'isVisuallyHiddenMessage',
+    'isTimestampVisibleMessage',
+    'isLiteImageLikeObject',
+    'isLiteFileAttachmentLikeObject',
+    'hasLiteFileAttachmentLikeContent',
+    'hasLiteImageLikeContent',
+    'normalizePartToText',
+    'extractTextFromMessage',
+    'classifyLitePathMessage'
+  ];
+  const sandbox = { Set, Map, Object, Array, Math, Number, String, Date };
+  vm.runInNewContext(`
+    const LITE_IMAGE_PLACEHOLDER_TEXT = '[image]';
+    const LITE_FILE_ATTACHMENT_PLACEHOLDER_TEXT = '[添付ファイル]';
+    ${helperNames.map((name) => extractInjectedFunction(name)).join('\n')}
+    this.extractTextFromMessage = extractTextFromMessage;
+    this.classifyLitePathMessage = classifyLitePathMessage;
+  `, sandbox);
+
+  const raw = {
+    mapping: {
+      root: { id: 'root', parent: null, children: ['u1'], message: null },
+      u1: {
+        id: 'u1', parent: 'root', children: ['a1'],
+        message: { id: 'm-u1', author: { role: 'user' }, create_time: 1, content: { content_type: 'text', parts: ['hello'] }, metadata: {} }
+      },
+      a1: {
+        id: 'a1', parent: 'u1', children: ['u2'],
+        message: { id: 'm-a1', author: { role: 'assistant' }, recipient: 'all', create_time: 2, content: { content_type: 'text', parts: ['reply'] }, metadata: {} }
+      },
+      u2: {
+        id: 'u2', parent: 'a1', children: ['a2'],
+        message: {
+          id: 'm-u2', author: { role: 'user' }, create_time: 3,
+          content: { content_type: 'multimodal_text', parts: [] },
+          metadata: { attachments: [{ id: 'file-1', name: 'probe.json', mime_type: 'application/json' }] }
+        }
+      },
+      a2: {
+        id: 'a2', parent: 'u2', children: [],
+        message: { id: 'm-a2', author: { role: 'assistant' }, recipient: 'all', create_time: 4, content: { content_type: 'text', parts: ['file reply'] }, metadata: {} }
+      }
+    }
+  };
+
+  assert.equal(sandbox.extractTextFromMessage(raw.mapping.u2.message), '[添付ファイル]');
+  assert.equal(sandbox.classifyLitePathMessage(raw, 'u2').keep, true);
+  const markdownTurnSource = source.slice(
+    source.indexOf('  function buildConversationTurns('),
+    source.indexOf('  function classifyExportDecision', source.indexOf('  function buildConversationTurns('))
+  );
+  assert.match(markdownTurnSource, /if \(msg\.role === 'user' \|\| !current\)/);
+  const markdownLeafSource = source.slice(
+    source.indexOf('  function findLatestLeafNode('),
+    source.indexOf('  function buildPathFromLeaf', source.indexOf('  function findLatestLeafNode('))
+  );
+  assert.match(markdownLeafSource, /raw\?\.current_node && raw\?\.mapping\?\.\[raw\.current_node\]/);
 });
 
 test('live timestamp fallback uses DOM observation time for missing index items', () => {
@@ -700,11 +767,12 @@ test('initial existing timestamp DOM waits for index instead of current-time pro
 
 test('timestamp initial DOM awaiting state is applied only on startup and conversation snapshots', () => {
   const startupStart = source.indexOf('  function startMessageTimestampUi()');
-  const startupEnd = source.indexOf('  function scheduleApplyMessageTimestamps', startupStart);
+  const startupEnd = source.indexOf('  function stopMessageTimestampUi', startupStart);
   const startupSource = source.slice(startupStart, startupEnd);
   assert.match(startupSource, /resetMessageTimeStateForConversation\(tryExtractConversationIdFromUrl\(window\.location\.href\)\)/);
   assert.match(startupSource, /markInitialMessageTimeRoleNodes\(getRoleNodesForTimestampBadges\(\), 'startup_initial_dom_snapshot'\)/);
-  assert.match(startupSource, /scheduleRefreshMessageTimestampIndex\('startup_existing_conversation_fetch_index'\)/);
+  assert.match(startupSource, /scheduleRefreshMessageTimestampIndex\('startup_existing_conversation_fetch_index', \{ applyAll: true \}\)/);
+  assert.match(startupSource, /scheduleApplyAllMessageTimestamps\('startup_dom_first_observation'\)/);
 
   const monitorStart = source.indexOf('  async function syncConversationDependentState(');
   const monitorEnd = source.indexOf('  function startPageConversationMonitor', monitorStart);
@@ -713,7 +781,7 @@ test('timestamp initial DOM awaiting state is applied only on startup and conver
   assert.match(monitorSource, /markInitialMessageTimeRoleNodes\(getRoleNodesForTimestampBadges\(\), 'conversation_changed_initial_dom_snapshot'\)/);
 
   const applyStart = source.indexOf('  async function applyMessageTimestampBadges(');
-  const applyEnd = source.indexOf('  function scheduleApplyMessageTimestamps', applyStart);
+  const applyEnd = source.indexOf('  function flushMessageTimestampApply', applyStart);
   const applySource = source.slice(applyStart, applyEnd);
   assert.match(applySource, /const initialDomMarkedThisApply = 0/);
   assert.doesNotMatch(applySource, /guarded_initial_apply/);
@@ -748,7 +816,7 @@ test('message timestamp badges mark provisional values without role-specific ita
 test('assistant timestamp display is deferred while the latest assistant is generating', () => {
   const applySource = source.slice(
     source.indexOf('  async function applyMessageTimestampBadges('),
-    source.indexOf('  function scheduleApplyMessageTimestamps', source.indexOf('  async function applyMessageTimestampBadges('))
+    source.indexOf('  function flushMessageTimestampApply', source.indexOf('  async function applyMessageTimestampBadges('))
   );
   assert.match(source, /function shouldDeferAssistantTimestampForGeneration/);
   assert.match(applySource, /const generationDetector = isLikelyChatGPTGenerating\(\);/);
@@ -765,7 +833,7 @@ test('assistant timestamp defer removes any existing in-progress badge and repor
   );
   const applySource = source.slice(
     source.indexOf('  async function applyMessageTimestampBadges('),
-    source.indexOf('  function scheduleApplyMessageTimestamps', source.indexOf('  async function applyMessageTimestampBadges('))
+    source.indexOf('  function flushMessageTimestampApply', source.indexOf('  async function applyMessageTimestampBadges('))
   );
   assert.match(removeSource, /badge\.remove\(\)/);
   assert.match(removeSource, /data-arcaia-message-time-skip-reason/);
@@ -783,7 +851,8 @@ test('existing timestamp index refresh requests only the current conversation an
   assert.match(refreshSource, /activeConversationId !== conversationId/);
   assert.doesNotMatch(refreshSource, /index_response_stale_after_navigation|pushMessageTimeDebugEvent/);
   assert.match(refreshSource, /!index \|\| Boolean\(conversationId && index\.conversationId === conversationId\)/);
-  assert.match(refreshSource, /scheduleApplyMessageTimestamps\(`index_refreshed:\$\{reason\}`\)/);
+  assert.match(refreshSource, /scheduleApplyAllMessageTimestamps\(`index_refreshed:\$\{reason\}`\)/);
+  assert.match(refreshSource, /scheduleApplyMessageTimestampsForMessageIds\(targetMessageIds, `index_refreshed:\$\{reason\}`\)/);
   assert.doesNotMatch(refreshSource, /fetch\s*\(/);
 });
 
@@ -832,9 +901,10 @@ test('conversation-derived state is accepted only for the current conversation a
   const listenerSource = source.slice(listenerStart, listenerEnd);
   assert.equal(
     (listenerSource.match(/if \(currentConversationId && eventConversationId === currentConversationId\)/g) || []).length,
-    2
+    3
   );
   assert.match(listenerSource, /mainEventType === 'message_timestamp_index_updated'/);
+  assert.match(listenerSource, /mainEventType === 'tool_history_summary_index_updated'/);
   assert.match(listenerSource, /mainEventType === 'current_conversation_model_config'/);
 
   const syncStart = source.indexOf('  async function syncConversationDependentState(');
@@ -855,18 +925,159 @@ test('conversation-derived state is accepted only for the current conversation a
 });
 
 test('message timestamp observer uses message DOM and assistant toolbar readiness triggers', () => {
-  const start = source.indexOf('  function nodeContainsMessageTimestampDom(');
-  const end = source.indexOf('  const LITE_BAR_ID', start);
+  const start = source.indexOf('  function collectMessageTimestampMutationRoleNodes(');
+  const end = source.indexOf('  function startMessageTimestampUi()', start);
   const timestampUiSource = source.slice(start, end);
   assert.match(source, /const MESSAGE_TIME_MUTATION_SELECTOR =/);
-  assert.match(timestampUiSource, /function nodeContainsMessageTimestampDom/);
-  assert.match(timestampUiSource, /function classifyMessageTimestampMutation/);
+  assert.match(timestampUiSource, /function collectMessageTimestampMutationRoleNodes/);
   assert.match(timestampUiSource, /nodeContainsTurnCopyButton\(node\)/);
-  assert.match(timestampUiSource, /sawTurnCopyButton \? 'assistant_toolbar_ready'/);
-  assert.match(timestampUiSource, /sawMessageDom \? 'message_dom_mutation' : null/);
-  assert.match(timestampUiSource, /const reason = classifyMessageTimestampMutation\(mutations\)/);
-  assert.match(timestampUiSource, /if \(reason\) scheduleApplyMessageTimestamps\(reason\)/);
+  assert.match(timestampUiSource, /reason: sawTurnCopyButton \? 'assistant_toolbar_ready' : 'message_dom_mutation'/);
+  assert.match(timestampUiSource, /const \{ reason, roleNodes \} = collectMessageTimestampMutationRoleNodes\(mutations\)/);
+  assert.match(timestampUiSource, /scheduleApplyMessageTimestampsForNodes\(roleNodes, reason\)/);
+  assert.doesNotMatch(timestampUiSource, /getRoleNodesForTimestampBadges\(\)/);
   assert.doesNotMatch(timestampUiSource, /setInterval/);
+});
+
+test('live timestamp updates target only changed messages and never rescan prior chat rows', () => {
+  const listenerStart = source.indexOf("  window.addEventListener('message', (event) => {");
+  const listenerEnd = source.indexOf('  function requestMainAuth', listenerStart);
+  const listenerSource = source.slice(listenerStart, listenerEnd);
+  assert.match(listenerSource, /changedMessageIds/);
+  assert.match(listenerSource, /targetMessageIds: changedMessageIds/);
+
+  const schedulerStart = source.indexOf('  function flushMessageTimestampApply(');
+  const schedulerEnd = source.indexOf('  function startMessageTimestampUi()', schedulerStart);
+  const schedulerSource = source.slice(schedulerStart, schedulerEnd);
+  assert.match(schedulerSource, /messageTimePendingRoleNodes/);
+  assert.match(schedulerSource, /scheduleApplyMessageTimestampsForNodes/);
+  assert.match(schedulerSource, /getMessageTimestampRoleNodesByMessageIds/);
+  assert.match(schedulerSource, /document\.querySelectorAll\(`\[data-message-id=/);
+  assert.doesNotMatch(schedulerSource, /document\.querySelectorAll\('\[data-message-author-role/);
+
+  const mainEventStart = injectedSource.indexOf('  function getChangedMessageTimestampIds(');
+  const mainEventEnd = injectedSource.indexOf('  function observeMessageTimestampIndexFromConversation', mainEventStart);
+  const mainEventSource = injectedSource.slice(mainEventStart, mainEventEnd);
+  assert.match(mainEventSource, /const changed = \[\]/);
+  assert.match(mainEventSource, /changed\.push\(messageId\)/);
+  assert.doesNotMatch(mainEventSource, /turnNumber|turnCount/);
+});
+
+test('delayed absolute turn counter uses persistent anchors and only rebuilds history on an anchor miss', () => {
+  const schedulerStart = source.indexOf('  function scheduleAbsoluteTurnIndex(');
+  const schedulerEnd = source.indexOf('  async function tryGetAccessTokenFromSession', schedulerStart);
+  const schedulerSource = source.slice(schedulerStart, schedulerEnd);
+  assert.match(schedulerSource, /delayMs = 2500/);
+  assert.match(schedulerSource, /requestIdleCallback/);
+  assert.match(schedulerSource, /document\.hidden/);
+  assert.match(schedulerSource, /isArcaiaFeatureEnabled\('messageTimestamps'\)/);
+  assert.match(schedulerSource, /isArcaiaFeatureEnabled\('turnNumbers'\)/);
+  assert.doesNotMatch(schedulerSource, /liteView|liteTurnCount|recentView/i);
+
+  const requestStart = source.indexOf("  async function requestAbsoluteTurnIndexNow(");
+  const requestEnd = source.indexOf('  function scheduleAbsoluteTurnIndex(', requestStart);
+  const requestSource = source.slice(requestStart, requestEnd);
+  assert.match(requestSource, /scheduleApplyMessageTimestampsForMessageIds\(targetMessageIds/);
+  assert.match(requestSource, /turnNumberPendingMessageIds/);
+  assert.match(requestSource, /turnNumberPendingApplyAll/);
+  assert.match(requestSource, /const requestToken = \+\+turnNumberRequestToken/);
+  assert.match(requestSource, /readTurnAnchorCacheEntry\(conversationId\)/);
+  assert.match(requestSource, /writeTurnAnchorCacheEntry\(conversationId, result\.anchorCache\)/);
+  assert.match(requestSource, /TURN_ANCHOR_HISTORY_FALLBACK_COOLDOWN_MS/);
+  assert.equal((requestSource.match(/requestToken !== turnNumberRequestToken/g) || []).length, 3);
+  const clearStart = source.indexOf('  function clearScheduledAbsoluteTurnIndex(');
+  const clearEnd = source.indexOf('  function clearAbsoluteTurnPendingWork', clearStart);
+  const clearSource = source.slice(clearStart, clearEnd);
+  assert.match(clearSource, /turnNumberRequestToken \+= 1/);
+  assert.match(clearSource, /turnNumberRequestInFlight = false/);
+
+  const counterStart = injectedSource.indexOf('  function isTurnCounterUserMessage(');
+  const counterEnd = injectedSource.indexOf('  function buildCurrentConversationModelConfig', counterStart);
+  const counterSource = injectedSource.slice(counterStart, counterEnd);
+  assert.match(counterSource, /resolveAbsoluteTurnIndexFromSnapshot\(snapshot, anchorCache\)/);
+  assert.match(counterSource, /getReadOnlyConversationModelForContent\(conversationId, 'all', true\)/);
+  assert.match(counterSource, /allowHistoryFetch === false/);
+  assert.match(counterSource, /historyFetchAttempted: true/);
+  assert.doesNotMatch(counterSource, /new AbortController\(\)/);
+  assert.doesNotMatch(counterSource, /liteView|liteDisplayConfig/);
+  const userCounterStart = counterSource.indexOf('  function isTurnCounterUserMessage(');
+  const userCounterEnd = counterSource.indexOf('  function buildTurnPageSnapshot', userCounterStart);
+  const userCounterSource = counterSource.slice(userCounterStart, userCounterEnd);
+  assert.match(userCounterSource, /message\.author\?\.role === 'user'/);
+  assert.doesNotMatch(userCounterSource, /content_type|multimodal_text|text/);
+});
+
+test('absolute turn anchor cache resolves the current page and rejects conflicting anchors', () => {
+  const sandbox = { Map, Set, Object, Array, Math, Number, String, Date };
+  vm.runInNewContext(`
+    const MAX_TURN_ANCHORS_PER_CONVERSATION = 12;
+    ${extractInjectedFunction('normalizeTurnAnchorCacheForMain')}
+    ${extractInjectedFunction('buildAbsoluteTurnIndexFromSnapshot')}
+    ${extractInjectedFunction('buildTurnAnchorCacheFromAbsoluteIndex')}
+    ${extractInjectedFunction('resolveAbsoluteTurnIndexFromSnapshot')}
+    this.resolveAbsoluteTurnIndexFromSnapshot = resolveAbsoluteTurnIndexFromSnapshot;
+  `, sandbox);
+  const snapshot = {
+    conversationId: 'c1',
+    revision: 7,
+    hasPreviousPage: true,
+    startCursor: 'cursor',
+    localTurnCount: 3,
+    userMessageIds: ['u118', 'u119', 'u120'],
+    byMessageId: {
+      u118: { localTurnNumber: 1 },
+      a118: { localTurnNumber: 1 },
+      u119: { localTurnNumber: 2 },
+      a119: { localTurnNumber: 2 },
+      u120: { localTurnNumber: 3 },
+      a120: { localTurnNumber: 3 }
+    },
+    byNodeId: {
+      n118: { localTurnNumber: 1 },
+      n119: { localTurnNumber: 2 },
+      n120: { localTurnNumber: 3 }
+    }
+  };
+  const resolved = sandbox.resolveAbsoluteTurnIndexFromSnapshot(snapshot, {
+    conversationId: 'c1',
+    totalTurnCount: 120,
+    anchors: [
+      { messageId: 'u119', turnNumber: 119 },
+      { messageId: 'u120', turnNumber: 120 }
+    ]
+  });
+  assert.equal(resolved.ok, true);
+  assert.equal(resolved.source, 'anchor_cache');
+  assert.equal(resolved.matchedAnchorCount, 2);
+  assert.equal(resolved.index.olderTurnCount, 117);
+  assert.equal(resolved.index.totalTurnCount, 120);
+  assert.equal(resolved.index.byMessageId.u118, 118);
+  assert.equal(resolved.index.byMessageId.a120, 120);
+  assert.equal(resolved.index.byNodeId.n119, 119);
+  assert.equal(resolved.anchorCache.totalTurnCount, 120);
+
+  const conflicting = sandbox.resolveAbsoluteTurnIndexFromSnapshot(snapshot, {
+    conversationId: 'c1',
+    totalTurnCount: 120,
+    anchors: [
+      { messageId: 'u119', turnNumber: 119 },
+      { messageId: 'u120', turnNumber: 119 }
+    ]
+  });
+  assert.equal(conflicting.ok, false);
+  assert.equal(conflicting.error, 'absolute_turn_anchor_inconsistent');
+});
+
+test('turn number option is a timestamp sub-setting and not a Recent View sub-setting', () => {
+  assert.match(popupSource, /turnNumbers: true/);
+  assert.match(popupSource, /turnNumbers: 'turnNumbersToggle'/);
+  assert.match(popupHtmlSource, /data-feature-row="turnNumbers"/);
+  assert.match(popupHtmlSource, /id="turnNumbersToggle"/);
+  assert.match(popupHtmlSource, />ターン番号</);
+  assert.match(popupHtmlSource, /Recent ViewのON\/OFFには依存しません/);
+  assert.match(popupSource, /featureSettings\.messageTimestamps === false/);
+  const turnRowStart = popupHtmlSource.indexOf('data-feature-row="turnNumbers"');
+  const recentRowStart = popupHtmlSource.indexOf('data-feature-row="liteView"');
+  assert.ok(turnRowStart > recentRowStart);
 });
 
 test('message timestamp generic diagnostics are removed while event-driven scheduling remains', () => {
@@ -875,19 +1086,380 @@ test('message timestamp generic diagnostics are removed while event-driven sched
   const timestampSource = source.slice(start, end);
   assert.match(source, /let conversationDomObservedContentRoot = null/);
   assert.doesNotMatch(timestampSource, /messageTimeDebugEvents|snapshotMessageTimeRoleNodes|pushMessageTimeDebugEvent|getMessageTimeObserverDiagnostic|lastApplyRoleSnapshot/);
-  assert.match(timestampSource, /queueMicrotask\(\(\) => \{/);
+  assert.match(timestampSource, /queueMicrotask\(flushMessageTimestampApply\)/);
   assert.match(timestampSource, /queueMicrotask\(flushMessageTimestampIndexRefresh\)/);
-  assert.match(timestampSource, /function scheduleApplyMessageTimestamps\(/);
+  assert.match(timestampSource, /function scheduleApplyAllMessageTimestamps\(/);
+  assert.match(timestampSource, /function scheduleApplyMessageTimestampsForNodes\(/);
   assert.match(timestampSource, /function scheduleRefreshMessageTimestampIndex\(/);
   assert.doesNotMatch(timestampSource, /messageTimeObserver|messageTimeScanTimer|messageTimeRefreshTimer/);
   assert.doesNotMatch(timestampSource, /setTimeout/);
 });
 
-test('extension version is v0.1.275 across executable entry points', () => {
-  assert.equal(manifest.version, '0.1.275');
-  assert.match(source, /const APP_VERSION = '0\.1\.275'/);
-  assert.match(injectedSource, /const APP_VERSION = '0\.1\.275'/);
-  assert.match(popupSource, /const APP_VERSION = '0\.1\.275'/);
+test('extension version is v0.1.371 across executable entry points', () => {
+  assert.equal(manifest.version, '0.1.371');
+  assert.match(source, /const APP_VERSION = '0\.1\.371'/);
+  assert.match(injectedSource, /const APP_VERSION = '0\.1\.371'/);
+  assert.match(popupSource, /const APP_VERSION = '0\.1\.371'/);
+});
+
+test('tool history compaction is opt-in, keeps React-owned tool DOM connected, and reuses the shared conversation observer', () => {
+  assert.match(source, /toolHistoryCompaction: false/);
+  assert.match(popupSource, /toolHistoryCompaction: false/);
+  assert.match(popupSource, /toolHistoryCompaction: 'toolHistoryCompactionToggle'/);
+  assert.match(popupHtmlSource, /id="toolHistoryCompactionToggle"[^>]*type="checkbox"[^>]*role="switch"/);
+  const popupRowMatch = popupHtmlSource.match(/<div class="switch-row" data-feature-row="toolHistoryCompaction">[\s\S]*?<\/div>/);
+  assert.ok(popupRowMatch, 'tool history compaction popup row must exist');
+  assert.doesNotMatch(popupRowMatch[0], /\bchecked\b/);
+
+  const start = source.indexOf('  const TOOL_HISTORY_GROUP_SELECTOR');
+  const end = source.indexOf('  function collectMessageSectionModel(', start);
+  assert.ok(start >= 0 && end > start);
+  const compactor = source.slice(start, end);
+  assert.match(compactor, /span\.group\\\/tool-message/);
+  assert.match(compactor, /ツール使用 × \$\{count\}/);
+  assert.doesNotMatch(compactor, /candidate\.remove\(\)/);
+  assert.match(compactor, /candidate\.style\.display = 'none'/);
+  const hardCandidateStart = compactor.indexOf('  function hardPruneToolHistoryCandidate(');
+  const hardCandidateEnd = compactor.indexOf('  function compactToolHistorySection(', hardCandidateStart);
+  const hardCandidateSource = compactor.slice(hardCandidateStart, hardCandidateEnd);
+  assert.match(hardCandidateSource, /return softHideToolHistoryCandidate\(candidate\);/);
+  assert.match(compactor, /function resolveToolHistoryCompactionMode\(/);
+  assert.match(compactor, /softOnly \|\| generating \? 'soft' : 'hard'/);
+  assert.match(compactor, /const TOOL_HISTORY_HARD_PRUNE_QUIET_MS = 6000/);
+  assert.match(compactor, /const TOOL_HISTORY_INITIAL_HYDRATION_GRACE_MS = 20000/);
+  assert.match(compactor, /const TOOL_HISTORY_IDLE_BATCH_SIZE = 1/);
+  assert.match(compactor, /const TOOL_HISTORY_IDLE_BATCH_GAP_MS = 500/);
+  assert.match(compactor, /getToolHistoryNavigationKey/);
+  assert.match(compactor, /nextNavigationKey === toolHistoryHydrationNavigationKey/);
+  assert.match(compactor, /function resetToolHistoryHydrationGuard\(/);
+  assert.match(compactor, /function installToolHistoryHideStyle\(/);
+  assert.match(compactor, /function scheduleToolHistoryHardPrune\(/);
+  assert.match(compactor, /function queueToolHistorySectionSweep\(/);
+  assert.match(compactor, /function drainToolHistoryIdleQueue\(/);
+  assert.match(compactor, /requestIdleCallback\(drainToolHistoryIdleQueue, \{ timeout: 1000 \}\)/);
+  assert.match(compactor, /TOOL_HISTORY_SUMMARY_TEXT_ATTR/);
+  assert.match(compactor, /section\.querySelector\?\.\('\[data-message-author-role="user"\]'\)/);
+  assert.match(compactor, /section\.querySelector\?\.\(TOOL_HISTORY_GROUP_SELECTOR\)/);
+  assert.match(compactor, /setTimeout\(/);
+  assert.doesNotMatch(compactor, /new MutationObserver|setInterval/);
+
+  const summaryStart = compactor.indexOf('  function ensureToolHistorySummary(');
+  const summaryEnd = compactor.indexOf('  function softHideToolHistoryCandidate(', summaryStart);
+  const summarySource = compactor.slice(summaryStart, summaryEnd);
+  assert.doesNotMatch(summarySource, /createElement|insertBefore|appendChild/);
+  assert.match(summarySource, /anchor\?\.matches\?\.\(TOOL_HISTORY_GROUP_SELECTOR\)/);
+
+  const releaseStart = source.indexOf('  function releaseToolHistoryHydrationGuard(');
+  const releaseEnd = source.indexOf('  function scheduleToolHistoryHydrationRelease(', releaseStart);
+  const releaseSource = source.slice(releaseStart, releaseEnd);
+  assert.match(releaseSource, /queueToolHistorySectionSweep\(document, 'summary'/);
+  assert.doesNotMatch(releaseSource, /compactToolHistory\(document/);
+
+  const mutationStart = source.indexOf('  function handleConversationDomMutations(');
+  const mutationEnd = source.indexOf('  function reconcileConversationDomFeatures(', mutationStart);
+  const mutationHandler = source.slice(mutationStart, mutationEnd);
+  assert.match(mutationHandler, /scheduleToolHistoryCompactionForMutations\(mutations\)/);
+  assert.equal((source.match(/conversationDomContentObserver = new MutationObserver/g) || []).length, 1);
+  assert.match(source, /if \(!toolHistoryHydrationReady\) return;/);
+  assert.match(source, /resetToolHistoryHydrationGuard\(`main_world_\$\{navigationReason\}`\)/);
+
+  const toolMutationStart = source.indexOf('  function scheduleToolHistoryCompactionForMutations(');
+  const toolMutationEnd = source.indexOf('  function collectMessageSectionModel(', toolMutationStart);
+  const toolMutationSource = source.slice(toolMutationStart, toolMutationEnd);
+  assert.match(toolMutationSource, /queueToolHistorySectionWork\(section, 'summary'/);
+  assert.doesNotMatch(toolMutationSource, /compactToolHistorySection\(/);
+
+  const hardPruneStart = source.indexOf('  function scheduleToolHistoryHardPrune(');
+  const hardPruneEnd = source.indexOf('  function restoreSoftHiddenToolHistoryCandidate(', hardPruneStart);
+  const hardPruneSource = source.slice(hardPruneStart, hardPruneEnd);
+  assert.doesNotMatch(hardPruneSource, /if \(toolHistoryHardPruneTimer !== null\) return;/);
+  assert.match(hardPruneSource, /clearToolHistoryHardPruneTimer\(\);/);
+  assert.match(hardPruneSource, /queueToolHistorySectionSweep\(document, 'hard'/);
+  assert.match(hardPruneSource, /isLikelyChatGPTGenerating\(\)\?\.generating/);
+  assert.match(hardPruneSource, /scheduleToolHistoryHardPrune\(`generation_active:\$\{reason\}`\)/);
+  const drainStart = compactor.indexOf('  function drainToolHistoryIdleQueue(');
+  const drainEnd = compactor.indexOf('  function clearToolHistoryHardPruneTimer(', drainStart);
+  const drainSource = compactor.slice(drainStart, drainEnd);
+  assert.match(drainSource, /if \(work\.mode === 'hard' && generating\) \{/);
+  assert.match(drainSource, /scheduleToolHistoryHardPrune\(`generation_active:\$\{work\.reason\}`\)/);
+  assert.match(drainSource, /if \(section === latestAssistantSection\) \{/);
+  assert.match(drainSource, /scheduleToolHistoryIdleQueue\(\);\s*return;/);
+  assert.doesNotMatch(drainSource, /candidate\.remove\(\)[\s\S]*work\.mode === 'hard' && generating/);
+});
+
+test('tool history compaction mode stays soft during hydration and for the latest active assistant', () => {
+  const sandbox = {};
+  vm.runInNewContext(`${extractFunction('resolveToolHistoryCompactionMode')}; this.resolveToolHistoryCompactionMode = resolveToolHistoryCompactionMode;`, sandbox);
+  assert.equal(sandbox.resolveToolHistoryCompactionMode(true, true, false), 'soft');
+  assert.equal(sandbox.resolveToolHistoryCompactionMode(true, false, false), 'soft');
+  assert.equal(sandbox.resolveToolHistoryCompactionMode(false, true, false), 'hard');
+  assert.equal(sandbox.resolveToolHistoryCompactionMode(false, false, false), 'hard');
+  assert.equal(sandbox.resolveToolHistoryCompactionMode(false, false, true), 'soft');
+});
+
+test('tool history payload compaction preserves recent turns and removes only heavy historical tool detail', () => {
+  assert.match(injectedSource, /const TOOL_HISTORY_PAYLOAD_PRESERVE_LATEST_USER_TURNS = 2/);
+  assert.match(injectedSource, /toolHistoryCompaction: Boolean\(config\?\.toolHistoryCompaction === true\)/);
+  assert.match(injectedSource, /function shouldApplyToolHistoryCompactionToFetch\(/);
+  assert.match(injectedSource, /function buildToolHistorySummaryIndexFromConversation\(/);
+  assert.match(injectedSource, /tool_history_summary_index_updated/);
+  assert.match(injectedSource, /toolHistorySummaryIndex: toolHistorySummaryIndex \|\| null/);
+  assert.match(injectedSource, /metadata\.search_result_groups = \[\]/);
+  assert.match(injectedSource, /delete metadata\.inline_cot_expandable_content/);
+  assert.match(injectedSource, /restoreToolCompactedPayloadShape/);
+  assert.match(source, /toolHistoryCompaction: Boolean\(isArcaiaNormalMode\(\) && featureSettings\.toolHistoryCompaction\)/);
+  assert.match(source, /configSource: 'tool_history_compaction_option'/);
+  assert.match(source, /data-arcaia-tool-history-payload-summary/);
+  assert.match(source, /function applyToolHistoryPayloadSummaryIndex\(/);
+  assert.match(source, /ツール使用 × \$\{count\}/);
+  assert.match(source, /tool_history_summary_index_updated/);
+  const liteDisableStart = source.indexOf('  async function runLiteDisplayDisable(');
+  const liteDisableEnd = source.indexOf('  async function runLiteDisplayStatus(', liteDisableStart);
+  assert.ok(liteDisableStart >= 0 && liteDisableEnd > liteDisableStart);
+  assert.match(source.slice(liteDisableStart, liteDisableEnd), /toolHistoryCompaction: Boolean\(isArcaiaNormalMode\(\) && featureSettings\.toolHistoryCompaction\)/);
+
+  const sandbox = {};
+  vm.runInNewContext(`
+    const TOOL_HISTORY_PAYLOAD_PRESERVE_LATEST_USER_TURNS = 2;
+    function findRootNode(raw) { return raw?.mapping?.root || null; }
+    function collectReachableNodeIds(raw) { return new Set(Object.keys(raw?.mapping || {})); }
+    function findLatestLeafNodeForLite(raw) { return raw?.mapping?.[raw?.current_node] || null; }
+    function buildPathFromLeaf(raw, root, leaf) {
+      const path = [];
+      let current = leaf;
+      const seen = new Set();
+      while (current?.id && !seen.has(current.id)) {
+        seen.add(current.id);
+        path.push(current.id);
+        if (current.id === root?.id) break;
+        current = current.parent ? raw?.mapping?.[current.parent] : null;
+      }
+      return path.reverse();
+    }
+    ${extractInjectedFunction('isCompletedHistoricalToolMessage')}
+    ${extractInjectedFunction('compactHistoricalToolPayload')}
+    this.compactHistoricalToolPayload = compactHistoricalToolPayload;
+  `, sandbox);
+  vm.runInNewContext(`${extractInjectedFunction('restoreToolCompactedPayloadShape')}; this.restoreToolCompactedPayloadShape = restoreToolCompactedPayloadShape;`, sandbox);
+
+  const mapping = {};
+  const add = (id, message, parent = null) => {
+    mapping[id] = { id, message, parent, children: [] };
+    if (parent) mapping[parent].children.push(id);
+  };
+  add('root', null);
+  let parent = 'root';
+  for (let turn = 1; turn <= 4; turn += 1) {
+    const userId = `u${turn}`;
+    add(userId, {
+      id: userId,
+      author: { role: 'user' },
+      content: { content_type: 'text', parts: [`user-${turn}`] },
+      metadata: { parent_id: parent },
+      status: 'finished_successfully'
+    }, parent);
+    const invokeId = `c${turn}`;
+    add(invokeId, {
+      id: invokeId,
+      author: { role: 'assistant' },
+      content: { content_type: 'code', text: `tool-${turn}` },
+      metadata: { parent_id: userId },
+      recipient: 'web.run',
+      status: 'finished_successfully',
+      end_turn: false
+    }, userId);
+    const toolId = `t${turn}`;
+    add(toolId, {
+      id: toolId,
+      author: { role: 'tool' },
+      content: { content_type: 'text', parts: ['tool-result-shell'] },
+      metadata: {
+        parent_id: invokeId,
+        request_id: `req-${turn}`,
+        turn_id: `turn-${turn}`,
+        search_result_groups: Array.from({ length: turn }, (_, index) => ({
+          domain: 'example.com',
+          entries: [{ ref_id: `r${turn}-${index}`, title: 'title', snippet: 'x'.repeat(200) }]
+        })),
+        inline_cot_expandable_content: { search_result_groups: [{ entries: [{ snippet: 'y'.repeat(200) }] }] }
+      },
+      recipient: 'all',
+      status: 'finished_successfully'
+    }, invokeId);
+    const assistantId = `a${turn}`;
+    add(assistantId, {
+      id: assistantId,
+      author: { role: 'assistant' },
+      content: { content_type: 'text', parts: [`assistant-${turn}`] },
+      metadata: { parent_id: toolId },
+      recipient: 'all',
+      status: 'finished_successfully',
+      end_turn: true
+    }, toolId);
+    parent = assistantId;
+  }
+  const raw = { mapping, current_node: 'a4' };
+  const result = sandbox.compactHistoricalToolPayload(raw);
+  assert.equal(result.summary.changed, true);
+  assert.equal(result.summary.totalUserTurns, 4);
+  assert.equal(result.summary.compactThroughTurn, 2);
+  assert.equal(result.summary.compactedToolMessageCount, 2);
+  assert.equal(result.summary.clearedSearchResultGroupCount, 3);
+  assert.equal(result.summary.clearedInlineCotCount, 2);
+  assert.ok(result.summary.afterToolBytes < result.summary.beforeToolBytes);
+  assert.equal(result.compactRaw.mapping.t1.message.metadata.search_result_groups.length, 0);
+  assert.equal(result.compactRaw.mapping.t2.message.metadata.search_result_groups.length, 0);
+  assert.equal('inline_cot_expandable_content' in result.compactRaw.mapping.t1.message.metadata, false);
+  assert.equal(result.compactRaw.mapping.t1.message.metadata.request_id, 'req-1');
+  assert.equal(result.compactRaw.mapping.t1.message.metadata.turn_id, 'turn-1');
+  assert.equal(result.compactRaw.mapping.t1.message.status, 'finished_successfully');
+  assert.equal(result.compactRaw.mapping.t3.message.metadata.search_result_groups.length, 3);
+  assert.equal(result.compactRaw.mapping.t4.message.metadata.search_result_groups.length, 4);
+  assert.equal(raw.mapping.t1.message.metadata.search_result_groups.length, 1, 'original payload must remain untouched');
+
+  const summarySandbox = {};
+  vm.runInNewContext(`
+    const APP_VERSION = 'test';
+    function extractConversationIdFromConversationDetailUrl() { return null; }
+    function extractConversationIdFromCurrentUrl() { return null; }
+    function nowIso() { return '2026-09-10T00:00:00.000Z'; }
+    function findRootNode(raw) { return raw?.mapping?.root || null; }
+    function collectReachableNodeIds(raw) { return new Set(Object.keys(raw?.mapping || {})); }
+    function findLatestLeafNodeForLite(raw) { return raw?.mapping?.[raw?.current_node] || null; }
+    function buildPathFromLeaf(raw, root, leaf) {
+      const path = [];
+      let current = leaf;
+      const seen = new Set();
+      while (current?.id && !seen.has(current.id)) {
+        seen.add(current.id);
+        path.push(current.id);
+        if (current.id === root?.id) break;
+        current = current.parent ? raw?.mapping?.[current.parent] : null;
+      }
+      return path.reverse();
+    }
+    ${extractInjectedFunction('isToolHistoryInvocationMessage')}
+    ${extractInjectedFunction('isToolHistorySummaryTargetMessage')}
+    ${extractInjectedFunction('buildToolHistorySummaryIndexFromConversation')}
+    this.buildToolHistorySummaryIndexFromConversation = buildToolHistorySummaryIndexFromConversation;
+  `, summarySandbox);
+  const summaryIndex = summarySandbox.buildToolHistorySummaryIndexFromConversation({ ...raw, conversation_id: 'conversation-test' });
+  assert.equal(summaryIndex.summarizedTurnCount, 4);
+  assert.equal(summaryIndex.totalToolInvocations, 4);
+  assert.equal(summaryIndex.byAssistantMessageId.a1.toolCount, 1);
+  assert.equal(summaryIndex.byAssistantMessageId.a4.toolCount, 1);
+
+  const originalMessagesPayload = {
+    conversation_id: 'conversation-test',
+    messages: [raw.mapping.u1.message, raw.mapping.t1.message, raw.mapping.a1.message],
+    page_info: { has_previous_page: true, start_cursor: 'cursor-test' }
+  };
+  const canonicalForRestore = {
+    mapping: {
+      u1: { message: raw.mapping.u1.message },
+      t1: { message: result.compactRaw.mapping.t1.message },
+      a1: { message: raw.mapping.a1.message }
+    }
+  };
+  const restored = sandbox.restoreToolCompactedPayloadShape(originalMessagesPayload, canonicalForRestore, 'messages');
+  assert.equal(restored.messages.length, 3);
+  assert.deepEqual(restored.page_info, originalMessagesPayload.page_info);
+  assert.equal(restored.messages[1].metadata.search_result_groups.length, 0);
+  assert.equal(restored.messages[1].metadata.parent_id, 'c1');
+});
+
+test('tool history payload summary index merges paginated turns within one conversation', () => {
+  const sandbox = {};
+  vm.runInNewContext(`${extractFunction('mergeToolHistoryPayloadSummaryIndex')}; this.mergeToolHistoryPayloadSummaryIndex = mergeToolHistoryPayloadSummaryIndex;`, sandbox);
+  const first = {
+    conversationId: 'conversation-a',
+    summarizedTurnCount: 1,
+    totalToolInvocations: 1,
+    byAssistantMessageId: {
+      a1: { assistantMessageId: 'a1', toolCount: 1 }
+    }
+  };
+  const second = {
+    conversationId: 'conversation-a',
+    summarizedTurnCount: 2,
+    totalToolInvocations: 3,
+    byAssistantMessageId: {
+      a2: { assistantMessageId: 'a2', toolCount: 2 },
+      a3: { assistantMessageId: 'a3', toolCount: 1 }
+    }
+  };
+  const merged = sandbox.mergeToolHistoryPayloadSummaryIndex(first, second);
+  assert.equal(merged.summarizedTurnCount, 3);
+  assert.equal(merged.totalToolInvocations, 4);
+  assert.deepEqual(Object.keys(merged.byAssistantMessageId).sort(), ['a1', 'a2', 'a3']);
+  assert.equal(merged.byAssistantMessageId.a2.toolCount, 2);
+
+  const replacement = sandbox.mergeToolHistoryPayloadSummaryIndex(merged, {
+    conversationId: 'conversation-b',
+    summarizedTurnCount: 1,
+    totalToolInvocations: 1,
+    byAssistantMessageId: { b1: { assistantMessageId: 'b1', toolCount: 1 } }
+  });
+  assert.equal(replacement.conversationId, 'conversation-b');
+  assert.deepEqual(Object.keys(replacement.byAssistantMessageId), ['b1']);
+});
+
+test('tool history compaction safety contract stays linked and guards the proven React boundary', () => {
+  assert.match(agentsSource, /docs\/tool_history_compaction_runtime_contract\.md/);
+  assert.match(agentsSource, /Do not physically detach, empty, or replace children of ChatGPT\/React-owned historical tool DOM/);
+  assert.match(toolHistoryCompactionContractSource, /Never physically detach ChatGPT\/React-owned historical tool DOM as an optimization/);
+  assert.match(toolHistoryCompactionContractSource, /build the tool-use summary index from the original normalized conversation response/i);
+  assert.match(toolHistoryCompactionContractSource, /latest two user-started turns/);
+  assert.match(toolHistoryCompactionContractSource, /merge by final Assistant message ID/i);
+  assert.match(toolHistoryCompactionContractSource, /CSS `::before`/);
+  assert.match(toolHistoryCompactionContractSource, /at least three consecutive tool-enabled sends/i);
+});
+
+test('long answer jump selects only an active long assistant and targets its preceding user', () => {
+  const helperStart = source.indexOf('  function selectLongAnswerJumpRecord(');
+  const helperEnd = source.indexOf('  function installLongAnswerJumpStyles(', helperStart);
+  assert.ok(helperStart > -1 && helperEnd > helperStart);
+  const sandbox = {};
+  vm.runInNewContext(`
+    const LONG_ANSWER_JUMP_MIN_VIEWPORT_RATIO = 1.25;
+    const LONG_ANSWER_JUMP_TOP_THRESHOLD_PX = 32;
+    ${source.slice(helperStart, helperEnd)}
+    this.selectLongAnswerJumpRecord = selectLongAnswerJumpRecord;
+    this.resolveLongAnswerJumpTarget = resolveLongAnswerJumpTarget;
+  `, sandbox);
+  const user = { section: 'user', role: 'user', rect: { top: -300, bottom: -200, height: 100 } };
+  const assistant = { section: 'assistant', role: 'assistant', rect: { top: -120, bottom: 1380, height: 1500 } };
+  const shortAssistant = { section: 'short', role: 'assistant', rect: { top: -40, bottom: 500, height: 540 } };
+  const records = [user, assistant, shortAssistant];
+  const active = sandbox.selectLongAnswerJumpRecord(records, 800);
+  assert.equal(active.section, 'assistant');
+  assert.equal(sandbox.resolveLongAnswerJumpTarget(records, active), 'user');
+  assert.equal(sandbox.selectLongAnswerJumpRecord([shortAssistant], 800), null);
+  assert.equal(sandbox.resolveLongAnswerJumpTarget([assistant], assistant), 'assistant');
+  assert.match(source, /document\.addEventListener\('scroll', scheduleLongAnswerJumpUpdate, \{ capture: true, passive: true \}\)/);
+  assert.match(source, /document\.removeEventListener\('scroll', scheduleLongAnswerJumpUpdate, true\)/);
+});
+
+test('Recent View remaining count waits for the same absolute turn index as Turn badges', () => {
+  const controlsStart = source.indexOf('  function updateRecentViewHistoryControls(');
+  const refreshStart = source.indexOf('  function updateRecentViewHistoryAbsoluteCount(', controlsStart);
+  const updateLiteBarStart = source.indexOf('  function updateLiteBar(', refreshStart);
+  const controlsSource = source.slice(controlsStart, refreshStart);
+  const refreshSource = source.slice(refreshStart, updateLiteBarStart);
+  const absoluteRequestStart = source.indexOf('  async function requestAbsoluteTurnIndexNow(');
+  const absoluteRequestEnd = source.indexOf('  function scheduleAbsoluteTurnIndex(', absoluteRequestStart);
+  const absoluteRequestSource = source.slice(absoluteRequestStart, absoluteRequestEnd);
+  const clearAbsoluteSource = source.slice(
+    source.indexOf('  function clearAbsoluteTurnIndexState('),
+    source.indexOf('  async function requestAbsoluteTurnIndexNow(')
+  );
+  assert.match(controlsSource, /messageTimeState\.absoluteTurnIndexLoaded/);
+  assert.match(controlsSource, /countReady \? `以前の履歴（残り\$\{remainingTurnCount\}件）:` : '以前の履歴:'/);
+  assert.match(refreshSource, /messageTimeState\.absoluteTurnTotalCount/);
+  assert.match(refreshSource, /controls\.dataset\.totalTurnCount = String\(totalTurnCount\)/);
+  assert.match(absoluteRequestSource, /absoluteTurnTotalCount: Number\.isInteger\(Number\(index\.totalTurnCount\)\)/);
+  assert.match(absoluteRequestSource, /updateRecentViewHistoryAbsoluteCount\(\)/);
+  assert.match(clearAbsoluteSource, /absoluteTurnTotalCount: null/);
 });
 
 test('assistant completion is bound to the generation conversation and navigation abandons without sound', () => {
@@ -996,7 +1568,7 @@ test('history search navigation temporarily bypasses Lite without persisting a u
   assert.match(injectedSource, /historySearchBypass: true/);
   assert.match(injectedSource, /configSource: 'history_search_bypass'/);
   assert.match(injectedSource, /const enabled = Boolean\(currentConversationId\) && !userDisabled && !historySearchBypass/);
-  assert.match(injectedSource, /if \(config\.historySearchBypass\) return false/);
+  assert.match(injectedSource, /if \(config\.historySearchBypass\) return false;/);
   assert.match(injectedSource, /historySearchBypass: Boolean\(config\.historySearchBypass\)/);
   assert.match(source, /function isHistorySearchNavigationUrl\(value = window\.location\.href\)/);
   assert.match(source, /if \(isHistorySearchNavigationUrl\(\)\) \{/);
@@ -1150,7 +1722,7 @@ test('Lite image display option is persisted and synced to main-world config', (
 
 test('Lite image option sync does not rewrite enabled=false into popup_disable by itself', () => {
   const start = injectedSource.indexOf('  function setLiteDisplayConfig(config) {');
-  const end = injectedSource.indexOf('  function getLiteDisplayInternalDiagnostic', start);
+  const end = injectedSource.indexOf('  function isConversationJsonFetchResponse', start);
   const setterSource = injectedSource.slice(start, end);
   assert.match(setterSource, /const hasExplicitEnabled = Object\.prototype\.hasOwnProperty\.call\(config \|\| \{\}, 'enabled'\)/);
   assert.match(setterSource, /if \(hasExplicitEnabled && merged\.enabled === false\)/);
@@ -1162,8 +1734,36 @@ test('assistant completion sound remains selectable, persisted, and previewable 
   assert.match(popupHtmlSource, /id="assistantCompletionSoundToggle"/);
   assert.match(popupHtmlSource, /id="assistantCompletionSoundSelect"/);
   assert.match(popupHtmlSource, /id="assistantCompletionSoundVolume"/);
+  assert.match(popupHtmlSource, /\.sound-control-row\[data-sound-select-row\] \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\) 144px 68px;/);
+  assert.match(popupHtmlSource, /#assistantCompletionSoundTest \{[\s\S]*?white-space: nowrap;/);
+  assert.match(popupHtmlSource, /id="assistantCompletionSoundVolume"[^>]*value="30"/);
+  assert.match(popupHtmlSource, /id="assistantCompletionSoundVolumeHint"[^>]*>30%<\/output>/);
+  assert.match(popupSource, /const ASSISTANT_COMPLETION_SOUND_REFERENCE_UI_PERCENT = 30/);
+  assert.match(source, /const ASSISTANT_COMPLETION_SOUND_REFERENCE_UI_PERCENT = 30/);
+  const volumeHelperStart = popupSource.indexOf('  function normalizeAssistantCompletionSoundVolume(value) {');
+  const volumeHelperEnd = popupSource.indexOf('  function buildUiSettingsPayload()', volumeHelperStart);
+  assert.ok(volumeHelperStart > -1 && volumeHelperEnd > volumeHelperStart);
+  const volumeSandbox = {};
+  vm.runInNewContext(`
+    const DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME = 0.153;
+    const ASSISTANT_COMPLETION_SOUND_REFERENCE_UI_PERCENT = 30;
+    const MAX_ASSISTANT_COMPLETION_SOUND_VOLUME = DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME / (ASSISTANT_COMPLETION_SOUND_REFERENCE_UI_PERCENT / 100);
+    ${popupSource.slice(volumeHelperStart, volumeHelperEnd)}
+    this.toUi = assistantCompletionSoundVolumeToUiPercent;
+    this.fromUi = assistantCompletionSoundUiPercentToVolume;
+  `, volumeSandbox);
+  assert.equal(volumeSandbox.toUi(0.306), 60);
+  assert.ok(Math.abs(volumeSandbox.fromUi(100) - 0.51) < 1e-12);
   assert.match(popupHtmlSource, /value="classic_chime" selected>通知音1<\/option>/);
   assert.match(popupHtmlSource, /value="soft_chime">通知音2<\/option>/);
+  for (let number = 3; number <= 14; number += 1) {
+    const padded = String(number).padStart(2, '0');
+    assert.match(popupHtmlSource, new RegExp(`value="notification_sound_${padded}">通知音${number}<\\/option>`));
+    assert.match(popupSource, new RegExp(`'notification_sound_${padded}'`));
+    assert.match(backgroundSource, new RegExp(`'notification_sound_${padded}'`));
+    assert.match(offscreenSource, new RegExp(`notification_sound_${padded}: 'sounds\\/notification-${padded}\\.opus'`));
+    assert.match(source, new RegExp(`id: 'notification_sound_${padded}'[\\s\\S]*?label: '通知音${number}'`));
+  }
   assert.match(popupSource, /\[ASSISTANT_COMPLETION_SOUND_ID_STORAGE_KEY\]: payload\.assistantCompletionSoundId/);
   assert.match(popupSource, /\[ASSISTANT_COMPLETION_SOUND_VOLUME_STORAGE_KEY\]: payload\.assistantCompletionSoundVolume/);
   assert.match(popupSource, /type: 'ARCAIA_PLAY_COMPLETION_SOUND'/);
@@ -1171,16 +1771,42 @@ test('assistant completion sound remains selectable, persisted, and previewable 
   assert.match(popupSource, /function updateRangeProgress\(input, percent\)/);
   assert.match(backgroundSource, /ARCAIA_PLAY_COMPLETION_SOUND/);
   assert.match(offscreenSource, /audio\.volume = appliedVolume/);
+  assert.match(offscreenSource, /sounds\/notification-01\.wav/);
+  assert.match(offscreenSource, /sounds\/notification-02\.wav/);
+  assert.match(offscreenSource, /soundId === 'notification_08'\) return 'soft_chime'/);
+  assert.match(backgroundSource, /id === 'notification_08'\) return 'soft_chime'/);
+  assert.match(popupSource, /soundId === 'notification_08'\) return 'soft_chime'/);
+  assert.match(source, /id === 'notification_08'\) return 'soft_chime'/);
+  assert.doesNotMatch(offscreenSource, /synthesizeFutureGlass|notification-\d{2}\.webm|assistant-complete\.ogg/);
+  assert.equal(completionSoundAssetPaths.length, 2);
+  for (const assetPath of completionSoundAssetPaths) {
+    const asset = fs.readFileSync(assetPath);
+    assert.equal(asset.subarray(0, 4).toString('ascii'), 'RIFF');
+    assert.equal(asset.subarray(8, 12).toString('ascii'), 'WAVE');
+    assert.ok(asset.length > 100000);
+  }
+  assert.equal(completionSoundOpusAssetPaths.length, 12);
+  for (const assetPath of completionSoundOpusAssetPaths) {
+    const asset = fs.readFileSync(assetPath);
+    assert.equal(asset.subarray(0, 4).toString('ascii'), 'OggS');
+    assert.ok(asset.includes(Buffer.from('OpusHead')));
+    assert.ok(asset.length > 8000);
+  }
+  assert.equal(completionSoundNormalization.files.length, 2);
+  assert.match(completionSoundNormalization.method, /RMS normalization.*PCM 16-bit WAV/);
+  assert.ok(completionSoundNormalization.decodedRmsSpreadDb <= 1.5);
 });
 
 test('popup uses soft-graphite dark colors and the simplified one-line master header', () => {
   assert.doesNotMatch(popupHtmlSource, /class="popup-header"|class="popup-brand"|id="popupCloseButton"|>オプション</);
-  assert.match(popupHtmlSource, /<span class="master-title">Arcaia<\/span>[\s\S]*?id="operationModeStatus"[^>]*><\/span>[\s\S]*?class="menu-version">v0\.1\.275<\/span>[\s\S]*?id="settingsSaveState"[^>]*data-state="idle"[^>]*hidden[\s\S]*?class="master-switch-label"/);
+  assert.match(popupHtmlSource, /<span class="master-title">Arcaia<\/span>[\s\S]*?id="operationModeStatus"[^>]*><\/span>[\s\S]*?class="menu-version">v0\.1\.318<\/span>[\s\S]*?id="settingsSaveState"[^>]*data-state="idle"[^>]*hidden[\s\S]*?class="master-switch-label"/);
   assert.match(popupHtmlSource, /\.extension-state \{[\s\S]*?grid-template-columns: auto minmax\(0, 1fr\) auto auto auto;[\s\S]*?margin: 10px 12px;/);
   assert.match(popupHtmlSource, /\.master-switch-track \{[\s\S]*?width: 48px;[\s\S]*?height: 28px;/);
   assert.match(popupHtmlSource, /\.switch-track \{[\s\S]*?width: 34px;[\s\S]*?height: 20px;/);
   assert.match(popupHtmlSource, /\.switch-input:checked \+ \.master-switch-track::after \{ transform: translateX\(20px\); \}/);
-  assert.doesNotMatch(popupSource, /popupCloseButton|window\.close\(\)/);
+  assert.doesNotMatch(popupSource, /popupCloseButton/);
+  assert.match(popupSource, /window\.addEventListener\('blur'/);
+  assert.match(popupSource, /await settingsCommitQueue;[\s\S]*?!document\.hasFocus\(\)[\s\S]*?window\.close\(\)/);
   assert.match(popupHtmlSource, /<section class="settings-section" data-section="display">/);
   assert.match(popupHtmlSource, /<section class="settings-section" data-section="operation">/);
   assert.match(popupHtmlSource, /<section class="settings-section" data-section="sidebar">/);
@@ -1369,8 +1995,11 @@ test.skip('legacy completion-sound popup implementation contract was replaced in
   );
   assert.match(source, /function getAssistantCompletionSoundPreset\(soundId = assistantCompletionSoundId\)/);
   assert.match(source, /function setAssistantCompletionSoundEnabled\(enabled, reason = 'manual'\)/);
-  assert.match(source, /function syncAssistantCompletionSoundFromStorage\(\)/);
-  assert.match(source, /await syncAssistantCompletionSoundFromStorage\(\)/);
+  assert.match(source, /async function syncUiSettingsFromStorage\(\)/);
+  assert.match(source, /assistantCompletionSoundEnabled = Boolean\(featureSettings\.completionSound\)/);
+  assert.match(source, /assistantCompletionSoundId = isValidAssistantCompletionSoundId/);
+  assert.match(source, /assistantCompletionSoundVolume = normalizeAssistantCompletionSoundVolume/);
+  assert.doesNotMatch(source, /syncAssistantCompletionSoundFromStorage/);
   assert.match(source, /function playAssistantCompletionSound\(reason = 'assistant_completed'\)/);
   assert.match(source, /function triggerAssistantCompletionSound\(reason = 'assistant_completed'\)/);
   assert.match(source, /function triggerAssistantCompletionSoundOnce\(reason = 'assistant_completed'\)/);
@@ -1451,7 +2080,7 @@ test('release version helper supports dry-run version bumps for known release fi
   assert.match(helperSource, /manifest\.json/);
   assert.match(helperSource, /content\.js/);
   assert.match(helperSource, /injected-main\.js/);
-  assert.match(helperSource, /popup\.html/);
+  assert.doesNotMatch(helperSource, /popup\.html/);
   assert.match(helperSource, /tests\/lite-grouping\.test\.js/);
   assert.doesNotMatch(helperSource, /aice-probe-main-|aice-probe-content-/);
 });
@@ -1569,6 +2198,30 @@ test('assistant pending-response status only preserves an already active generat
   assert.equal(preserve(true, { streamingResponseStatusPresent: false }), false);
 });
 
+test('assistant image generation loading state preserves an active generation across a transient stream gap', () => {
+  const detectImageGeneration = Function(
+    'document',
+    'ASSISTANT_IMAGE_GENERATION_LOADING_SELECTOR',
+    `${extractFunction('hasLatestAssistantImageGenerationLoadingState')}\nreturn hasLatestAssistantImageGenerationLoadingState;`
+  )({ querySelectorAll: () => [] }, '[data-testid="image-gen-loading-state"]');
+  const preserve = Function(
+    `${extractFunction('shouldPreserveAssistantGenerationForImageGeneration')}\nreturn shouldPreserveAssistantGenerationForImageGeneration;`
+  )();
+  const completedTurn = { querySelector: () => null };
+  const imageGeneratingTurn = {
+    querySelector(selector) {
+      return selector === '[data-testid="image-gen-loading-state"]' ? {} : null;
+    }
+  };
+  assert.equal(detectImageGeneration({ querySelectorAll: () => [completedTurn, imageGeneratingTurn] }), true);
+  assert.equal(detectImageGeneration({ querySelectorAll: () => [imageGeneratingTurn, completedTurn] }), false);
+  assert.equal(preserve(true, { imageGenerationLoadingPresent: true }), true);
+  assert.equal(preserve(false, { imageGenerationLoadingPresent: true }), false);
+  assert.equal(preserve(true, { imageGenerationLoadingPresent: false }), false);
+  assert.match(source, /detector\?\.generating \|\| preserveGeneration/);
+  assert.match(source, /shouldPreserveAssistantGenerationForImageGeneration\(assistantGenerationActive, detector\)/);
+});
+
 test('assistant loading title prefix remains singular across animation frames', () => {
   const helperStart = source.indexOf('  function stripAssistantActivityTitlePrefix(title) {');
   const helperEnd = source.indexOf('  function setAssistantActivityTitlePrefix(prefix) {', helperStart);
@@ -1591,6 +2244,35 @@ test('assistant loading title prefix remains singular across animation frames', 
   }
   const stacked = '|･･ ･|･ ･･| 会話タイトル';
   assert.equal(sandbox.stripAssistantActivityTitlePrefix(stacked), '会話タイトル');
+});
+
+test('assistant loading title adopts a later native conversation title during animation', () => {
+  const helperStart = source.indexOf('  function stripAssistantActivityTitlePrefix(title) {');
+  const helperEnd = source.indexOf('  function getAssistantLoadingTitleFrame() {', helperStart);
+  assert.ok(helperStart > -1 && helperEnd > helperStart);
+  const sandbox = {};
+  vm.runInNewContext(`
+    const ASSISTANT_LOADING_TITLE_FRAMES = Object.freeze(['|･･ ', '･|･ ', '･･| ']);
+    const ASSISTANT_COMPLETED_INACTIVE_TITLE_PREFIX = '● ';
+    const ASSISTANT_TITLE_PREFIX_STRIP_LIMIT = 32;
+    let assistantActivityOriginalTitle = null;
+    let assistantActivityTitlePrefix = '';
+    const document = { title: 'ChatGPT' };
+    ${source.slice(helperStart, helperEnd)}
+    this.document = document;
+    this.setAssistantActivityTitlePrefix = setAssistantActivityTitlePrefix;
+    this.clearAssistantActivityTitlePrefix = clearAssistantActivityTitlePrefix;
+  `, sandbox);
+
+  sandbox.setAssistantActivityTitlePrefix('|･･ ');
+  assert.equal(sandbox.document.title, '|･･ ChatGPT');
+
+  sandbox.document.title = '会話タイトル';
+  sandbox.setAssistantActivityTitlePrefix('･|･ ');
+  assert.equal(sandbox.document.title, '･|･ 会話タイトル');
+
+  sandbox.clearAssistantActivityTitlePrefix();
+  assert.equal(sandbox.document.title, '会話タイトル');
 });
 
 test('assistant stream mutation transition distinguishes generation start, hidden completion, and final removal', () => {
@@ -1749,12 +2431,195 @@ test('Lite image outputs can remain visible or fall back to explicit placeholder
   assert.doesNotMatch(builderSource, /fetch\s*\(/);
 });
 
+test('plural conversations messages payload is normalized for Recent View and model authority', () => {
+  const sandbox = { Date };
+  for (const name of [
+    'normalizeConversationPayloadForArcaia',
+    'findRootNode',
+    'getLeafNodes',
+    'collectReachableNodeIds',
+    'findLatestLeafNodeForLite',
+    'buildPathFromLeaf'
+  ]) {
+    vm.runInNewContext(`${extractInjectedFunction(name)}; this.${name} = ${name};`, sandbox);
+  }
+  sandbox.extractTextFromMessage = (message) => String(message?.content?.parts?.[0] || '');
+  sandbox.extractConversationIdFromConversationDetailUrl = () => null;
+  vm.runInNewContext(`${extractInjectedFunction('buildCurrentConversationModelConfig')}; this.buildCurrentConversationModelConfig = buildCurrentConversationModelConfig;`, sandbox);
+  vm.runInNewContext(`${extractInjectedFunction('restoreConversationPayloadShape')}; this.restoreConversationPayloadShape = restoreConversationPayloadShape;`, sandbox);
+
+  const message = (id, parentId, role, effort = null) => ({
+    id,
+    author: { role },
+    content: { content_type: 'text', parts: [`${role}:${id}`] },
+    metadata: {
+      parent_id: parentId,
+      ...(effort ? { model_slug: 'gpt-5-6-thinking', thinking_effort: effort } : {})
+    },
+    recipient: role === 'assistant' ? 'all' : undefined,
+    create_time: 100
+  });
+  const raw = {
+    conversation_id: 'conversation-current',
+    current_node: 'a4',
+    page_info: { has_previous_page: true, start_cursor: 'cursor', has_next_page: false, end_cursor: 'end' },
+    messages: [
+      message('s0', null, 'system'),
+      message('u1', 's0', 'user'), message('a1', 'u1', 'assistant'),
+      message('u2', 'a1', 'user'), message('a2', 'u2', 'assistant'),
+      message('u3', 'a2', 'user'), message('a3', 'u3', 'assistant'),
+      message('u4', 'a3', 'user'), message('a4', 'u4', 'assistant', 'xhigh')
+    ]
+  };
+  const normalized = sandbox.normalizeConversationPayloadForArcaia(raw);
+  assert.equal(normalized.sourceFormat, 'messages');
+  assert.equal(Object.prototype.hasOwnProperty.call(normalized.raw, 'messages'), false);
+  assert.equal(normalized.raw.mapping.a4.parent, 'u4');
+  assert.deepEqual(Array.from(normalized.raw.mapping.u4.children), ['a4']);
+  assert.equal(normalized.raw.current_node, 'a4');
+
+  const config = sandbox.buildCurrentConversationModelConfig(normalized.raw);
+  assert.equal(config.modelSlug, 'gpt-5-6-thinking');
+  assert.equal(config.thinkingEffort, 'xhigh');
+  assert.equal(config.currentNodeUsed, true);
+
+  const keptIds = ['s0', 'u2', 'a2', 'u3', 'a3', 'u4', 'a4'];
+  const liteMapping = {};
+  for (let index = 0; index < keptIds.length; index += 1) {
+    const id = keptIds[index];
+    liteMapping[id] = {
+      ...normalized.raw.mapping[id],
+      parent: keptIds[index - 1] || null,
+      children: keptIds[index + 1] ? [keptIds[index + 1]] : []
+    };
+  }
+  const restored = sandbox.restoreConversationPayloadShape(raw, { ...normalized.raw, mapping: liteMapping, current_node: 'a4' }, 'messages');
+  assert.equal(Object.prototype.hasOwnProperty.call(restored, 'mapping'), false);
+  assert.deepEqual(Array.from(restored.messages, (item) => item.id), keptIds);
+  assert.deepEqual(Array.from(restored.messages, (item) => item.metadata.parent_id), [null, 's0', 'u2', 'a2', 'u3', 'a3', 'u4']);
+  assert.equal(restored.current_node, 'a4');
+  assert.equal(restored.page_info.has_previous_page, false);
+  assert.equal(restored.page_info.start_cursor, null);
+  assert.equal(restored.page_info.has_next_page, false);
+  assert.equal(restored.page_info.end_cursor, 'end');
+
+  assert.match(injectedSource, /backend-api\\\/conversations\?\\\/\[\^\/\?#\]\+\$/);
+  assert.match(injectedSource, /normalizeConversationPayloadForArcaia\(raw\)/);
+  assert.match(injectedSource, /restoreConversationPayloadShape\(raw, rewrittenCanonical, sourceFormat\)/);
+  assert.match(injectedSource, /restoreToolCompactedPayloadShape\(raw, rewrittenCanonical, sourceFormat\)/);
+});
+test('flat messages use response order when parent_id references are incomplete', () => {
+  const sandbox = { Date };
+  for (const name of [
+    'normalizeConversationPayloadForArcaia',
+    'findRootNode',
+    'getLeafNodes',
+    'collectReachableNodeIds',
+    'findLatestLeafNodeForLite',
+    'buildPathFromLeaf'
+  ]) {
+    vm.runInNewContext(`${extractInjectedFunction(name)}; this.${name} = ${name};`, sandbox);
+  }
+  sandbox.extractTextFromMessage = () => '';
+
+  const direct = (id, parentId, role) => ({
+    id,
+    author: { role },
+    recipient: role === 'assistant' ? 'all' : undefined,
+    content: { content_type: role === 'user' ? 'nonstandard_visible_user' : 'text', parts: role === 'assistant' ? [id] : [] },
+    metadata: { parent_id: parentId },
+    create_time: 100
+  });
+  const raw = {
+    conversation_id: 'conversation-broken-parent-links',
+    current_node: 'a5',
+    page_info: { has_previous_page: false, has_next_page: false },
+    messages: [
+      direct('u1', 'outside-1', 'user'), direct('a1', 'outside-2', 'assistant'),
+      direct('tool-1', 'outside-3', 'tool'),
+      direct('u2', 'outside-4', 'user'), direct('a2', 'u2', 'assistant'),
+      direct('u3', 'outside-5', 'user'), direct('a3', 'u3', 'assistant'),
+      direct('u4', 'outside-6', 'user'), direct('a4', 'u4', 'assistant'),
+      direct('u5', 'outside-7', 'user'), direct('a5', 'u5', 'assistant')
+    ]
+  };
+
+  const normalized = sandbox.normalizeConversationPayloadForArcaia(raw);
+  assert.equal(normalized.raw.mapping.u1.parent, null);
+  assert.equal(normalized.raw.mapping.a1.parent, 'u1');
+  assert.equal(normalized.raw.mapping['tool-1'].parent, 'a1');
+  assert.equal(normalized.raw.mapping.u2.parent, 'tool-1');
+  assert.deepEqual(Array.from(normalized.raw.mapping.u4.children), ['a4']);
+  const rootNode = sandbox.findRootNode(normalized.raw);
+  const reachable = sandbox.collectReachableNodeIds(normalized.raw, rootNode);
+  const leaf = sandbox.findLatestLeafNodeForLite(normalized.raw, reachable);
+  const pathIds = sandbox.buildPathFromLeaf(normalized.raw, rootNode, leaf);
+  assert.deepEqual(Array.from(pathIds), raw.messages.map((message) => message.id));
+});
+
+test('flat messages preserve backend parent_id branches when those parents are present', () => {
+  const sandbox = { Date };
+  for (const name of [
+    'normalizeConversationPayloadForArcaia',
+    'findRootNode',
+    'collectReachableNodeIds',
+    'findLatestLeafNodeForLite',
+    'buildPathFromLeaf'
+  ]) {
+    vm.runInNewContext(`${extractInjectedFunction(name)}; this.${name} = ${name};`, sandbox);
+  }
+  const message = (id, parentId, role) => ({
+    id,
+    author: { role },
+    recipient: role === 'assistant' ? 'all' : undefined,
+    content: { content_type: 'text', parts: [id] },
+    metadata: { parent_id: parentId },
+    create_time: 100
+  });
+  const raw = {
+    conversation_id: 'conversation-branched',
+    current_node: 'a2b',
+    messages: [
+      message('u1', null, 'user'),
+      message('a1', 'u1', 'assistant'),
+      message('u2a', 'a1', 'user'),
+      message('a2a', 'u2a', 'assistant'),
+      message('u2b', 'a1', 'user'),
+      message('a2b', 'u2b', 'assistant')
+    ]
+  };
+  const normalized = sandbox.normalizeConversationPayloadForArcaia(raw);
+  assert.deepEqual(Array.from(normalized.raw.mapping.a1.children), ['u2a', 'u2b']);
+  assert.equal(normalized.raw.mapping.u2b.parent, 'a1');
+  const rootNode = sandbox.findRootNode(normalized.raw);
+  const reachable = sandbox.collectReachableNodeIds(normalized.raw, rootNode);
+  const leaf = sandbox.findLatestLeafNodeForLite(normalized.raw, reachable);
+  const pathIds = sandbox.buildPathFromLeaf(normalized.raw, rootNode, leaf);
+  assert.deepEqual(Array.from(pathIds), ['u1', 'a1', 'u2b', 'a2b']);
+});
+
+test('flat Recent View treats non-text user role messages as turn boundaries', () => {
+  const sandbox = {
+    extractTextFromMessage: (message) => String(message?.content?.parts?.[0] || ''),
+    isVisuallyHiddenMessage: (message) => message?.metadata?.is_visually_hidden_from_conversation === true
+  };
+  vm.runInNewContext(`${extractInjectedFunction('classifyLitePathMessage')}; this.classifyLitePathMessage = classifyLitePathMessage;`, sandbox);
+  const raw = { mapping: {
+    user: { message: { author: { role: 'user' }, content: { content_type: 'nonstandard_visible_user', parts: [] }, metadata: {} } },
+    assistantEmpty: { message: { author: { role: 'assistant' }, recipient: 'all', content: { content_type: 'text', parts: [] }, metadata: {} } },
+    assistantText: { message: { author: { role: 'assistant' }, recipient: 'all', content: { content_type: 'text', parts: ['ok'] }, metadata: {} } }
+  } };
+  assert.equal(sandbox.classifyLitePathMessage(raw, 'user').keep, true);
+  assert.equal(sandbox.classifyLitePathMessage(raw, 'assistantEmpty').keep, false);
+  assert.equal(sandbox.classifyLitePathMessage(raw, 'assistantText').keep, true);
+});
+
 test('backend Lite rewrite has a short conversation no-op guard', () => {
   const builderStart = injectedSource.indexOf('  function buildLiteRawForPage(');
   const builderEnd = injectedSource.indexOf('  function summarizeNetworkLiteJsonForProbe', builderStart);
   const builderSource = injectedSource.slice(builderStart, builderEnd);
   const guardIndex = builderSource.indexOf('if (turns.length <= safeTurnCount)');
-  const laterIndex = builderSource.indexOf('const userOnlyTurnIds = new Set');
+  const laterIndex = builderSource.indexOf('const retainedUserNodeIds = retainedTurns');
   assert.ok(guardIndex > -1);
   assert.ok(laterIndex > guardIndex);
   assert.match(builderSource, /below_lite_turn_threshold/);
@@ -1762,18 +2627,67 @@ test('backend Lite rewrite has a short conversation no-op guard', () => {
   assert.match(builderSource, /syntheticImagePlaceholderCount: 0/);
 });
 
-test('Lite synthetic image placeholders are inserted only for user-only retained turns with downstream image signals', () => {
+test('Lite image paths are checked for every retained user-started turn', () => {
   const builderStart = injectedSource.indexOf('  function buildLiteRawForPage(');
   const builderEnd = injectedSource.indexOf('  function summarizeNetworkLiteJsonForProbe', builderStart);
   const builderSource = injectedSource.slice(builderStart, builderEnd);
-  assert.match(builderSource, /const userOnlyTurnIds = new Set/);
+  assert.match(builderSource, /const retainedUserNodeIdSet = new Set\(retainedUserNodeIds\)/);
   assert.match(builderSource, /imageDisplayDiagnostics\.push\(\{/);
   assert.match(builderSource, /addedPathNodeCount: addedPathNodeIds\.length/);
-  assert.match(builderSource, /roles\.has\('user'\) && !roles\.has\('assistant'\)/);
+  assert.match(builderSource, /if \(!retainedUserNodeIdSet\.has\(id\)\) continue/);
+  assert.doesNotMatch(builderSource, /userOnlyTurnIds/);
   assert.match(builderSource, /findLiteImageSignalAfterUser\(raw, pathIds, id, retainedUserNodeIdSet\)/);
   assert.match(builderSource, /createSyntheticLiteImagePlaceholderNode\(id, sourceSignal/);
   assert.match(builderSource, /syntheticImagePlaceholderCount: syntheticPlaceholderDiagnostics\.length/);
   assert.match(builderSource, /syntheticImagePlaceholders: syntheticPlaceholderDiagnostics/);
+});
+
+test('backend rewrite retains an image path when the retained turn already has assistant text', () => {
+  const sandbox = {
+    findRootNode: (raw) => raw.mapping.root,
+    collectReachableNodeIds: (raw) => raw.pathIds.slice(),
+    findLatestLeafNodeForLite: (raw) => raw.mapping[raw.pathIds[raw.pathIds.length - 1]],
+    buildPathFromLeaf: (raw) => raw.pathIds.slice(),
+    classifyLitePathMessage: (raw, id) => {
+      const message = raw.mapping[id]?.message || null;
+      return { id, role: message?.role || null, keep: Boolean(message?.keep) };
+    },
+    findLiteImageSignalAfterUser: (_raw, _pathIds, userNodeId) => (
+      userNodeId === 'u3' ? { nodeId: 'img3', role: 'tool', contentType: 'image_asset_pointer' } : null
+    ),
+    createSyntheticLiteImagePlaceholderNode: () => ({ id: 'synthetic', parent: null, children: [], message: null }),
+    applyLiteImagePlaceholderToMessage: () => false
+  };
+  const builderStart = injectedSource.indexOf('  function buildLiteRawForPage(');
+  const builderEnd = injectedSource.indexOf('  function getPublicLiteDisplayState(', builderStart);
+  const builderFunctionSource = injectedSource.slice(builderStart + 2, builderEnd).trim();
+  vm.runInNewContext(`${builderFunctionSource}\nthis.buildLiteRawForPage = buildLiteRawForPage;`, sandbox);
+  const pathIds = ['root', 'u1', 'a1', 'u2', 'a2', 'u3', 'a3', 'img3', 'u4', 'a4'];
+  const mapping = {};
+  for (let index = 0; index < pathIds.length; index += 1) {
+    const id = pathIds[index];
+    const role = id.startsWith('u') ? 'user' : id.startsWith('a') ? 'assistant' : id === 'img3' ? 'tool' : null;
+    mapping[id] = {
+      id,
+      parent: pathIds[index - 1] || null,
+      children: pathIds[index + 1] ? [pathIds[index + 1]] : [],
+      message: role ? { role, keep: role === 'user' || role === 'assistant' } : null
+    };
+  }
+  const result = sandbox.buildLiteRawForPage({ mapping, pathIds, current_node: 'a4' }, 1, { liteShowImages: true });
+  assert.ok(result.liteRaw.mapping.img3);
+  assert.equal(result.summary.liteImageDisplayNodeCount, 1);
+  assert.equal(result.summary.syntheticImagePlaceholderCount, 0);
+
+  const exactThree = sandbox.buildLiteRawForPage(
+    { mapping, pathIds, current_node: 'a4' },
+    3,
+    { liteShowImages: true, renderAnchorExtraTurnCount: 0 }
+  );
+  assert.equal(exactThree.summary.backendRetainedTurnCount, 3);
+  assert.equal(exactThree.summary.retainedTurnCount, 3);
+  assert.equal(Boolean(exactThree.liteRaw.mapping.u1), false);
+  assert.equal(Boolean(exactThree.liteRaw.mapping.u2), true);
 });
 
 test('Lite synthetic image placeholder guard stops at the next retained user turn', () => {
@@ -1801,7 +2715,7 @@ test('Lite image signal scan ignores search result thumbnails to avoid false pla
   assert.match(ignoreSource, /thumbnails/);
 
   const scanStart = injectedSource.indexOf('  function collectLiteImageSignalKeys(');
-  const scanEnd = injectedSource.indexOf('  function collectLiteImageSignalScan', scanStart);
+  const scanEnd = injectedSource.indexOf('  function buildLiteRawForPage', scanStart);
   const scanSource = injectedSource.slice(scanStart, scanEnd);
   assert.match(scanSource, /isIgnoredLiteImageSignalPath\(childPath, key\)/);
   assert.match(scanSource, /lowered\.includes\('image'\)/);
@@ -2017,8 +2931,8 @@ test('block collapser targets real code and writing blocks without folding plain
   assert.doesNotMatch(source, /collectBlockCollapserDiagnostics/);
   assert.match(codeSource, /function isRealCodeHeader/);
   assert.match(codeSource, /buttons\.some\(isCodeBlockCopyButton\)/);
-  assert.match(codeSource, /function hasWritingEditButton/);
-  assert.match(codeSource, /buttons\.some\(isWritingEditButton\)/);
+  assert.doesNotMatch(codeSource, /function hasWritingEditButton/);
+  assert.match(codeSource, /Array\.from\(outerBlock\.querySelectorAll\('button'\)\)\.find\(isWritingEditButton\)/);
   assert.match(codeSource, /outerBlock\.querySelector\(WRITING_BLOCK_SELECTOR\)/);
   assert.match(codeSource, /function findWritingOuterBlock/);
   assert.match(codeSource, /writingBlock\.closest\('section'\)/);
@@ -2058,7 +2972,7 @@ test('block collapser targets real code and writing blocks without folding plain
   assert.match(source, /startCodeBlockCollapserUi\(\)/);
 });
 
-test('pinned sidebar sorter isolates standalone chats and each project folder without moving folders', () => {
+test('pinned sidebar sorter isolates standalone chats and project chat scopes', () => {
   assert.match(source, /const PINNED_SORT_STORAGE_KEY = 'arcaia\.sidebarPinnedSorter\.v1'/);
   assert.match(source, /const PINNED_FAVORITES_STORAGE_KEY = 'arcaia\.sidebarPinnedFavorites\.v1'/);
   assert.match(source, /function startPinnedSortEarlyGate/);
@@ -2171,6 +3085,50 @@ test('pinned sidebar sorter isolates standalone chats and each project folder wi
   assert.doesNotMatch(pinnedSource, /pinnedSortObserver\.observe\(target/);
   assert.doesNotMatch(source, /cloneNode\(/);
   assert.doesNotMatch(source, /createFolder\(/);
+});
+
+test('top-level project folders use native stable IDs and cannot mix with chat rows', () => {
+  const mainStart = injectedSource.indexOf('  function isProjectSidebarJsonFetchResponse(');
+  const mainEnd = injectedSource.indexOf('  async function maybeRewriteFetchResponseForLiteDisplay', mainStart);
+  const projectMainSource = injectedSource.slice(mainStart, mainEnd);
+  assert.match(projectMainSource, /\/backend-api\/gizmos\/snorlax\/sidebar/);
+  assert.match(projectMainSource, /response\.clone\(\)\.json\(\)/);
+  assert.match(projectMainSource, /projects\.push\(\{ id, name \}\)/);
+  assert.match(injectedSource, /GET_PROJECT_SIDEBAR_INDEX/);
+  assert.match(injectedSource, /isProjectSidebarJsonFetchResponse\(method, url, response\)/);
+  assert.match(injectedSource, /observeProjectSidebarIndexFromResponse\(response\)/);
+  assert.doesNotMatch(projectMainSource, /originalFetch|fetch\(/);
+
+  const pinnedStart = source.indexOf('  const PINNED_SORT_STYLE_ID');
+  const pinnedEnd = source.indexOf('  const TURN_EXPORT_BUTTON_ATTR', pinnedStart);
+  const pinnedSource = source.slice(pinnedStart, pinnedEnd);
+  assert.match(pinnedSource, /PINNED_SORT_PROJECT_BUTTON_SELECTOR/);
+  assert.match(pinnedSource, /scopeKey: 'project-folders'/);
+  assert.match(pinnedSource, /scopeType: 'project-folder'/);
+  assert.match(pinnedSource, /matches\.length === 1 \? matches\[0\]\.id : null/);
+  assert.match(pinnedSource, /function collectPinnedSortProjectRows\(nav\)/);
+  assert.match(pinnedSource, /function collectPinnedSortAllRows\(pinnedSection, nav = getPinnedSortNav\(\)\)/);
+  assert.match(pinnedSource, /scopeCountByList\.get\(scope\.list\) === 1/);
+  assert.match(pinnedSource, /function unbindPinnedSortList\(list\)/);
+  assert.match(pinnedSource, /scopeCountByList\.get\(scope\.list\) > 1/);
+  assert.match(pinnedSource, /payload\.scopeKey !== latestScope\.key/);
+  assert.match(pinnedSource, /projectRows = collectPinnedSortProjectRows\(nav\)/);
+  assert.match(pinnedSource, /!projectRows\.length/);
+  assert.ok(source.includes('.group\\\\/project-unfurl-row'));
+
+  const saveSource = extractFunction('savePinnedSortState');
+  assert.doesNotMatch(saveSource, /title|project.*name/i);
+
+  const sandbox = { pinnedSortProjectSidebarIndex: { projects: [{ id: 'g-p-a', name: 'Alpha' }] } };
+  vm.runInNewContext(`
+    let pinnedSortProjectSidebarIndex = this.pinnedSortProjectSidebarIndex;
+    ${extractFunction('normalizePinnedSortText')}
+    ${extractFunction('getPinnedSortProjectIdForTitle')}
+    this.resolveProjectId = getPinnedSortProjectIdForTitle;
+  `, sandbox);
+  assert.equal(sandbox.resolveProjectId('Alpha'), 'g-p-a');
+  sandbox.pinnedSortProjectSidebarIndex.projects.push({ id: 'g-p-b', name: 'Alpha' });
+  assert.equal(sandbox.resolveProjectId('Alpha'), null);
 });
 
 test('project expansion preserves native revealed order and updates saved visible order', () => {
@@ -2314,12 +3272,13 @@ test('GPT-5.6 model selector rich UI resolves history Chat, new Chat, and Work i
   assert.match(contentModelSelectorSource, /const PICKER_SELECTOR = '\[data-testid="composer-intelligence-picker-content"\]'/);
   assert.match(contentModelSelectorSource, /const COMPOSER_SELECTOR = 'form\[data-type="unified-composer"\]'/);
   assert.match(contentModelSelectorSource, /const MODEL_VERSION_PATTERN = \/\\bGPT/);
-  assert.match(contentModelSelectorSource, /return match \? 'GPT-5\.6' : null/);
+  assert.match(contentModelSelectorSource, /const candidateModelVersion = extractExplicitModelVersion\(modelLabel\)/);
+  assert.doesNotMatch(contentModelSelectorSource, /function normalizeModelVersion\(/);
   assert.match(contentModelSelectorSource, /const CHATGPT_LAST_MODEL_COOKIE = 'oai-last-model-config'/);
   assert.match(contentModelSelectorSource, /const WORK_MODEL_SETTINGS_STORAGE_KEY = 'oai\/apps\/tpp\/model-settings'/);
   assert.match(contentModelSelectorSource, /const WORK_THINKING_EFFORT_STORAGE_KEY = 'oai\/apps\/tpp\/thinking-effort'/);
   assert.match(contentModelSelectorSource, /function readNewChatCurrentState\(\)/);
-  assert.match(contentModelSelectorSource, /function readWorkCurrentState\(\)/);
+  assert.match(contentModelSelectorSource, /function readWorkCurrentResolution\(\)/);
   assert.match(contentModelSelectorSource, /function resolveCurrentContextState\(\)/);
   assert.ok(contentModelSelectorSource.includes("match(/\\/c\\/([^/?#]+)/i)"));
   assert.match(contentModelSelectorSource, /'work_local_storage_current'/);
@@ -2328,6 +3287,10 @@ test('GPT-5.6 model selector rich UI resolves history Chat, new Chat, and Work i
   assert.match(contentModelSelectorSource, /function applyConversationModelConfig\(config, reason = 'conversation_detail'\)/);
   assert.match(contentModelSelectorSource, /config\?\.source \|\| 'conversation_detail_current_branch'/);
   assert.match(contentModelSelectorSource, /function resetForNavigation\(\{ reason = 'navigation' \} = \{\}\)/);
+  assert.match(contentModelSelectorSource, /function getCurrentModelContextKey\(\)/);
+  assert.match(contentModelSelectorSource, /nextContextKey === currentStateContextKey/);
+  assert.match(contentModelSelectorSource, /navigation_same_context:/);
+  assert.match(contentModelSelectorSource, /currentStateContextKey = null/);
   assert.match(contentModelSelectorSource, /applyConversationModelConfig,/);
   assert.match(contentModelSelectorSource, /resetForNavigation/);
   assert.match(contentModelSelectorSource, /function getLightweightStatus\(\)/);
@@ -2368,32 +3331,38 @@ test('GPT-5.6 model selector rich UI resolves history Chat, new Chat, and Work i
   assert.match(contentModelSelectorSource, /composerObserver = new MutationObserver\(handleComposerMutations\)/);
   assert.match(contentModelSelectorSource, /composerObserver\.observe\(nextComposer, \{ childList: true, subtree: true \}\)/);
   assert.match(contentModelSelectorSource, /composerParentObserver\.observe\(nextParent, \{ childList: true \}\)/);
+  assert.match(contentModelSelectorSource, /composerGrandparentObserver\.observe\(nextGrandparent, \{ childList: true \}\)/);
   assert.match(contentModelSelectorSource, /surfaceModeObserver = new MutationObserver\(handleSurfaceModeMutations\)/);
   assert.match(contentModelSelectorSource, /surface_state_changed/);
   assert.match(contentModelSelectorSource, /attributeFilter: \['data-state', 'aria-checked', 'aria-selected'\]/);
-  assert.match(contentModelSelectorSource, /attributeFilter: \['aria-checked', 'aria-expanded', 'data-state'\]/);
+  assert.match(contentModelSelectorSource, /attributeFilter: \['aria-checked', 'aria-selected', 'aria-expanded', 'data-state'\]/);
   assert.match(contentModelSelectorSource, /pickerObserver = new MutationObserver\(handlePickerMutations\)/);
   assert.match(contentModelSelectorSource, /function handlePickerMutations\(mutations\)/);
   assert.match(contentModelSelectorSource, /picker_confirmed_selection/);
+  assert.match(contentModelSelectorSource, /function findSelectedPerformanceItem\(picker\)/);
+  assert.match(contentModelSelectorSource, /getDirectPerformanceLabel\(findSelectedPerformanceItem\(picker\)\)/);
   assert.match(contentModelSelectorSource, /const THINKING_SLIDER_HOST_SELECTOR = '\[data-testid="composer-model-picker-slider-simple-view"\]'/);
   assert.match(contentModelSelectorSource, /function observeThinkingSlider\(picker\)/);
   assert.match(contentModelSelectorSource, /thinkingSliderObserver\.observe\(slider, \{/);
   assert.match(contentModelSelectorSource, /attributeFilter: \['aria-valuenow'\]/);
   assert.match(contentModelSelectorSource, /function handleThinkingSliderMutations\(mutations\)/);
   assert.match(contentModelSelectorSource, /mutation\.target === observedThinkingSlider/);
-  assert.match(contentModelSelectorSource, /nextThinkingEffort !== observedWorkThinkingEffort/);
-  assert.match(contentModelSelectorSource, /work_thinking_effort_pending/);
+  assert.match(contentModelSelectorSource, /nextThinkingEffort !== observedThinkingEffort/);
+  assert.match(contentModelSelectorSource, /thinking_effort_pending/);
   assert.match(contentModelSelectorSource, /function observeTriggerState\(trigger\)/);
-  assert.match(contentModelSelectorSource, /attributeFilter: \['aria-expanded', 'data-state'\]/);
-  assert.match(contentModelSelectorSource, /function commitPendingWorkThinkingState\(reason = 'work_thinking_effort_focusout_confirmed'\)/);
-  assert.match(contentModelSelectorSource, /composer_work_selection_confirmed/);
+  assert.match(contentModelSelectorSource, /attributeFilter: \['aria-expanded', 'data-state', RICH_ATTR\]/);
+  assert.match(contentModelSelectorSource, /model_decoration_removed/);
+  assert.match(contentModelSelectorSource, /function commitPendingPickerState\(reason = 'picker_focusout_confirmed'\)/);
+  assert.match(contentModelSelectorSource, /composer_selection_confirmed/);
   assert.match(contentModelSelectorSource, /document\.addEventListener\('click', handleDocumentClick, true\)/);
   assert.doesNotMatch(contentModelSelectorSource, /menu\.itemSelect|handleMenuItemSelect|menu_item_select/);
   assert.match(contentModelSelectorSource, /const BARE_MODEL_VERSION_PATTERN = \/\\b\(\\d\+\\\.\\d\+\)\\b\//);
   assert.match(contentModelSelectorSource, /function extractExplicitModelVersion\(value\)/);
   assert.match(contentModelSelectorSource, /const explicitPerformanceModelVersion = extractExplicitModelVersion\(checkedText\)/);
+  assert.match(contentModelSelectorSource, /const candidateModelVersion = extractExplicitModelVersion\(modelLabel\)/);
   assert.match(contentModelSelectorSource, /const modelVersion = explicitPerformanceModelVersion \|\| candidateModelVersion/);
-  assert.match(contentModelSelectorSource, /const modelSource = explicitPerformanceModelVersion/);
+  assert.match(contentModelSelectorSource, /let modelSource = 'not_found'/);
+  assert.match(contentModelSelectorSource, /if \(explicitPerformanceModelVersion\) modelSource = 'checked_performance_item'/);
   assert.match(contentModelSelectorSource, /'performance_picker_with_current_state'/);
   assert.doesNotMatch(contentModelSelectorSource, /applySelectedMenuItem|buildPerformanceSelectionState|rememberTransientSelection/);
   assert.doesNotMatch(contentModelSelectorSource, /selectionInFlight|pendingClickFallback|transientSelection/);
@@ -2414,12 +3383,12 @@ test('GPT-5.6 model selector rich UI resolves history Chat, new Chat, and Work i
   assert.doesNotMatch(source, /model_selector_ui_snapshot_start|hasModelSelectorUiDiagnostic/);
   assert.match(injectedSource, /function buildCurrentConversationModelConfig\(raw, url = ''\)/);
   assert.match(injectedSource, /emitMainEvent\('current_conversation_model_config'/);
-  assert.match(injectedSource, /observeCurrentConversationModelConfig\(raw, url, 'conversation_fetch_response'\)/);
+  assert.match(injectedSource, /observeCurrentConversationModelConfig\(arcaiaRaw, url, 'conversation_fetch_response'\)/);
 });
 
 test('work composer model-name trigger is accepted when performance label is not rendered', () => {
   const helperStart = contentModelSelectorSource.indexOf('  function normalizeText(value) {');
-  const helperEnd = contentModelSelectorSource.indexOf('  function normalizeModelVersion(value) {', helperStart);
+  const helperEnd = contentModelSelectorSource.indexOf('  function normalizeVisualStyle(value) {', helperStart);
   const explicitStart = contentModelSelectorSource.indexOf('  function extractExplicitModelVersion(value) {');
   const explicitEnd = contentModelSelectorSource.indexOf('  function extractModelSuffix(modelLabel) {', explicitStart);
   const triggerStart = contentModelSelectorSource.indexOf('  function looksLikeExpectedModelTrigger(button, expectedModelVersion = \'\') {');
@@ -2540,7 +3509,6 @@ test('model selector resolves source-specific Chat and Work state without stale 
       ${setupSource}
       globalThis.modelSelectorTestApi = {
         readNewChatCurrentState,
-        readWorkCurrentState,
         resolveCurrentContextState,
         getPerformanceLabelForEffort,
         getEffortForPerformanceLabel,
@@ -2593,15 +3561,12 @@ test('model selector resolves source-specific Chat and Work state without stale 
 
 
 test('popup auto-injects split content scripts in dependency order', () => {
-  assert.match(popupSource, /const CONTENT_SCRIPT_FILES = \[[\s\S]*?'content_toolbar\.js'[\s\S]*?'content_diagnostics\.js'[\s\S]*?'content_markdown\.js'[\s\S]*?'content_filename\.js'[\s\S]*?'content_model_selector\.js'[\s\S]*?'content\.js'[\s\S]*?\]/);
+  assert.match(popupSource, /const CONTENT_SCRIPT_FILES = \[[\s\S]*?'content_toolbar\.js'[\s\S]*?'content_markdown\.js'[\s\S]*?'content_filename\.js'[\s\S]*?'content_model_selector\.js'[\s\S]*?'content\.js'[\s\S]*?\]/);
   assert.doesNotMatch(popupSource, /content_zip\.js/);
+  assert.doesNotMatch(popupSource, /content_diagnostics\.js/);
   assert.match(popupSource, /chrome\.scripting\.executeScript\(\{ target: \{ tabId \}, files: CONTENT_SCRIPT_FILES \}\)/);
   assert.doesNotMatch(contentToolbarSourceFile, /\bAPP_VERSION\b/);
   assert.doesNotMatch(contentToolbarSourceFile, /\bdebugModeEnabled\b/);
-  assert.match(contentDiagnosticsSource, /window\.ArcaiaContentDiagnostics = Object\.freeze/);
-  assert.doesNotMatch(contentDiagnosticsSource, /\bAPP_VERSION\b/);
-  assert.doesNotMatch(contentDiagnosticsSource, /\bdebugModeEnabled\b/);
-  assert.doesNotMatch(contentDiagnosticsSource, /chrome\.storage/);
   assert.match(contentMarkdownSource, /window\.ArcaiaContentMarkdown = Object\.freeze/);
   assert.doesNotMatch(contentMarkdownSource, /APP_VERSION|chrome\.|document\.|fetch\s*\(/);
   assert.match(contentFilenameSource, /window\.ArcaiaContentFilename = Object\.freeze/);
@@ -2631,12 +3596,11 @@ test('content toolbar helper is split into content_toolbar.js and loaded before 
   const scripts = manifest.content_scripts[0].js;
   assert.equal(scripts.includes('content_zip.js'), false);
   assert.ok(scripts.includes('content_toolbar.js'));
-  assert.ok(scripts.includes('content_diagnostics.js'));
+  assert.equal(scripts.includes('content_diagnostics.js'), false);
   assert.ok(scripts.includes('content_markdown.js'));
   assert.ok(scripts.includes('content_filename.js'));
   assert.ok(scripts.includes('content_model_selector.js'));
-  assert.ok(scripts.indexOf('content_toolbar.js') < scripts.indexOf('content_diagnostics.js'));
-  assert.ok(scripts.indexOf('content_diagnostics.js') < scripts.indexOf('content_markdown.js'));
+  assert.ok(scripts.indexOf('content_toolbar.js') < scripts.indexOf('content_markdown.js'));
   assert.ok(scripts.indexOf('content_markdown.js') < scripts.indexOf('content_filename.js'));
   assert.ok(scripts.indexOf('content_filename.js') < scripts.indexOf('content_model_selector.js'));
   assert.ok(scripts.indexOf('content_model_selector.js') < scripts.indexOf('content.js'));
@@ -2651,7 +3615,7 @@ test('content toolbar helper is split into content_toolbar.js and loaded before 
   assert.doesNotMatch(source, /function startToolbarPageJob\(deps\)/);
 });
 
-test('content diagnostics helper is split into content_diagnostics.js and loaded before content.js', () => {
+test.skip('legacy content diagnostics wrapper contract was removed in v0.1.281', () => {
   const scripts = manifest.content_scripts[0].js;
   assert.ok(scripts.includes('content_diagnostics.js'));
   assert.ok(scripts.indexOf('content_diagnostics.js') < scripts.indexOf('content.js'));
@@ -2666,17 +3630,36 @@ test('content diagnostics helper is split into content_diagnostics.js and loaded
   assert.doesNotMatch(contentDiagnosticsSource, /APP_VERSION|debugModeEnabled|chrome\.runtime|chrome\.storage/);
 });
 
+test.skip('legacy content diagnostics helper file contract was removed in v0.1.281', () => {
+  const scripts = manifest.content_scripts[0].js;
+  assert.ok(scripts.includes('content_diagnostics.js'));
+  assert.ok(scripts.indexOf('content_diagnostics.js') < scripts.indexOf('content.js'));
+  assert.match(contentDiagnosticsSource, /function simpleDiagnosticHash\(text\)/);
+  assert.match(contentDiagnosticsSource, /function normalizeRectForDiagnostics\(rect\)/);
+  assert.doesNotMatch(source, /getContentDiagnostics|getElementRectForDiagnostics|simpleDiagnosticHash\(text\)/);
+  assert.doesNotMatch(source, /let hash = 2166136261|normalizeRectForDiagnostics\(rect\)/);
+  assert.doesNotMatch(contentDiagnosticsSource, /\bAPP_VERSION\b|\bdebugModeEnabled\b|chrome\.runtime|chrome\.storage/);
+});
+
 test('generic diagnostic ZIP helper is removed from the extension runtime', () => {
   assert.equal(manifest.content_scripts[0].js.includes('content_zip.js'), false);
   assert.doesNotMatch(popupSource, /content_zip\.js|diagnosticZip/);
   assert.doesNotMatch(contentToolbarSourceFile, /diagnostic_zip|DiagnosticZip|createToolbarZipBlob/);
 });
 
+test('resolved content diagnostics helper is removed from extension runtime', () => {
+  const scripts = manifest.content_scripts[0].js;
+  assert.equal(scripts.includes('content_diagnostics.js'), false);
+  assert.equal(fs.existsSync(path.join(__dirname, '..', 'content_diagnostics.js')), false);
+  assert.doesNotMatch(popupSource, /content_diagnostics\.js|ArcaiaContentDiagnostics/);
+  assert.doesNotMatch(source, /getContentDiagnostics|getElementRectForDiagnostics|simpleDiagnosticHash\(text\)/);
+});
+
 
 test('content_markdown helper is split and remains pure/dependency-light', () => {
   const scripts = manifest.content_scripts[0].js;
   assert.ok(scripts.includes('content_markdown.js'));
-  assert.ok(scripts.indexOf('content_diagnostics.js') < scripts.indexOf('content_markdown.js'));
+  assert.ok(scripts.indexOf('content_toolbar.js') < scripts.indexOf('content_markdown.js'));
   assert.ok(scripts.indexOf('content_markdown.js') < scripts.indexOf('content_filename.js'));
   assert.ok(scripts.indexOf('content_filename.js') < scripts.indexOf('content.js'));
   assert.match(contentMarkdownSource, /window\.ArcaiaContentMarkdown = Object\.freeze/);
@@ -2740,6 +3723,7 @@ test('content_filename helper is split and keeps filename/date logic dependency-
   assert.match(contentFilenameSource, /function pickLatestAssistantDateFromResult\(result\)/);
   assert.match(contentFilenameSource, /function makeBaseExportName\(result, normalizeDate\)/);
   assert.match(contentFilenameSource, /function makeSingleTurnExportName\(result, turn, normalizeDate\)/);
+  assert.doesNotMatch(contentFilenameSource, /result\?\.conversationId \|\| 'chatgpt-conversation'/);
   assert.match(contentFilenameSource, /function formatTurnNumberForFile\(turn, result\)/);
   assert.match(contentFilenameSource, /return `\$\{date\}_\$\{title\}_\$\{formatTurnNumberForFile\(turn, result\)\}`/);
   assert.match(contentFilenameSource, /turn_\$\{current\}-of-\$\{String\(total\)\.padStart\(width, '0'\)\}/);
@@ -2775,6 +3759,14 @@ test('Markdown export boundary keeps data extraction in content and UI orchestra
   assert.match(exportSource, /function buildSingleTurnMarkdownDraft\(title, url, conversationId, turn, totalTurnCount\)/);
   assert.match(exportSource, /function makeBaseExportName\(result\)/);
   assert.match(exportSource, /function downloadText\(filename, text, mimeType = 'text\/plain;charset=utf-8'\)/);
+  assert.match(exportSource, /type: 'ARCAIA_DOWNLOAD_TEXT'/);
+  assert.match(exportSource, /chrome\.runtime\.sendMessage\(payload/);
+  assert.match(exportSource, /downloadBlob\(payload\.filename/);
+  assert.equal(manifest.permissions.includes('downloads'), true);
+  assert.match(backgroundSource, /const ARCAIA_DOWNLOAD_TEXT = 'ARCAIA_DOWNLOAD_TEXT'/);
+  assert.match(backgroundSource, /chrome\.downloads\.download\(\{/);
+  assert.match(backgroundSource, /filename,/);
+  assert.match(backgroundSource, /conflictAction: 'uniquify'/);
   assert.match(source, /async function extractChatGPTInternal\(includeRaw = false\)/);
 
   const toolbarStart = contentToolbarSourceFile.indexOf('  async function runToolbarMarkdownSave(');
@@ -2814,6 +3806,7 @@ test('turn export buttons anchor to copy toolbar leading side and avoid polling'
   const start = source.indexOf('  const TURN_EXPORT_BUTTON_ATTR');
   const end = source.indexOf('  function startArcaiaPageUi', start);
   const turnExportSource = source.slice(start, end);
+  const singleTurnExportSource = turnExportSource.slice(0, turnExportSource.indexOf('  const HEADER_MARKDOWN_BUTTON_ID'));
   assert.match(turnExportSource, /const TURN_EXPORT_TOOLBAR_ATTR = 'data-arcaia-turn-export-toolbar'/);
   assert.match(turnExportSource, /const TURN_COPY_BUTTON_SELECTOR = 'button\[data-testid=\"copy-turn-action-button\"\]'/);
   assert.match(turnExportSource, /const ASSISTANT_COMPLETION_TURN_SELECTOR = 'section\[data-turn=\"assistant\"\]'/);
@@ -2828,6 +3821,9 @@ test('turn export buttons anchor to copy toolbar leading side and avoid polling'
   assert.match(turnExportSource, /container\.setAttribute\(TURN_EXPORT_TOOLBAR_ATTR, 'true'\)/);
   assert.match(turnExportSource, /container\.insertBefore\(button, container\.firstChild\)/);
   assert.match(turnExportSource, /text-token-text-secondary hover:bg-token-surface-hover rounded-lg/);
+  assert.match(singleTurnExportSource, /installArcaiaTooltip\(button, 'Arcaia: このTurnをMarkdown保存'\)/);
+  assert.match(singleTurnExportSource, /setArcaiaTooltipText\(button, 'Arcaia: 保存中\.\.\.'\)/);
+  assert.doesNotMatch(singleTurnExportSource, /button\.title\s*=/);
   assert.doesNotMatch(turnExportSource, /focus:bg-token-surface-hover|focus-visible:bg-token-surface-hover/);
   assert.doesNotMatch(turnExportSource, /data-arcaia-turn-export-focused|button\.addEventListener\('focusin'|button\.addEventListener\('focusout'/);
   assert.doesNotMatch(turnExportSource, /background-color: var\(--token-surface-hover|opacity: 0\.78|color-mix\(in srgb, currentColor 10%, transparent\)|margin-left: 2px|width: 28px|height: 28px|color: inherit/);
@@ -2844,7 +3840,7 @@ test('turn export buttons anchor to copy toolbar leading side and avoid polling'
   assert.doesNotMatch(turnExportSource, /markAssistantCompletedFromCopyButton/);
   assert.match(turnExportSource, /function handleTurnExportMutations\(mutations\)/);
   assert.match(turnExportSource, /installTurnExportButtons\(conversationDomObservedContentRoot, addedCopyButtons\)/);
-  assert.match(turnExportSource, /scheduleApplyMessageTimestamps\('assistant_toolbar_ready'\)/);
+  assert.match(turnExportSource, /scheduleApplyMessageTimestampsForNodes\(assistantRoleNodes, 'assistant_toolbar_ready'\)/);
   assert.doesNotMatch(turnExportSource, /\.click\(\)/);
   assert.match(turnExportSource, /installTurnExportInteractionTriggers/);
   assert.match(turnExportSource, /nextRoot\.addEventListener\('pointerover', turnExportInteractionHandler, true\)/);
@@ -2888,9 +3884,10 @@ test('Lite turn count is configurable and persisted between popup and content ru
   assert.match(popupSource, /\[LITE_TURN_COUNT_STORAGE_KEY\]: payload\.liteTurnCount/);
   assert.match(source, /const LITE_TURN_COUNT_STORAGE_KEY = 'arcaia_lite_turn_count_v1'/);
   assert.match(source, /function getConfiguredLiteTurnCount\(\)/);
-  assert.match(source, /function getEffectiveLiteTurnCount\(conversationId = tryExtractConversationIdFromUrl\(window\.location\.href\)\)/);
+  assert.doesNotMatch(source, /function getEffectiveLiteTurnCount/);
   assert.match(source, /previous\.liteTurnCount !== next\.liteTurnCount/);
-  assert.match(source, /buildLiteGroupingPlan\(document, getEffectiveLiteTurnCount\(\), generationDetector\.generating\)/);
+  assert.match(source, /const turnCount = getConfiguredLiteTurnCount\(\)/);
+  assert.match(source, /buildLiteGroupingPlan\(document, turnCount, generationDetector\.generating\)/);
   assert.match(source, /const turnCount = normalizeLiteTurnCount\(message\?\.turnCount \?\? getConfiguredLiteTurnCount\(\)\)/);
   assert.match(injectedSource, /turnCountOverrideConversationId/);
   assert.match(injectedSource, /turnCountOverrideConversationId === currentConversationId/);
@@ -2907,7 +3904,7 @@ test('main-world Recent View override applies only to its target conversation', 
     String,
     Boolean,
     currentConversationId: 'conversation-a',
-    APP_VERSION: '0.1.275',
+    APP_VERSION: '0.1.310',
     NATIVE_LITE_TURN_COUNT: 3,
     CONFIGURED_LITE_TURN_COUNT_MAX: 10,
     RECENT_VIEW_EXPANDED_TURN_COUNT_MAX: 50,
@@ -2955,18 +3952,24 @@ test('full-log Markdown action is placed before the native Share button in the p
   assert.match(popupSource, /headerMarkdownButton: true/);
   assert.match(popupSource, /headerMarkdownButton: 'headerMarkdownButtonToggle'/);
   assert.match(source, /const HEADER_MARKDOWN_BUTTON_ID = 'arcaia-header-markdown-button'/);
-  assert.match(source, /const HEADER_MARKDOWN_CONTENT_VERSION = 'download-icon-v1'/);
+  assert.match(source, /const HEADER_MARKDOWN_CONTENT_VERSION = 'lucide-file-down-v5'/);
   assert.match(source, /function findNativeShareButton\(root = document\)/);
   assert.match(source, /if \(!button\.closest\?\.\('header'\)\) return false/);
+  assert.match(source, /function resolveHeaderMarkdownPlacement\(shareButton\)/);
+  assert.match(source, /layoutCandidates\.find\(\(candidate\) => candidate\.shareActionRoot !== shareButton\)/);
   assert.match(source, /function findHeaderMarkdownObserverBinding\(\)/);
-  assert.match(source, /return \{ target: actionsContainer, subtree: false \}/);
+  assert.match(source, /return \{ target: placement\.container, subtree: true \}/);
   assert.match(source, /headerMarkdownObserver\.observe\(target, \{ childList: true, subtree \}\)/);
   assert.match(source, /syncHeaderMarkdownButtonUi\('startup_after_settings_sync'\)/);
   assert.match(source, /syncHeaderMarkdownButtonUi\(conversationChanged \? 'conversation_changed' : 'url_changed'\)/);
   assert.doesNotMatch(source, /headerMarkdownScanTimer|scheduleHeaderMarkdownButtonScan/);
-  assert.match(source, /function createHeaderMarkdownDownloadIcon\(\)/);
+  assert.match(source, /function createHeaderMarkdownFileDownIcon\(\)/);
   assert.match(source, /svg\.setAttribute\('width', '20'\)/);
-  assert.match(source, /path\.setAttribute\('d', 'M12 3v12/);
+  assert.match(source, /svg\.setAttribute\('viewBox', '0 0 24 24'\)/);
+  assert.match(source, /documentPath\.setAttribute\('d', 'M6 22a2 2 0 0 1-2-2V4/);
+  assert.match(source, /foldPath\.setAttribute\('d', 'M14 2v5a1 1 0 0 0 1 1h5'/);
+  assert.match(source, /arrowStemPath\.setAttribute\('d', 'M12 18v-6'/);
+  assert.match(source, /arrowHeadPath\.setAttribute\('d', 'm9 15 3 3 3-3'/);
   assert.match(source, /function renderHeaderMarkdownButtonContent\(button, shareButton\)/);
   assert.match(source, /button\.replaceChildren\(\)/);
   assert.match(source, /button\.dataset\.arcaiaContentVersion = HEADER_MARKDOWN_CONTENT_VERSION/);
@@ -2974,7 +3977,7 @@ test('full-log Markdown action is placed before the native Share button in the p
   assert.match(source, /button\.setAttribute\('aria-label', '全ログをMarkdownでダウンロード'\)/);
   assert.match(source, /button\.setAttribute\('data-testid', 'arcaia-header-markdown-button'\)/);
   assert.doesNotMatch(source, /button\.textContent = 'Markdown'/);
-  assert.match(source, /parent\.insertBefore\(button, shareButton\)/);
+  assert.match(source, /parent\.insertBefore\(button, shareActionRoot\)/);
   assert.match(source, /await startToolbarMarkdownSaveFromPopup\(\)/);
   assert.match(source, /if \(isArcaiaFeatureEnabled\('headerMarkdownButton'\)\) startHeaderMarkdownButtonUi\(\)/);
   assert.match(source, /startHeaderMarkdownButtonUi\(\)/);
@@ -3008,42 +4011,55 @@ test('backend rewrite gate checks Lite, GET, successful JSON response, conversat
   assert.match(helperSource, /!response \|\| !response\.ok/);
   assert.match(helperSource, /extractConversationIdFromConversationDetailUrl/);
   assert.match(helperSource, /contentType\.includes\('application\/json'\)/);
-  assert.match(gateSource, /if \(!config\.enabled\) return false/);
+  assert.match(gateSource, /if \(!config\.enabled\) return false;/);
   assert.match(gateSource, /!isConversationJsonFetchResponse\(method, url, response\)/);
   assert.match(gateSource, /config\.fullLoadOnce/);
   assert.match(gateSource, /conversationId !== config\.conversationId/);
   assert.match(gateSource, /!config\.backendRewriteEnabled/);
 });
 
-test('full load requests one backend rewrite skip through the probe-backed native SPA round trip', () => {
-  const start = source.indexOf('  async function loadFullConversationInPlace(');
+test('full load uses the cached conversation model through a read-only custom DOM', () => {
+  const start = source.indexOf('  async function showFullConversationReadOnly(');
   const end = source.indexOf('  function getLiteMessageContainer', start);
   const fullLoadSource = source.slice(start, end);
-  assert.match(fullLoadSource, /requestMainWorldFullLoadOnce/);
-  assert.match(fullLoadSource, /runRecentViewSpaRoundTrip/);
-  assert.match(fullLoadSource, /findRecentViewNativeNewChatControl/);
-  assert.match(fullLoadSource, /findRecentViewNativeConversationLink/);
-  assert.match(fullLoadSource, /native_new_chat_round_trip/);
-  assert.match(fullLoadSource, /contentRoot === sourceContentRoot/);
-  assert.doesNotMatch(fullLoadSource, /window\.location\.href\s*=/);
+  assert.match(fullLoadSource, /requestMainWorldReadOnlyConversationModel/);
+  assert.match(fullLoadSource, /requestedTurnCount: 'all'/);
+  assert.match(fullLoadSource, /strategy: 'existing_conversation_payload_read_only_renderer'/);
+  assert.match(fullLoadSource, /renderer\.mount/);
+  assert.match(fullLoadSource, /mode: 'full'/);
+  assert.match(fullLoadSource, /captureRecentViewFullScrollAnchor/);
+  assert.doesNotMatch(fullLoadSource, /runRecentViewDocumentReload|window\.location\.reload\(\)/);
+  assert.doesNotMatch(fullLoadSource, /findRecentViewNativeNewChatControl|findRecentViewNativeConversationLink/);
   assert.doesNotMatch(fullLoadSource, /arcaia_full_load/);
   assert.doesNotMatch(fullLoadSource, /fetch\s*\(/);
 });
 
-test('Recent View top controls progressively load ten turns or all history without a scroll listener', () => {
+test('startup Recent View sync merges settings without replacing existing main-world state', () => {
+  const enableStart = source.indexOf('  async function syncLiteDisplayForStartup(');
+  const enableEnd = source.indexOf('  async function runLiteDisplayDisable', enableStart);
+  const enableSource = source.slice(enableStart, enableEnd);
+  const startupStart = source.indexOf('  function startArcaiaPageUi()');
+  const startupEnd = source.indexOf('  const startupSettingsSyncPromise', startupStart);
+  const startupSource = source.slice(startupStart, startupEnd);
+  assert.match(enableSource, /configSource: 'feature_settings_startup_merge'/);
+  assert.doesNotMatch(enableSource, /replaceExisting: true|resetStorageBeforeSet: true/);
+  assert.match(startupSource, /syncLiteDisplayForStartup\(/);
+  assert.doesNotMatch(startupSource, /resetStorageBeforeSet: true|replaceExisting: true/);
+});
+
+test('Recent View top controls expose full history only without a scroll listener', () => {
   const start = source.indexOf('  function updateRecentViewHistoryControls(');
   const end = source.indexOf('  function getLiteMessageContainer', start);
   const recentViewSource = source.slice(start, end);
-  assert.match(source, /RECENT_VIEW_EXPANSION_STEP = 10/);
   assert.match(recentViewSource, /RECENT_VIEW_HISTORY_CONTROLS_ID/);
   assert.match(recentViewSource, /firstVisibleSection\.insertAdjacentElement\('beforebegin', controls\)/);
-  assert.match(recentViewSource, /`さらに\$\{increment\}件表示`/);
-  assert.match(recentViewSource, /fullButton\.textContent = '全部表示'/);
-  assert.match(recentViewSource, /mode: 'expand'/);
-  assert.match(recentViewSource, /mode: 'full'/);
-  assert.match(recentViewSource, /turnCountOverride: targetTurnCount/);
-  assert.match(recentViewSource, /requestMainWorldFullLoadOnce/);
-  assert.match(recentViewSource, /restoreRecentViewScrollAnchor/);
+  assert.doesNotMatch(recentViewSource, /さらに[^'"`]*件表示|dataset\.action = 'expand'|mode: 'expand'/);
+  assert.match(recentViewSource, /fullButton\.textContent = '全文表示'/);
+  assert.match(recentViewSource, /requestedTurnCount: 'all'/);
+  assert.match(recentViewSource, /requestMainWorldReadOnlyConversationModel/);
+  assert.match(recentViewSource, /renderer\.mount/);
+  assert.match(recentViewSource, /scrollAnchor/);
+  assert.doesNotMatch(recentViewSource, /requestMainWorldFullLoadOnce|window\.location\.reload\(\)/);
   assert.doesNotMatch(recentViewSource, /addEventListener\('scroll'/);
 });
 
@@ -3061,8 +4077,8 @@ test('Recent View reports only failed history actions with a temporary accessibl
   assert.match(failureNoticeSource, /以前の履歴を表示できませんでした。左サイドバーから元の会話を開いてください。/);
   assert.match(failureNoticeSource, /action: 'recent_view_history_action_failed'/);
   assert.match(failureNoticeSource, /showRecentViewHistoryActionFailure\(conversationId\)/);
-  assert.match(failureNoticeSource, /return await loadFullConversationInPlace\('recent_view_history_full'/);
-  assert.match(failureNoticeSource, /return await runRecentViewSpaRoundTrip\(\{/);
+  assert.match(failureNoticeSource, /return await showFullConversationReadOnly\('recent_view_history_full'\)/);
+  assert.doesNotMatch(failureNoticeSource, /recent_view_history_expand_read_only|dataset\.action = 'expand'/);
   assert.doesNotMatch(failureNoticeSource, /showRecentViewFailureNotice\([^)]*成功/);
 });
 
@@ -3070,6 +4086,22 @@ test('Recent View no longer contains the unreachable three-stage soft-refresh fa
   assert.doesNotMatch(source, /triggerCurrentConversationContentRefresh|findCurrentConversationSidebarLink|dispatchClickSequence/);
   assert.doesNotMatch(source, /sidebar_link_click_with_refresh_query|history_pushstate_popstate_with_refresh_query|synthetic_anchor_click_with_refresh_query/);
   assert.doesNotMatch(source, /arcaia_soft_refresh|contentRefreshInFlight|CONTENT_REFRESH_COOLDOWN_MS/);
+  assert.doesNotMatch(source, /runRecentViewSpaRoundTrip|findRecentViewNativeNewChatControl|findRecentViewNativeConversationLink/);
+});
+
+test('resolved Recent View probes and diagnostic body inspection are absent from normal runtime', () => {
+  assert.doesNotMatch(source, /runLiteDisplayDryRun|buildLiteDisplayDryRunModel|buildReparentedLiteRawForEstimate/);
+  assert.doesNotMatch(source, /summarizeSelectorForDiagnostics|getDomDiagnosticsForBundle|getIframeDiagnosticsForBundle/);
+  assert.doesNotMatch(injectedSource, /ARM_HISTORY_FETCH_PROBE|HISTORY_FETCH_PROBE_ARMED/);
+  assert.doesNotMatch(injectedSource, /GET_LITE_DISPLAY_INTERNAL_DIAGNOSTIC|LITE_DISPLAY_INTERNAL_DIAGNOSTIC_RESULT/);
+  assert.doesNotMatch(injectedSource, /BUILD_LITE_REWRITE_DIAGNOSTIC|LITE_REWRITE_DIAGNOSTIC_RESULT/);
+  assert.doesNotMatch(injectedSource, /recordResponseProbe|inspectFetchResponseAsync|inspectXhrResponseAsync/);
+  assert.doesNotMatch(injectedSource, /responseProbes|historyProbeArmedUntil|readLiteDisplayRawStorageForDebug/);
+  assert.doesNotMatch(injectedSource, /state\.observations|MAX_OBSERVATIONS|seenUrlCount|lastSeenUrl/);
+  assert.doesNotMatch(source, /seenUrlCount: auth|lastSeenUrl: auth/);
+  assert.doesNotMatch(injectedSource, /recentViewProbeSandboxFileName|collectRecentViewProbeSandboxResourceState|summarizeRecentViewRewriteResourceRetention/);
+  assert.doesNotMatch(injectedSource, /collectRecentViewProbeRawResourceEvidence|collectRecentViewProbeRawMessageShapeEvidence|updateRecentViewRewriteResourceProbeTrace/);
+  assert.doesNotMatch(injectedSource, /liteDisplayRewriteResourceProbe|rewriteResourceProbeVersion|rewriteResourceProbeTrace/);
 });
 
 test('backend rewrite diagnostics expose rewrite summary, render anchor, and byte reduction', () => {
@@ -3079,16 +4111,17 @@ test('backend rewrite diagnostics expose rewrite summary, render anchor, and byt
   assert.match(injectedSource, /backendRetainedTurnCount/);
   assert.match(injectedSource, /renderAnchorTargetExtraTurnCount/);
   assert.match(injectedSource, /renderAnchorExtraTurnCount/);
-  assert.match(injectedSource, /retainedTurnCount: summary\?\.retainedTurnCount/);
-  assert.match(injectedSource, /totalTurnCount: summary\?\.totalTurnCount/);
+  assert.match(injectedSource, /retainedTurnCount: liteSummary\?\.retainedTurnCount/);
+  assert.match(injectedSource, /totalTurnCount: liteSummary\?\.totalTurnCount/);
   assert.match(injectedSource, /bytesReductionPct/);
 });
 
-test('backend rewrite uses latest-path three-turn target plus two render-anchor turns', () => {
+test('backend rewrite keeps legacy mapping anchors while flat messages uses the exact target', () => {
   const start = injectedSource.indexOf('  function buildLiteRawForPage(');
   const end = injectedSource.indexOf('  function summarizeNetworkLiteJsonForProbe', start);
   const builderSource = injectedSource.slice(start, end);
-  assert.match(builderSource, /renderAnchorTargetExtraTurnCount = 2/);
+  assert.match(builderSource, /requestedRenderAnchorExtraTurnCount/);
+  assert.match(builderSource, /Math\.max\(0, Math\.min\(2, Math\.floor\(requestedRenderAnchorExtraTurnCount\)\)\)/);
   assert.match(builderSource, /backendRetainedTurnCount = Math\.min\(turns\.length, safeTurnCount \+ renderAnchorTargetExtraTurnCount\)/);
   assert.match(builderSource, /const retainedTurns = turns\.slice/);
   assert.match(builderSource, /requestedTurnCount: safeTurnCount/);
@@ -3097,7 +4130,7 @@ test('backend rewrite uses latest-path three-turn target plus two render-anchor 
   assert.match(builderSource, /renderAnchorTargetExtraTurnCount/);
   assert.match(builderSource, /renderAnchorExtraTurnCount/);
   assert.match(builderSource, /retainedTurnCount: retainedTurns\.length/);
-  assert.match(injectedSource, /buildLiteRawForPage\(raw, config\.turnCount, \{ liteShowImages: config\.liteShowImages !== false \}\)/);
+  assert.match(injectedSource, /renderAnchorExtraTurnCount: sourceFormat === 'messages' \? 0 : 2/);
 });
 
 test('patched fetch rewrites the original response without issuing a second normal-page fetch', () => {
@@ -3106,18 +4139,75 @@ test('patched fetch rewrites the original response without issuing a second norm
   const patchedFetchSource = injectedSource.slice(start, end);
   assert.equal((patchedFetchSource.match(/state\.originalFetch\.apply/g) || []).length, 2);
   assert.match(patchedFetchSource, /if \(!observedRequest\) return state\.originalFetch\.apply\(this, arguments\)/);
+  assert.match(patchedFetchSource, /shouldSuppressNativeRecentViewHistoryFetch\(method, url\)/);
+  assert.match(patchedFetchSource, /createSuppressedNativeRecentViewHistoryResponse\(\)/);
   assert.match(patchedFetchSource, /const fetchPromise = state\.originalFetch\.apply\(this, arguments\)/);
   assert.match(patchedFetchSource, /shouldProcessConversationFetchResponse\(method, url, response\)/);
   assert.match(patchedFetchSource, /maybeRewriteFetchResponseForLiteDisplay/);
   assert.match(injectedSource, /function shouldProcessConversationFetchResponse/);
   assert.match(injectedSource, /function isConversationJsonFetchResponse/);
-  assert.match(injectedSource, /isHistoryProbeArmed\(\) && isConversationHistoryUrl\(this\.__aice_probe_url\)/);
+  assert.doesNotMatch(patchedFetchSource, /response\.clone\(\)\.text|inspectFetchResponseAsync|recordResponseProbe/);
 
   const rewriteStart = injectedSource.indexOf('  async function maybeRewriteFetchResponseForLiteDisplay(');
-  const rewriteEnd = injectedSource.indexOf('  function recordResponseProbe', rewriteStart);
+  const rewriteEnd = injectedSource.indexOf('  function rememberObservation', rewriteStart);
   assert.doesNotMatch(injectedSource.slice(rewriteStart, rewriteEnd), /originalFetch|fetch\s*\(/);
 });
 
+test('Recent View suppresses only native previous-history pagination for the active conversation', () => {
+  const sandbox = {
+    URL,
+    Date,
+    window: {
+      location: {
+        origin: 'https://chatgpt.com',
+        href: 'https://chatgpt.com/c/conversation-1'
+      }
+    },
+    state: {
+      liteDisplayConfig: {
+        enabled: true,
+        conversationId: 'conversation-1',
+        historySearchBypass: false,
+        fullLoadOnce: false
+      }
+    },
+    isMainExtensionEnabled: () => true,
+    normalizeLiteDisplayConfig: (value) => value,
+    defaultLiteDisplayConfig: () => ({ enabled: true }),
+    extractConversationIdFromCurrentUrl: () => 'conversation-1'
+  };
+  vm.runInNewContext(`${extractInjectedFunction('shouldSuppressNativeRecentViewHistoryFetch')}; this.shouldSuppressNativeRecentViewHistoryFetch = shouldSuppressNativeRecentViewHistoryFetch;`, sandbox);
+
+  assert.equal(sandbox.shouldSuppressNativeRecentViewHistoryFetch(
+    'GET',
+    'https://chatgpt.com/backend-api/conversations/conversation-1/messages?before=cursor&num_turns=20'
+  ), true);
+  assert.equal(sandbox.shouldSuppressNativeRecentViewHistoryFetch(
+    'GET',
+    'https://chatgpt.com/backend-api/conversations/conversation-1/messages?num_turns=20'
+  ), false);
+  assert.equal(sandbox.shouldSuppressNativeRecentViewHistoryFetch(
+    'GET',
+    'https://chatgpt.com/backend-api/conversations/conversation-2/messages?before=cursor&num_turns=20'
+  ), false);
+  assert.equal(sandbox.shouldSuppressNativeRecentViewHistoryFetch(
+    'POST',
+    'https://chatgpt.com/backend-api/conversations/conversation-1/messages?before=cursor&num_turns=20'
+  ), false);
+
+  sandbox.state.liteDisplayConfig.enabled = false;
+  assert.equal(sandbox.shouldSuppressNativeRecentViewHistoryFetch(
+    'GET',
+    'https://chatgpt.com/backend-api/conversations/conversation-1/messages?before=cursor&num_turns=20'
+  ), false);
+
+  sandbox.state.liteDisplayConfig.enabled = true;
+  sandbox.state.liteDisplayConfig.historySearchBypass = true;
+  assert.equal(sandbox.shouldSuppressNativeRecentViewHistoryFetch(
+    'GET',
+    'https://chatgpt.com/backend-api/conversations/conversation-1/messages?before=cursor&num_turns=20'
+  ), false);
+});
 
 test('content split plan documents the first low-risk extraction boundary', () => {
   const planPath = path.join(__dirname, '..', 'docs', 'content_split_plan.md');

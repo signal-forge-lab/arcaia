@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { chromium } = require('playwright');
+const { launchBrowser } = require('../tools/playwright_browser');
 
 const injectedSource = fs.readFileSync(path.join(__dirname, '..', 'injected-main.js'), 'utf8');
 const conversationId = '6a53d9a3-6718-83ee-8165-6f4441d06014';
@@ -59,7 +59,7 @@ function conversationPayload() {
 }
 
 test('history search bypass keeps the full response and restores Lite after the query is removed', async () => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser({ headless: true });
   try {
     const page = await browser.newPage();
     const payload = conversationPayload();

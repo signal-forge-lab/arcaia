@@ -1,0 +1,32 @@
+{
+  "method": "full-duration stereo RMS normalization written directly as PCM 16-bit WAV, verified after quantization",
+  "targetRmsDb": -21,
+  "peakCeilingDb": -1.7,
+  "decodedRmsSpreadDb": 0,
+  "files": [
+    {
+      "number": 1,
+      "filename": "notification-01.wav",
+      "codec": "PCM signed 16-bit little-endian",
+      "container": "WAV",
+      "bytes": 245804,
+      "durationSeconds": 1.28,
+      "sourceRmsDb": -21,
+      "sourcePeakDb": -7.71,
+      "decodedRmsDb": -21,
+      "decodedPeakDb": -7.71
+    },
+    {
+      "number": 2,
+      "filename": "notification-02.wav",
+      "codec": "PCM signed 16-bit little-endian",
+      "container": "WAV",
+      "bytes": 169004,
+      "durationSeconds": 0.88,
+      "sourceRmsDb": -21,
+      "sourcePeakDb": -6.82,
+      "decodedRmsDb": -21,
+      "decodedPeakDb": -6.82
+    }
+  ]
+}

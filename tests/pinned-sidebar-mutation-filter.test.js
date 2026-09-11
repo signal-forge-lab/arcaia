@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { chromium } = require('playwright');
+const { launchBrowser } = require('../tools/playwright_browser');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
 
@@ -41,14 +41,16 @@ const classifierSource = String.raw`
   ${extractFunction('normalizePinnedSortText')}
   ${extractFunction('isPinnedSortSectionElement')}
   ${extractFunction('mutationNodeContainsPinnedSortSection')}
+  ${extractFunction('isPinnedSortProjectItem')}
+  ${extractFunction('mutationNodeContainsPinnedSortProjectItem')}
   ${extractFunction('mutationNodeContainsPinnedSortConversationAnchor')}
   ${extractFunction('getPinnedSortMutationSection')}
   ${extractFunction('shouldSchedulePinnedSortForMutations')}
   window.__arcaiaPinnedMutationFilter = shouldSchedulePinnedSortForMutations;
 `;
 
-test('Pinned rescans only for Pinned section or conversation-anchor structure changes', async () => {
-  const browser = await chromium.launch({ headless: true });
+test('Pinned rescans only for Pinned section, conversation-anchor, or Project-row structure changes', async () => {
+  const browser = await launchBrowser({ headless: true });
   try {
     const page = await browser.newPage();
     await page.setContent(`

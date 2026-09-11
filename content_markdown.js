@@ -75,6 +75,118 @@
     return assistantMessages[assistantMessages.length - 1] || null;
   }
 
+  function getMarkdownCodeFence(text) {
+    const longestRun = Math.max(0, ...Array.from(String(text || '').matchAll(/`+/g), (match) => match[0].length));
+    return '`'.repeat(Math.max(3, longestRun + 1));
+  }
+
+  function getMarkdownCodeLanguage(element) {
+    const candidates = [
+      element?.getAttribute?.('data-language'),
+      element?.getAttribute?.('data-code-language'),
+      element?.querySelector?.('code')?.getAttribute?.('data-language'),
+      element?.className,
+      element?.querySelector?.('code')?.className
+    ];
+    for (const candidate of candidates) {
+      const match = String(candidate || '').match(/(?:language-|lang-)([a-z0-9_+-]+)/i);
+      if (match?.[1]) return match[1];
+    }
+    return '';
+  }
+
+  function serializeMarkdownChildren(node, context = {}) {
+    return Array.from(node?.childNodes || [], (child) => serializeMarkdownNode(child, context)).join('');
+  }
+
+  function serializeMarkdownList(list, depth = 0) {
+    const ordered = String(list?.tagName || '').toUpperCase() === 'OL';
+    const items = Array.from(list?.children || []).filter((child) => String(child.tagName || '').toUpperCase() === 'LI');
+    return `${items.map((item, index) => {
+      const nestedLists = Array.from(item.children || []).filter((child) => /^(UL|OL)$/.test(String(child.tagName || '').toUpperCase()));
+      const body = Array.from(item.childNodes || [])
+        .filter((child) => !(child?.nodeType === 1 && /^(UL|OL)$/.test(String(child.tagName || '').toUpperCase())))
+        .map((child) => serializeMarkdownNode(child, { inline: true }))
+        .join('')
+        .trim();
+      const prefix = `${'  '.repeat(depth)}${ordered ? `${index + 1}.` : '-'} `;
+      const nested = nestedLists.map((child) => serializeMarkdownList(child, depth + 1).trimEnd()).filter(Boolean);
+      return [prefix + body, ...nested].join('\n');
+    }).join('\n')}\n\n`;
+  }
+
+  function serializeMarkdownTable(table) {
+    const rows = Array.from(table?.querySelectorAll?.('tr') || []).map((row) => (
+      Array.from(row.children || []).map((cell) => serializeMarkdownChildren(cell, { inline: true }).trim().replace(/\|/g, '\\|').replace(/\s*\n\s*/g, ' '))
+    )).filter((cells) => cells.length > 0);
+    if (!rows.length) return '';
+    const width = Math.max(...rows.map((row) => row.length));
+    const normalizeRow = (row) => Array.from({ length: width }, (_, index) => row[index] || '');
+    const lines = [normalizeRow(rows[0]), Array(width).fill('---'), ...rows.slice(1).map(normalizeRow)];
+    return `${lines.map((row) => `| ${row.join(' | ')} |`).join('\n')}\n\n`;
+  }
+
+  function serializeMarkdownNode(node, context = {}) {
+    if (!node) return '';
+    if (node.nodeType === 3) {
+      const text = String(node.nodeValue || '').replace(/\u00a0/g, ' ');
+      return !context.inline && /^\s*$/.test(text) ? '' : text;
+    }
+    if (node.nodeType !== 1) return '';
+    const tag = String(node.tagName || '').toUpperCase();
+    const children = () => serializeMarkdownChildren(node, context);
+    const inlineChildren = () => serializeMarkdownChildren(node, { ...context, inline: true });
+    if (/^H[1-6]$/.test(tag)) return `${'#'.repeat(Number(tag.slice(1)))} ${inlineChildren().trim()}\n\n`;
+    if (tag === 'P') return context.inline ? inlineChildren() : `${inlineChildren().trim()}\n\n`;
+    if (tag === 'BR') return '\n';
+    if (tag === 'STRONG' || tag === 'B') return `**${inlineChildren()}**`;
+    if (tag === 'EM' || tag === 'I') return `*${inlineChildren()}*`;
+    if (tag === 'DEL' || tag === 'S') return `~~${inlineChildren()}~~`;
+    if (tag === 'A') {
+      const label = inlineChildren().trim() || String(node.getAttribute?.('href') || '');
+      const href = String(node.getAttribute?.('href') || '').trim();
+      return href ? `[${label}](${href})` : label;
+    }
+    if (tag === 'CODE' && String(node.parentElement?.tagName || '').toUpperCase() !== 'PRE') {
+      const text = String(node.textContent || '');
+      const fence = getMarkdownCodeFence(text);
+      return `${fence}${text}${fence}`;
+    }
+    if (tag === 'PRE') {
+      const text = String(node.textContent || '').replace(/\n$/, '');
+      const fence = getMarkdownCodeFence(text);
+      return `${fence}${getMarkdownCodeLanguage(node)}\n${text}\n${fence}\n\n`;
+    }
+    if (tag === 'UL' || tag === 'OL') return serializeMarkdownList(node, Number(context.listDepth || 0));
+    if (tag === 'LI') return children();
+    if (tag === 'BLOCKQUOTE') {
+      const body = children().trim();
+      return `${body.split('\n').map((line) => `> ${line}`).join('\n')}\n\n`;
+    }
+    if (tag === 'HR') return '---\n\n';
+    if (tag === 'TABLE') return serializeMarkdownTable(node);
+    if (tag === 'IMG') {
+      const src = String(node.getAttribute?.('src') || '').trim();
+      const alt = String(node.getAttribute?.('alt') || '').trim();
+      return src ? `![${alt}](${src})` : '';
+    }
+    return children();
+  }
+
+  function serializeFilePreviewMarkdown(root) {
+    return serializeMarkdownChildren(root).replace(/\n[ \t]+\n/g, '\n\n').trim();
+  }
+
+  function extractFilePreviewRawText(editor) {
+    if (!editor || editor.nodeType !== 1) return '';
+    const children = Array.from(editor.children || []).filter((child) => String(child.textContent || '').trim());
+    const codeBlocks = children.filter((child) => child.matches?.('pre, code') || (child.children.length === 1 && child.firstElementChild?.matches?.('pre, code')));
+    if (codeBlocks.length && codeBlocks.length === children.length) {
+      return codeBlocks.map((block) => String((block.matches?.('pre, code') ? block : block.firstElementChild)?.textContent || '')).join('\n').trim();
+    }
+    return String(editor.innerText || editor.textContent || '').trim();
+  }
+
   window.ArcaiaContentMarkdown = Object.freeze({
     buildMarkdownHeaderLines,
     buildMarkdownTurnHeading,
@@ -84,6 +196,8 @@
     buildNonTextMarkdownBody,
     renderMarkdownMessageBody,
     pickMarkdownUserMessages,
-    pickFinalAssistantMessageForMarkdown
+    pickFinalAssistantMessageForMarkdown,
+    serializeFilePreviewMarkdown,
+    extractFilePreviewRawText
   });
 })();

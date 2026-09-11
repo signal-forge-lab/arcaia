@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { chromium } = require('playwright');
+const { launchBrowser } = require('../tools/playwright_browser');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
 
@@ -54,7 +54,7 @@ const classifierSource = `
 `;
 
 test('Recent View schedules only proven grouping mutations while shared content observation stays broad', async () => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser({ headless: true });
   try {
     const page = await browser.newPage();
     await page.setContent(`

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Arcaia Initial Render Probe</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      width: 360px;
+      margin: 0;
+      padding: 16px;
+      box-sizing: border-box;
+      background: #1e2126;
+      color: #e7e9ec;
+      font: 13px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    h1 { margin: 0 0 10px; font-size: 15px; }
+    .panel { border: 1px solid #3a414a; border-radius: 10px; padding: 12px; background: #24282e; }
+    .row { display: flex; justify-content: space-between; gap: 12px; margin: 4px 0; }
+    .label { color: #a9b0ba; }
+    .value { text-align: right; word-break: break-word; }
+    .notice { margin: 10px 0 0; color: #a9b0ba; }
+    .actions { display: flex; gap: 8px; margin-top: 12px; }
+    button {
+      flex: 1;
+      border: 1px solid #3a414a;
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #2b3037;
+      color: #e7e9ec;
+      cursor: pointer;
+    }
+    button:hover { background: #323840; }
+    button:disabled { opacity: .5; cursor: default; }
+  </style>
+</head>
+<body>
+  <h1>Arcaia Initial Render Probe</h1>
+  <div class="panel">
+    <div class="row"><span class="label">状態</span><span class="value" id="status">未取得</span></div>
+    <div class="row"><span class="label">イベント数</span><span class="value" id="event-count">0</span></div>
+    <div class="row"><span class="label">Arcaia版</span><span class="value" id="arcaia-version">未確認</span></div>
+    <div class="row"><span class="label">ターンMD</span><span class="value" id="turn-markdown">未確認</span></div>
+    <div class="row"><span class="label">ヘッダーMD</span><span class="value" id="header-markdown">未確認</span></div>
+    <div class="row"><span class="label">Recent View操作</span><span class="value" id="recent-controls">未確認</span></div>
+  </div>
+  <p class="notice">通常版Arcaiaを有効にしたまま、ChatGPTを新しいタブで開いて15秒待ってください。</p>
+  <div class="actions">
+    <button id="download" type="button" disabled>JSONを保存</button>
+    <button id="reset" type="button">記録を消去</button>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

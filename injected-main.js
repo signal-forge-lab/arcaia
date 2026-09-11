@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '0.1.275';
+  const APP_VERSION = '0.1.371';
   const MAIN_PROTOCOL_SOURCE = 'aice-probe-main-v159';
   const CONTENT_PROTOCOL_SOURCE = 'aice-probe-content-v159';
   const GLOBAL_KEY = '__AICE_PROBE_MAIN_STATE_V40__';
@@ -10,19 +10,21 @@
   const EXTENSION_ENABLED_STORAGE_KEY = 'arcaia_extension_enabled_v1';
   const HEADER_PREFIXES = ['chatgpt-', 'oai-'];
   const TARGET_PATH = '/backend-api/';
-  const MAX_OBSERVATIONS = 80;
   const MAX_CONVERSATION_DERIVED_STATE_CACHE_ENTRIES = 4;
+  const MAX_TURN_ANCHORS_PER_CONVERSATION = 12;
   const NATIVE_LITE_TURN_COUNT = 3;
   const CONFIGURED_LITE_TURN_COUNT_MAX = 10;
   const RECENT_VIEW_EXPANDED_TURN_COUNT_MAX = 50;
   const CAPTURE_TURN_COUNT_MAX = 80;
   const BACKEND_REWRITE_DEFAULT_ENABLED = true;
   const BACKEND_REWRITE_CAPTURE_ENABLED = true;
+  const TOOL_HISTORY_PAYLOAD_PRESERVE_LATEST_USER_TURNS = 2;
   const LITE_IMAGE_PLACEHOLDER_TEXT = [
     '🖼️ この回答は画像出力です。',
     'Recent Viewでは画像本体は表示されません。',
     '通常表示で確認してください。'
   ].join('\n');
+  const LITE_FILE_ATTACHMENT_PLACEHOLDER_TEXT = '[添付ファイル]';
 
   function getArcaiaCaptureMode() {
     try {
@@ -101,7 +103,6 @@
     } catch {}
   }
 
-
   if (window[GLOBAL_KEY]?.installed) {
     const previous = window[GLOBAL_KEY];
     if (previous?.appVersion === APP_VERSION) {
@@ -172,6 +173,7 @@
         userDisabled: false,
         configSource: 'capture_url_params',
         backendRewriteEnabled: BACKEND_REWRITE_CAPTURE_ENABLED,
+        toolHistoryCompaction: false,
         liteShowImages: true,
         fullLoadOnce: false,
         fullLoadConversationId: null,
@@ -195,6 +197,7 @@
         historySearchBypass: true,
         configSource: 'history_search_bypass',
         backendRewriteEnabled: BACKEND_REWRITE_DEFAULT_ENABLED,
+        toolHistoryCompaction: false,
         liteShowImages: true,
         fullLoadOnce: false,
         fullLoadConversationId: null,
@@ -218,6 +221,7 @@
         ? 'default_on_backend_rewrite_enabled_css_hide_fallback'
         : 'default_on_waiting_for_conversation_id_backend_rewrite_enabled_css_hide_fallback',
       backendRewriteEnabled: BACKEND_REWRITE_DEFAULT_ENABLED,
+      toolHistoryCompaction: false,
       liteShowImages: true,
       fullLoadOnce: false,
       fullLoadConversationId: null,
@@ -315,6 +319,7 @@
         captureMode: true,
         configSource: 'capture_url_params',
         backendRewriteEnabled: BACKEND_REWRITE_CAPTURE_ENABLED,
+        toolHistoryCompaction: false,
         liteShowImages: true,
         fullLoadOnce: false,
         fullLoadConversationId: null,
@@ -372,6 +377,7 @@
             : (config?.configSource || 'default_on_backend_rewrite_enabled_css_hide_fallback'),
       backendRewriteEnabled: Boolean(config?.backendRewriteEnabled !== false && BACKEND_REWRITE_DEFAULT_ENABLED),
       backendRewriteExperiment: Boolean(config?.backendRewriteExperiment === true),
+      toolHistoryCompaction: Boolean(config?.toolHistoryCompaction === true),
       liteShowImages: config?.liteShowImages !== false,
       fullLoadOnce: Boolean(config?.fullLoadOnce),
       fullLoadConversationId: typeof config?.fullLoadConversationId === 'string' ? config.fullLoadConversationId : null,
@@ -396,15 +402,6 @@
       return true;
     } catch {
       return false;
-    }
-  }
-
-  function readLiteDisplayRawStorageForDebug() {
-    try {
-      const raw = window.sessionStorage?.getItem?.(LITE_STORAGE_KEY);
-      return raw ? { exists: true, approxBytes: raw.length, parsed: JSON.parse(raw) } : { exists: false, approxBytes: 0, parsed: null };
-    } catch (error) {
-      return { exists: null, error: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -440,16 +437,26 @@
     authorization: null,
     extraHeaders: {},
     updatedAt: null,
-    responseProbes: [],
     extensionEnabled: readExtensionEnabledFromStorage(),
-    historyProbeArmedUntil: 0,
     liteDisplayConfig: readLiteDisplayConfigFromStorage(),
     liteDisplayRewriteCount: 0,
     liteDisplayLastRewrite: null,
+    toolHistoryPayloadRewriteCount: 0,
+    toolHistoryPayloadLastRewrite: null,
+    toolHistorySummaryIndex: null,
+    toolHistorySummaryIndexUpdateCount: 0,
+    toolHistorySummaryIndexesByConversation: createBoundedConversationCache(),
     messageTimestampIndex: null,
     messageTimestampIndexUpdateCount: 0,
     messageTimestampIndexesByConversation: createBoundedConversationCache(),
+    turnPageSnapshotsByConversation: createBoundedConversationCache(),
+    absoluteTurnIndexesByConversation: createBoundedConversationCache(),
+    projectSidebarIndex: null,
+    turnPageSnapshotRevision: 0,
+    turnCounterGeneration: 0,
+    turnCounterAbortController: null,
     conversationModelConfigsByConversation: createBoundedConversationCache(),
+    readOnlyConversationModelsByConversation: createBoundedConversationCache(2),
     fetchHooked: false,
     xhrHooked: false,
     originalFetch: null,
@@ -554,9 +561,29 @@
     };
   }
 
+  function getChangedMessageTimestampIds(previousIndex, nextIndex) {
+    if (!previousIndex || previousIndex.conversationId !== nextIndex?.conversationId) return [];
+    const changed = [];
+    for (const [messageId, nextItem] of Object.entries(nextIndex?.byMessageId || {})) {
+      const previousItem = previousIndex.byMessageId?.[messageId];
+      if (!previousItem
+        || previousItem.iso !== nextItem.iso
+        || previousItem.updateTimeIso !== nextItem.updateTimeIso
+        || previousItem.status !== nextItem.status) {
+        changed.push(messageId);
+      }
+    }
+    return changed;
+  }
+
   function observeMessageTimestampIndexFromConversation(raw, url = '', reason = 'conversation_fetch') {
     try {
+      observeTurnPageSnapshotFromConversation(raw, url);
       const index = buildMessageTimestampIndexFromConversation(raw, url);
+      const previousIndex = index.conversationId
+        ? state.messageTimestampIndexesByConversation.get(index.conversationId)
+        : state.messageTimestampIndex;
+      const changedMessageIds = getChangedMessageTimestampIds(previousIndex, index);
       state.messageTimestampIndex = index;
       state.messageTimestampIndexesByConversation.set(index.conversationId, index);
       state.messageTimestampIndexUpdateCount = (state.messageTimestampIndexUpdateCount || 0) + 1;
@@ -564,6 +591,7 @@
         reason,
         conversationId: index.conversationId || null,
         messageCount: index.messageCount || 0,
+        changedMessageIds,
         updateCount: state.messageTimestampIndexUpdateCount
       });
       return index;
@@ -578,6 +606,316 @@
       };
       return state.messageTimestampIndex;
     }
+  }
+
+  function isToolHistoryInvocationMessage(message) {
+    if (!message || message.author?.role !== 'assistant') return false;
+    const recipient = String(message.recipient || '').trim();
+    return Boolean(recipient && recipient !== 'all');
+  }
+
+  function isToolHistorySummaryTargetMessage(message) {
+    if (!message || message.author?.role !== 'assistant') return false;
+    const recipient = String(message.recipient || 'all').trim() || 'all';
+    if (recipient !== 'all') return false;
+    if (message.content?.content_type !== 'text') return false;
+    return message.end_turn === true || message.metadata?.is_complete === true;
+  }
+
+  function buildToolHistorySummaryIndexFromConversation(raw, url = '') {
+    if (!raw?.mapping || typeof raw.mapping !== 'object') return null;
+    const conversationId = raw.conversation_id || extractConversationIdFromConversationDetailUrl(url) || extractConversationIdFromCurrentUrl();
+    if (!conversationId) return null;
+    const root = findRootNode(raw);
+    if (!root?.id) return null;
+    const reachableIds = collectReachableNodeIds(raw, root);
+    const latestLeaf = findLatestLeafNodeForLite(raw, reachableIds);
+    if (!latestLeaf?.id) return null;
+    const pathIds = buildPathFromLeaf(raw, root, latestLeaf);
+    const byAssistantMessageId = {};
+    let currentToolCount = 0;
+    let currentSummaryTargetId = null;
+    let currentTurnStarted = false;
+    let totalToolInvocations = 0;
+    let summarizedTurnCount = 0;
+
+    const flushTurn = () => {
+      if (currentToolCount > 0 && currentSummaryTargetId) {
+        byAssistantMessageId[currentSummaryTargetId] = {
+          assistantMessageId: currentSummaryTargetId,
+          toolCount: currentToolCount
+        };
+        summarizedTurnCount += 1;
+      }
+      currentToolCount = 0;
+      currentSummaryTargetId = null;
+    };
+
+    for (const nodeId of pathIds) {
+      const message = raw.mapping?.[nodeId]?.message;
+      if (!message) continue;
+      if (message.author?.role === 'user') {
+        if (currentTurnStarted) flushTurn();
+        currentTurnStarted = true;
+        continue;
+      }
+      if (!currentTurnStarted) continue;
+      if (isToolHistoryInvocationMessage(message)) {
+        currentToolCount += 1;
+        totalToolInvocations += 1;
+      }
+      if (isToolHistorySummaryTargetMessage(message)) {
+        currentSummaryTargetId = message.id || nodeId;
+      }
+    }
+    if (currentTurnStarted) flushTurn();
+
+    return {
+      ok: true,
+      appVersion: APP_VERSION,
+      source: 'main_world_existing_conversation_fetch',
+      conversationId,
+      updatedAt: Date.now(),
+      updatedAtIso: nowIso(),
+      summarizedTurnCount,
+      totalToolInvocations,
+      byAssistantMessageId
+    };
+  }
+
+  function observeToolHistorySummaryIndexFromConversation(raw, url = '', reason = 'conversation_fetch') {
+    try {
+      const index = buildToolHistorySummaryIndexFromConversation(raw, url);
+      if (!index) return null;
+      state.toolHistorySummaryIndex = index;
+      state.toolHistorySummaryIndexesByConversation.set(index.conversationId, index);
+      state.toolHistorySummaryIndexUpdateCount = (state.toolHistorySummaryIndexUpdateCount || 0) + 1;
+      emitMainEvent('tool_history_summary_index_updated', {
+        reason,
+        conversationId: index.conversationId,
+        summarizedTurnCount: index.summarizedTurnCount,
+        totalToolInvocations: index.totalToolInvocations,
+        updateCount: state.toolHistorySummaryIndexUpdateCount,
+        toolHistorySummaryIndex: index
+      });
+      return index;
+    } catch {
+      return null;
+    }
+  }
+
+  function getToolHistorySummaryIndexForContent(requestedConversationId = null) {
+    const conversationId = String(requestedConversationId || '').trim();
+    return conversationId
+      ? state.toolHistorySummaryIndexesByConversation.get(conversationId)
+      : state.toolHistorySummaryIndex;
+  }
+
+  function isTurnCounterUserMessage(message) {
+    return Boolean(message && message.author?.role === 'user' && isTimestampVisibleMessage(message));
+  }
+
+  function buildTurnPageSnapshot(raw, url = '') {
+    if (!raw?.mapping || typeof raw.mapping !== 'object') return null;
+    const conversationId = raw.conversation_id || extractConversationIdFromConversationDetailUrl(url) || extractConversationIdFromCurrentUrl();
+    if (!conversationId) return null;
+    const root = findRootNode(raw);
+    const reachableIds = root ? collectReachableNodeIds(raw, root) : new Set();
+    const leaf = root ? findLatestLeafNodeForLite(raw, reachableIds) : null;
+    const pathIds = root && leaf ? buildPathFromLeaf(raw, root, leaf) : [];
+    const byMessageId = {};
+    const byNodeId = {};
+    const userMessageIds = [];
+    let localTurnNumber = 0;
+    for (const nodeId of pathIds) {
+      const message = raw.mapping?.[nodeId]?.message;
+      if (!message || !isTimestampVisibleMessage(message)) continue;
+      if (isTurnCounterUserMessage(message)) {
+        localTurnNumber += 1;
+        if (message.id) userMessageIds.push(message.id);
+      }
+      if (message.author?.role !== 'user' && message.author?.role !== 'assistant') continue;
+      const assignment = { localTurnNumber };
+      byNodeId[nodeId] = assignment;
+      if (message.id) byMessageId[message.id] = assignment;
+    }
+    state.turnPageSnapshotRevision = Number(state.turnPageSnapshotRevision || 0) + 1;
+    return {
+      conversationId,
+      revision: state.turnPageSnapshotRevision,
+      hasPreviousPage: raw?.page_info?.has_previous_page === true,
+      startCursor: typeof raw?.page_info?.start_cursor === 'string' ? raw.page_info.start_cursor : null,
+      localTurnCount: localTurnNumber,
+      userMessageIds,
+      byMessageId,
+      byNodeId
+    };
+  }
+
+  function observeTurnPageSnapshotFromConversation(raw, url = '') {
+    const snapshot = buildTurnPageSnapshot(raw, url);
+    if (snapshot?.conversationId) state.turnPageSnapshotsByConversation.set(snapshot.conversationId, snapshot);
+    return snapshot;
+  }
+
+  function cancelAbsoluteTurnCounter() {
+    state.turnCounterGeneration = Number(state.turnCounterGeneration || 0) + 1;
+    try { state.turnCounterAbortController?.abort?.(); } catch {}
+    state.turnCounterAbortController = null;
+  }
+
+  function normalizeTurnAnchorCacheForMain(value, conversationId) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const expectedConversationId = String(conversationId || '').trim();
+    const cachedConversationId = String(value.conversationId || expectedConversationId).trim();
+    if (!expectedConversationId || cachedConversationId !== expectedConversationId) return null;
+    const totalTurnCount = Math.floor(Number(value.totalTurnCount));
+    if (!Number.isInteger(totalTurnCount) || totalTurnCount < 1) return null;
+    const anchors = [];
+    const seen = new Set();
+    for (const rawAnchor of Array.isArray(value.anchors) ? value.anchors : []) {
+      const messageId = String(rawAnchor?.messageId || '').trim();
+      const turnNumber = Math.floor(Number(rawAnchor?.turnNumber));
+      if (!messageId || seen.has(messageId) || !Number.isInteger(turnNumber) || turnNumber < 1 || turnNumber > totalTurnCount) continue;
+      seen.add(messageId);
+      anchors.push({ messageId, turnNumber });
+    }
+    if (!anchors.length) return null;
+    return {
+      conversationId: expectedConversationId,
+      totalTurnCount,
+      anchors: anchors.slice(-MAX_TURN_ANCHORS_PER_CONVERSATION)
+    };
+  }
+
+  function buildAbsoluteTurnIndexFromSnapshot(snapshot, olderTurnCount = 0) {
+    const older = Math.max(0, Math.floor(Number(olderTurnCount) || 0));
+    const localTurnCount = Math.max(0, Math.floor(Number(snapshot?.localTurnCount) || 0));
+    const byMessageId = {};
+    const byNodeId = {};
+    const assign = (source, target) => {
+      for (const [id, value] of Object.entries(source || {})) {
+        const local = Math.floor(Number(value?.localTurnNumber || 0));
+        if (local > 0) target[id] = older + local;
+      }
+    };
+    assign(snapshot?.byMessageId, byMessageId);
+    assign(snapshot?.byNodeId, byNodeId);
+    return {
+      conversationId: snapshot?.conversationId || null,
+      revision: snapshot?.revision || 0,
+      totalTurnCount: older + localTurnCount,
+      olderTurnCount: older,
+      localTurnCount,
+      startCursor: snapshot?.startCursor || null,
+      hasPreviousPage: snapshot?.hasPreviousPage === true,
+      byMessageId,
+      byNodeId
+    };
+  }
+
+  function buildTurnAnchorCacheFromAbsoluteIndex(snapshot, index) {
+    const anchors = [];
+    for (const messageId of Array.isArray(snapshot?.userMessageIds) ? snapshot.userMessageIds : []) {
+      const turnNumber = Math.floor(Number(index?.byMessageId?.[messageId] || 0));
+      if (messageId && turnNumber > 0) anchors.push({ messageId, turnNumber });
+    }
+    if (!anchors.length || !index?.conversationId || !Number.isInteger(Number(index?.totalTurnCount))) return null;
+    return {
+      conversationId: index.conversationId,
+      totalTurnCount: Number(index.totalTurnCount),
+      anchors: anchors.slice(-MAX_TURN_ANCHORS_PER_CONVERSATION),
+      updatedAt: Date.now()
+    };
+  }
+
+  function resolveAbsoluteTurnIndexFromSnapshot(snapshot, anchorCache = null) {
+    if (!snapshot?.conversationId) return { ok: false, error: 'absolute_turn_snapshot_unavailable' };
+    let olderTurnCount = 0;
+    let matchedAnchorCount = 0;
+    let source = 'complete_snapshot';
+    if (snapshot.hasPreviousPage) {
+      const normalizedCache = normalizeTurnAnchorCacheForMain(anchorCache, snapshot.conversationId);
+      if (!normalizedCache) return { ok: false, error: 'absolute_turn_anchor_miss' };
+      const anchorByMessageId = new Map(normalizedCache.anchors.map((anchor) => [anchor.messageId, anchor.turnNumber]));
+      const offsets = [];
+      for (const messageId of Array.isArray(snapshot.userMessageIds) ? snapshot.userMessageIds : []) {
+        const absoluteTurn = Number(anchorByMessageId.get(messageId) || 0);
+        const localTurn = Number(snapshot.byMessageId?.[messageId]?.localTurnNumber || 0);
+        if (absoluteTurn > 0 && localTurn > 0) offsets.push(absoluteTurn - localTurn);
+      }
+      if (!offsets.length) return { ok: false, error: 'absolute_turn_anchor_miss' };
+      olderTurnCount = offsets[0];
+      if (olderTurnCount < 0 || offsets.some((offset) => offset !== olderTurnCount)) {
+        return { ok: false, error: 'absolute_turn_anchor_inconsistent' };
+      }
+      matchedAnchorCount = offsets.length;
+      source = 'anchor_cache';
+    }
+    const index = buildAbsoluteTurnIndexFromSnapshot(snapshot, olderTurnCount);
+    return {
+      ok: true,
+      index,
+      anchorCache: buildTurnAnchorCacheFromAbsoluteIndex(snapshot, index),
+      source,
+      matchedAnchorCount
+    };
+  }
+
+  async function getAbsoluteTurnIndexForContent(requestedConversationId, anchorCache = null, allowHistoryFetch = true) {
+    const conversationId = String(requestedConversationId || '').trim();
+    if (!conversationId || conversationId !== extractConversationIdFromCurrentUrl()) {
+      return { ok: false, appVersion: APP_VERSION, error: 'absolute_turn_snapshot_unavailable' };
+    }
+    const snapshot = state.turnPageSnapshotsByConversation.get(conversationId);
+    if (!snapshot) return { ok: false, appVersion: APP_VERSION, error: 'absolute_turn_snapshot_unavailable' };
+    const cached = state.absoluteTurnIndexesByConversation.get(conversationId);
+    if (cached?.revision === snapshot.revision) {
+      return {
+        ok: true,
+        appVersion: APP_VERSION,
+        index: cached,
+        anchorCache: buildTurnAnchorCacheFromAbsoluteIndex(snapshot, cached),
+        cached: true,
+        historyFetchAttempted: false
+      };
+    }
+    const resolved = resolveAbsoluteTurnIndexFromSnapshot(snapshot, anchorCache);
+    if (resolved.ok) {
+      state.absoluteTurnIndexesByConversation.set(conversationId, resolved.index);
+      return { ...resolved, appVersion: APP_VERSION, cached: false, historyFetchAttempted: false };
+    }
+    if (!snapshot.hasPreviousPage || allowHistoryFetch === false) {
+      return { ok: false, appVersion: APP_VERSION, error: resolved.error, historyFetchAttempted: false };
+    }
+    const rebuilt = await getReadOnlyConversationModelForContent(conversationId, 'all', true);
+    if (!rebuilt?.ok || conversationId !== extractConversationIdFromCurrentUrl()) {
+      return {
+        ok: false,
+        appVersion: APP_VERSION,
+        error: rebuilt?.error || 'absolute_turn_history_rebuild_failed',
+        historyFetchAttempted: true
+      };
+    }
+    const rebuiltSnapshot = state.turnPageSnapshotsByConversation.get(conversationId);
+    const rebuiltResolved = resolveAbsoluteTurnIndexFromSnapshot(rebuiltSnapshot, null);
+    if (!rebuiltResolved.ok || rebuiltSnapshot?.hasPreviousPage) {
+      return {
+        ok: false,
+        appVersion: APP_VERSION,
+        error: rebuiltResolved.error || 'absolute_turn_history_rebuild_incomplete',
+        historyFetchAttempted: true
+      };
+    }
+    state.absoluteTurnIndexesByConversation.set(conversationId, rebuiltResolved.index);
+    return {
+      ...rebuiltResolved,
+      appVersion: APP_VERSION,
+      cached: false,
+      source: 'history_rebuild',
+      historyFetchAttempted: true,
+      fallbackReason: resolved.error
+    };
   }
 
   function buildCurrentConversationModelConfig(raw, url = '') {
@@ -708,7 +1046,8 @@
   function classifyChatGPTEndpoint(pathOrUrl) {
     let pathname = String(pathOrUrl || '');
     try { pathname = new URL(pathOrUrl, window.location.origin).pathname; } catch {}
-    if (/\/backend-api\/conversation\/[^/?#]+$/.test(pathname)) return 'conversation_detail';
+    if (/\/backend-api\/conversations?\/[^/?#]+$/.test(pathname)) return 'conversation_detail';
+    if (/\/backend-api\/conversations\/[^/?#]+\/messages$/.test(pathname)) return 'conversation_messages_page';
     if (pathname === '/backend-api/conversations') return 'conversation_list';
     if (/\/backend-api\/files\/download\//.test(pathname)) return 'file_download';
     if (/\/backend-api\//.test(pathname)) return 'other_backend_api';
@@ -736,10 +1075,6 @@
         hrefRedacted: String(url || '').slice(0, 300)
       };
     }
-  }
-
-  function normalizeHttpMethod(method) {
-    return String(method || 'GET').toUpperCase();
   }
 
   function shouldObserve(url) {
@@ -800,28 +1135,6 @@
     return null;
   }
 
-  function sanitizeHeaders(headers) {
-    const headerKeys = Object.keys(headers || {});
-    const lowerToOriginal = {};
-    for (const key of headerKeys) lowerToOriginal[key.toLowerCase()] = key;
-
-    const authorization = getHeaderCaseInsensitive(headers, 'authorization');
-    const authScheme = authorization ? String(authorization).split(/\s+/)[0] || 'present' : null;
-    const matchedExtraHeaderKeys = headerKeys.filter((key) => {
-      const lower = key.toLowerCase();
-      return HEADER_PREFIXES.some((prefix) => lower.startsWith(prefix));
-    });
-
-    return {
-      headerKeys: headerKeys.sort(),
-      hasAuthorization: Boolean(authorization),
-      authorizationScheme: authScheme,
-      authorizationLength: authorization ? String(authorization).length : 0,
-      matchedExtraHeaderKeys: matchedExtraHeaderKeys.sort(),
-      hasOaiDeviceIdHeader: Boolean(lowerToOriginal['oai-device-id'])
-    };
-  }
-
   function extractExtraHeaders(headers) {
     const extraHeaders = {};
     for (const [key, value] of Object.entries(headers || {})) {
@@ -834,104 +1147,101 @@
   }
 
 
-  function isConversationHistoryUrl(url) {
-    try {
-      const u = new URL(url, window.location.origin);
-      if (u.origin !== window.location.origin) return false;
-      return /\/backend-api\/conversation\/[^/?#]+/.test(u.pathname);
-    } catch {
-      return /\/backend-api\/conversation\//.test(String(url || ''));
-    }
-  }
-
-  function pushLimited(list, item, max = MAX_OBSERVATIONS) {
-    list.push(item);
-    if (list.length > max) list.splice(0, list.length - max);
-  }
-
-  function maybeParseJsonText(text) {
-    if (typeof text !== 'string') return null;
-    const trimmed = text.trim();
-    if (!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')) return null;
-    try { return JSON.parse(trimmed); } catch { return null; }
-  }
-
-  function countBy(values) {
-    const counts = {};
-    for (const value of values) {
-      const key = String(value || 'unknown');
-      counts[key] = (counts[key] || 0) + 1;
-    }
-    return counts;
-  }
-
-  const PAGINATION_FALSE_POSITIVE_KEYS = new Set([
-    'previewable',
-    'preview_language',
-    'custom_symbol_offsets'
-  ]);
-
-  function isPaginationLikeKey(key) {
-    const lower = String(key || '').toLowerCase();
-    if (!lower || PAGINATION_FALSE_POSITIVE_KEYS.has(lower)) return false;
-    if (/^(cursor|limit|offset|pagination|before|after|previous|has_more|hasmore|end_cursor|start_cursor|page_token|next_page_token|previous_page_token|continuation|continuation_token)$/.test(lower)) return true;
-    return /(cursor|limit|offset|pagination|before|after|has_more|hasmore|end_cursor|start_cursor|page_token|next_page_token|previous_page_token|continuation_token)/.test(lower);
-  }
-
-  function walkForProbeKeys(value, path = '', out = [], depth = 0) {
-    if (!value || typeof value !== 'object' || depth > 5 || out.length > 120) return out;
-    if (Array.isArray(value)) {
-      for (let i = 0; i < Math.min(value.length, 8); i += 1) walkForProbeKeys(value[i], `${path}[]`, out, depth + 1);
-      return out;
-    }
-    for (const [key, child] of Object.entries(value)) {
-      const childPath = path ? `${path}.${key}` : key;
-      const lower = key.toLowerCase();
-      if (isPaginationLikeKey(key)) {
-        out.push({ path: childPath, key, valueType: child == null ? 'null' : Array.isArray(child) ? 'array' : typeof child });
-      }
-      walkForProbeKeys(child, childPath, out, depth + 1);
-    }
-    return out;
-  }
-
-  function analyzeConversationLikeJson(json) {
-    const mapping = json && typeof json === 'object' && !Array.isArray(json) ? json.mapping : null;
-    const nodes = mapping && typeof mapping === 'object' ? Object.values(mapping) : [];
-    const messages = nodes.map((node) => node && node.message).filter(Boolean);
-    const roles = messages.map((message) => message?.author?.role || message?.role || 'unknown');
-    const contentTypes = messages.map((message) => message?.content?.content_type || 'unknown');
-    const statusValues = messages.map((message) => message?.status || 'unknown');
-    const childCounts = nodes.map((node) => Array.isArray(node?.children) ? node.children.length : 0);
-    const leafNodeCount = childCounts.filter((count) => count === 0).length;
-    const paginationLikeKeyPaths = walkForProbeKeys(json).slice(0, 80);
-    return {
-      topLevelKeys: json && typeof json === 'object' && !Array.isArray(json) ? Object.keys(json).sort().slice(0, 80) : [],
-      hasMapping: Boolean(mapping),
-      mappingNodeCount: nodes.length,
-      messageNodeCount: messages.length,
-      leafNodeCount,
-      roleCounts: countBy(roles),
-      contentTypeCounts: countBy(contentTypes),
-      statusCounts: countBy(statusValues),
-      paginationLikeKeyCount: paginationLikeKeyPaths.length,
-      paginationLikeKeyPaths,
-      hasTitle: Boolean(json?.title),
-      hasConversationId: Boolean(json?.conversation_id || json?.conversationId),
-      defaultModelSlug: json?.default_model_slug || null
-    };
-  }
-
-
   function extractConversationIdFromConversationDetailUrl(url) {
     try {
       const u = new URL(url, window.location.origin);
-      const match = u.pathname.match(/\/backend-api\/conversation\/([^/?#]+)$/);
+      const match = u.pathname.match(/\/backend-api\/conversations?\/([^/?#]+)$/);
       return match ? match[1] : null;
     } catch {
-      const match = String(url || '').match(/\/backend-api\/conversation\/([^/?#]+)$/);
+      const match = String(url || '').match(/\/backend-api\/conversations?\/([^/?#]+)$/);
       return match ? match[1] : null;
     }
+  }
+
+  function normalizeConversationPayloadForArcaia(raw) {
+    if (raw?.mapping && typeof raw.mapping === 'object' && !Array.isArray(raw.mapping)) {
+      return { raw, sourceFormat: 'mapping' };
+    }
+    if (!Array.isArray(raw?.messages)) return { raw, sourceFormat: 'unknown' };
+
+    const mapping = {};
+    const orderedIds = [];
+    for (const message of raw.messages) {
+      if (!message || typeof message !== 'object' || Array.isArray(message)) continue;
+      const id = String(message.id || '').trim();
+      if (!id || mapping[id]) continue;
+      mapping[id] = { id, message, parent: null, children: [] };
+      orderedIds.push(id);
+    }
+
+    if (!orderedIds.length) return { raw, sourceFormat: 'messages' };
+    for (let index = 0; index < orderedIds.length; index += 1) {
+      const id = orderedIds[index];
+      const declaredParentId = String(mapping[id].message?.metadata?.parent_id || '').trim();
+      const parentId = declaredParentId && declaredParentId !== id && mapping[declaredParentId]
+        ? declaredParentId
+        : index > 0 ? orderedIds[index - 1] : null;
+      mapping[id].parent = parentId;
+      if (parentId && !mapping[parentId].children.includes(id)) mapping[parentId].children.push(id);
+    }
+
+    const lastMessageId = [...raw.messages].reverse().find((message) => message?.id && mapping[message.id])?.id || null;
+    const currentNode = typeof raw.current_node === 'string' && mapping[raw.current_node]
+      ? raw.current_node
+      : lastMessageId;
+    const { messages: _messages, ...conversationFields } = raw;
+    return {
+      raw: { ...conversationFields, mapping, current_node: currentNode },
+      sourceFormat: 'messages'
+    };
+  }
+
+  function restoreConversationPayloadShape(originalRaw, canonicalRaw, sourceFormat) {
+    if (sourceFormat !== 'messages') return canonicalRaw;
+    const root = findRootNode(canonicalRaw);
+    const reachableIds = collectReachableNodeIds(canonicalRaw, root);
+    const leaf = findLatestLeafNodeForLite(canonicalRaw, reachableIds);
+    const pathIds = buildPathFromLeaf(canonicalRaw, root, leaf);
+    const messageNodes = pathIds
+      .map((id) => canonicalRaw?.mapping?.[id])
+      .filter((node) => node?.message && typeof node.message === 'object');
+    const messages = messageNodes.map((node, index) => ({
+      ...node.message,
+      metadata: {
+        ...(node.message.metadata || {}),
+        parent_id: index > 0 ? messageNodes[index - 1].id : null
+      }
+    }));
+    const pageInfo = originalRaw?.page_info && typeof originalRaw.page_info === 'object'
+      ? {
+          ...originalRaw.page_info,
+          has_previous_page: false,
+          start_cursor: null
+        }
+      : originalRaw?.page_info;
+    return {
+      ...originalRaw,
+      current_node: canonicalRaw.current_node || originalRaw.current_node || null,
+      messages,
+      ...(pageInfo === undefined ? {} : { page_info: pageInfo })
+    };
+  }
+
+  function restoreToolCompactedPayloadShape(originalRaw, canonicalRaw, sourceFormat) {
+    if (sourceFormat !== 'messages') return canonicalRaw;
+    const compactedById = canonicalRaw?.mapping && typeof canonicalRaw.mapping === 'object'
+      ? canonicalRaw.mapping
+      : {};
+    return {
+      ...originalRaw,
+      messages: Array.isArray(originalRaw?.messages)
+        ? originalRaw.messages.map((message) => {
+            const id = String(message?.id || '').trim();
+            const compacted = id ? compactedById?.[id]?.message : null;
+            return compacted && typeof compacted === 'object' ? compacted : message;
+          })
+        : originalRaw?.messages
+    };
   }
 
   function findRootNode(raw) {
@@ -1008,6 +1318,37 @@
     });
   }
 
+  function isLiteFileAttachmentLikeObject(value) {
+    if (!value || typeof value !== 'object') return false;
+    const contentType = String(value.content_type || value.type || value.mime_type || '').toLowerCase();
+    const fileLikeContentType = contentType === 'file'
+      || contentType.startsWith('file_')
+      || contentType.startsWith('file-')
+      || contentType.includes('attachment')
+      || contentType.includes('document')
+      || contentType.includes('pdf')
+      || contentType.includes('spreadsheet')
+      || contentType.includes('presentation')
+      || contentType.includes('archive');
+    if (fileLikeContentType) return true;
+    if (value.file_id || value.file_name || value.filename || value.upload_id) return true;
+    if (typeof value.asset_pointer === 'string') {
+      const pointer = value.asset_pointer.toLowerCase();
+      if (pointer.startsWith('file-service://') || pointer.startsWith('sediment://')) return true;
+    }
+    if (Array.isArray(value.attachments) && value.attachments.length > 0) return true;
+    if (Array.isArray(value.files) && value.files.length > 0) return true;
+    return false;
+  }
+
+  function hasLiteFileAttachmentLikeContent(value, depth = 0) {
+    if (!value || depth > 5) return false;
+    if (Array.isArray(value)) return value.some((item) => hasLiteFileAttachmentLikeContent(item, depth + 1));
+    if (typeof value !== 'object') return false;
+    if (isLiteFileAttachmentLikeObject(value)) return true;
+    return Object.values(value).some((item) => hasLiteFileAttachmentLikeContent(item, depth + 1));
+  }
+
   function hasLiteImageLikeContent(value, depth = 0) {
     if (!value || depth > 5) return false;
     if (Array.isArray(value)) return value.some((item) => hasLiteImageLikeContent(item, depth + 1));
@@ -1021,6 +1362,7 @@
     if (!part || typeof part !== 'object') return '';
     if (part.content_type === 'text' && typeof part.text === 'string') return part.text;
     if (hasLiteImageLikeContent(part)) return LITE_IMAGE_PLACEHOLDER_TEXT;
+    if (hasLiteFileAttachmentLikeContent(part)) return LITE_FILE_ATTACHMENT_PLACEHOLDER_TEXT;
     return '';
   }
 
@@ -1032,7 +1374,462 @@
     const text = textLike ? parts.map(normalizePartToText).filter(Boolean).join('\n\n').trim() : '';
     if (text) return text;
     if (hasLiteImageLikeContent(content) || hasLiteImageLikeContent(message?.metadata)) return LITE_IMAGE_PLACEHOLDER_TEXT;
+    if (hasLiteFileAttachmentLikeContent(content) || hasLiteFileAttachmentLikeContent(message?.metadata)) return LITE_FILE_ATTACHMENT_PLACEHOLDER_TEXT;
     return '';
+  }
+
+  function rendererTimestampIso(value) {
+    if (value == null || value === '') return null;
+    const number = Number(value);
+    const date = Number.isFinite(number)
+      ? new Date(number > 1000000000000 ? number : number * 1000)
+      : new Date(String(value));
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+
+  function rendererMessageText(message) {
+    const content = message?.content || {};
+    const contentType = String(content.content_type || '').toLowerCase();
+    if (contentType !== 'text' && contentType !== 'multimodal_text') return '';
+    return (Array.isArray(content.parts) ? content.parts : [])
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part?.content_type === 'text' && typeof part.text === 'string') return part.text;
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n\n')
+      .trim();
+  }
+
+  function rendererSafeHttpUrl(value, allowBackendRelative = false) {
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    if (allowBackendRelative && /^\/backend-api\/(?:files(?:\/|$)|estuary\/content(?:\?|$))/i.test(raw)) {
+      return raw;
+    }
+    if (!/^https?:\/\//i.test(raw)) return null;
+    try {
+      const url = new URL(raw);
+      return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function rendererResourceName(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    const withoutQuery = raw.split(/[?#]/, 1)[0];
+    const candidate = withoutQuery.split(/[\\/]/).filter(Boolean).pop() || '';
+    if (!candidate) return null;
+    try { return decodeURIComponent(candidate).slice(0, 240); } catch { return candidate.slice(0, 240); }
+  }
+
+  function rendererFileIdFromPointer(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    const withoutQuery = raw.split(/[?#]/, 1)[0];
+    const candidate = withoutQuery.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('/').filter(Boolean).pop() || '';
+    return /^[a-z0-9][a-z0-9._-]{2,199}$/i.test(candidate) ? candidate : null;
+  }
+
+  function rendererSandboxPath(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    const withoutScheme = raw.replace(/^sandbox:/i, '');
+    const encodedPath = withoutScheme.split(/[?#]/, 1)[0];
+    let path;
+    try { path = decodeURIComponent(encodedPath); } catch { path = encodedPath; }
+    if (!path.startsWith('/mnt/data/') || path.includes('\0') || path.split('/').includes('..')) return null;
+    return path.slice(0, 2048);
+  }
+
+  function collectRendererResources(value, path = '$', depth = 0, out = []) {
+    if (!value || typeof value !== 'object' || depth > 7 || out.length >= 80) return out;
+    if (Array.isArray(value)) {
+      for (let index = 0; index < Math.min(value.length, 80); index += 1) {
+        collectRendererResources(value[index], `${path}[${index}]`, depth + 1, out);
+      }
+      return out;
+    }
+    const pathLower = String(path).toLowerCase();
+    const pointer = typeof value.asset_pointer === 'string' ? value.asset_pointer : null;
+    const explicitFileId = value.file_id || value.fileId || value.upload_id || value.uploadId || null;
+    const fileId = rendererFileIdFromPointer(explicitFileId || pointer);
+    const mimeType = String(value.mime_type || value.mimeType || '').toLowerCase();
+    const contentType = String(value.content_type || value.type || '').toLowerCase();
+    const name = rendererResourceName(
+      value.file_name || value.filename || (pathLower.includes('attachment') ? value.name : null) || null
+    );
+    const url = rendererSafeHttpUrl(value.download_url || value.image_url || value.url || null, true);
+    const excludedVisualPath = /(citation|search_result|source|favicon|thumbnail)/.test(pathLower);
+    const imageLike = !excludedVisualPath && Boolean(
+      mimeType.startsWith('image/')
+      || contentType.includes('image')
+      || (pointer && (pathLower.includes('image') || Number(value.width) > 0 || Number(value.height) > 0))
+    );
+    const attachmentLike = Boolean(
+      pointer
+      || fileId
+      || name
+      || mimeType
+      || contentType.includes('file')
+      || contentType.includes('attachment')
+      || pathLower.includes('attachment')
+    );
+    if (!excludedVisualPath && attachmentLike) {
+      out.push({
+        kind: imageLike ? 'image' : 'attachment',
+        isImage: imageLike,
+        assetPointer: pointer,
+        fileId,
+        name: name ? String(name) : null,
+        mimeType: mimeType || null,
+        width: Number.isFinite(Number(value.width)) ? Number(value.width) : null,
+        height: Number.isFinite(Number(value.height)) ? Number(value.height) : null,
+        url
+      });
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (child && typeof child === 'object') {
+        collectRendererResources(child, `${path}.${key}`, depth + 1, out);
+      }
+    }
+    return out;
+  }
+
+  function collectRendererCitations(value, path = '$', depth = 0, out = []) {
+    if (!value || typeof value !== 'object' || depth > 7 || out.length >= 80) return out;
+    if (Array.isArray(value)) {
+      for (let index = 0; index < Math.min(value.length, 80); index += 1) {
+        collectRendererCitations(value[index], `${path}[${index}]`, depth + 1, out);
+      }
+      return out;
+    }
+    const pathLower = String(path).toLowerCase();
+    if (/(citation|source|search_result|content_reference)/.test(pathLower)) {
+      const url = rendererSafeHttpUrl(value.url || value.href || value.link || null);
+      if (url) {
+        let domain = null;
+        try { domain = new URL(url).hostname.replace(/^www\./, ''); } catch {}
+        out.push({
+          url,
+          title: String(value.title || value.name || value.text || domain || '出典').slice(0, 240),
+          domain
+        });
+      }
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (child && typeof child === 'object') {
+        collectRendererCitations(child, `${path}.${key}`, depth + 1, out);
+      }
+    }
+    return out;
+  }
+
+  function dedupeRendererItems(items, keyBuilder) {
+    const seen = new Set();
+    const result = [];
+    for (const item of items || []) {
+      const key = keyBuilder(item);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      result.push(item);
+    }
+    return result;
+  }
+
+  function normalizeRendererMessage(message, resources = [], citations = [], fallbackMessageId = null) {
+    return {
+      messageId: message?.id ? String(message.id) : (fallbackMessageId ? String(fallbackMessageId) : null),
+      text: rendererMessageText(message),
+      createdAtIso: rendererTimestampIso(message?.create_time || message?.update_time),
+      resources: dedupeRendererItems(resources, (item) => (
+        item?.assetPointer || item?.fileId || item?.url || `${item?.name || ''}|${item?.mimeType || ''}`
+      )),
+      citations: dedupeRendererItems(citations, (item) => item?.url)
+    };
+  }
+
+  function buildReadOnlyConversationModel(raw, url = '') {
+    if (!raw?.mapping || typeof raw.mapping !== 'object') throw new Error('conversation mapping is missing.');
+    const root = findRootNode(raw);
+    if (!root?.id) throw new Error('root node could not be detected.');
+    const reachableIds = collectReachableNodeIds(raw, root);
+    const leaf = findLatestLeafNodeForLite(raw, reachableIds);
+    if (!leaf?.id) throw new Error('latest leaf node could not be detected.');
+    const pathIds = buildPathFromLeaf(raw, root, leaf);
+    const turns = [];
+    let currentTurn = null;
+    let turnNumber = 0;
+    for (const nodeId of pathIds) {
+      const message = raw.mapping?.[nodeId]?.message;
+      if (!message) continue;
+      const role = message.author?.role || null;
+      const contentType = String(message.content?.content_type || '').toLowerCase();
+      const resources = collectRendererResources({ content: message.content, metadata: message.metadata });
+      const citations = collectRendererCitations({ content: message.content, metadata: message.metadata });
+      const visuallyHidden = isVisuallyHiddenMessage(message);
+      const userVisible = !visuallyHidden
+        && role === 'user'
+        && (contentType === 'text' || contentType === 'multimodal_text');
+      const assistantVisible = !visuallyHidden
+        && role === 'assistant'
+        && contentType === 'text'
+        && message.end_turn === true
+        && (!message.recipient || message.recipient === 'all');
+      if (userVisible) {
+        turnNumber += 1;
+        currentTurn = {
+          turnNumber,
+          user: normalizeRendererMessage(message, resources, [], nodeId),
+          assistant: null,
+          pendingAssistantResources: [],
+          pendingAssistantCitations: []
+        };
+        turns.push(currentTurn);
+        continue;
+      }
+      if (!currentTurn) continue;
+      if (role !== 'system') {
+        currentTurn.pendingAssistantResources.push(...resources);
+        currentTurn.pendingAssistantCitations.push(...citations);
+      }
+      if (assistantVisible) {
+        currentTurn.assistant = normalizeRendererMessage(
+          message,
+          currentTurn.pendingAssistantResources,
+          currentTurn.pendingAssistantCitations,
+          nodeId
+        );
+      }
+    }
+    for (const turn of turns) {
+      if (!turn.assistant && (turn.pendingAssistantResources.length || turn.pendingAssistantCitations.length)) {
+        turn.assistant = normalizeRendererMessage(
+          null,
+          turn.pendingAssistantResources,
+          turn.pendingAssistantCitations
+        );
+      }
+      delete turn.pendingAssistantResources;
+      delete turn.pendingAssistantCitations;
+    }
+    return {
+      ok: true,
+      appVersion: APP_VERSION,
+      conversationId: raw.conversation_id || extractConversationIdFromConversationDetailUrl(url) || null,
+      observedAt: Date.now(),
+      totalTurnCount: turns.length,
+      historyComplete: raw?.page_info?.has_previous_page !== true,
+      turns
+    };
+  }
+
+  function observeReadOnlyConversationModel(raw, url = '') {
+    const model = buildReadOnlyConversationModel(raw, url);
+    if (!model.conversationId) throw new Error('conversation id is missing.');
+    state.readOnlyConversationModelsByConversation.set(model.conversationId, model);
+    return model;
+  }
+
+  async function getReadOnlyConversationModelForContent(requestedConversationId, requestedTurnCount = 'all', forceRefresh = false) {
+    const conversationId = String(requestedConversationId || '').trim();
+    const all = requestedTurnCount === 'all';
+    let model = state.readOnlyConversationModelsByConversation.get(conversationId);
+    const needsFetch = Boolean(forceRefresh)
+      || !model
+      || model.conversationId !== conversationId
+      || (all && model.historyComplete === false);
+    if (needsFetch) {
+      if (
+        !conversationId
+        || conversationId !== extractConversationIdFromCurrentUrl()
+        || !state.fetchHooked
+        || typeof state.originalFetch !== 'function'
+      ) {
+        return { ok: false, appVersion: APP_VERSION, error: 'read_only_conversation_model_unavailable' };
+      }
+      try {
+        const headers = new Headers(state.extraHeaders || {});
+        if (state.authorization) headers.set('authorization', state.authorization);
+        const fetchJson = async (url) => {
+          const response = await Function.prototype.call.call(state.originalFetch, window, url, {
+            method: 'GET',
+            credentials: 'include',
+            headers
+          });
+          if (!response?.ok) throw new Error('read_only_history_fetch_failed');
+          return response.json();
+        };
+        const detailUrl = `/backend-api/conversations/${encodeURIComponent(conversationId)}`;
+        const initialRaw = await fetchJson(detailUrl);
+        let completeRaw = initialRaw;
+        if (all && Array.isArray(initialRaw?.messages) && initialRaw?.page_info?.has_previous_page === true) {
+          const chunks = [initialRaw.messages];
+          const seenCursors = new Set();
+          let pageInfo = initialRaw.page_info;
+          let pageCount = 0;
+          while (pageInfo?.has_previous_page === true) {
+            const cursor = typeof pageInfo.start_cursor === 'string' ? pageInfo.start_cursor : '';
+            if (!cursor || seenCursors.has(cursor)) throw new Error('read_only_history_pagination_cursor_invalid');
+            if (pageCount >= 500) throw new Error('read_only_history_pagination_limit');
+            seenCursors.add(cursor);
+            const pageUrl = `/backend-api/conversations/${encodeURIComponent(conversationId)}/messages?before=${encodeURIComponent(cursor)}&include_has_versions=true&num_turns=20`;
+            const pageRaw = await fetchJson(pageUrl);
+            if (!Array.isArray(pageRaw?.messages)) throw new Error('read_only_history_page_messages_missing');
+            chunks.unshift(pageRaw.messages);
+            pageInfo = pageRaw.page_info || null;
+            pageCount += 1;
+          }
+          const seenMessageIds = new Set();
+          const messages = [];
+          for (const chunk of chunks) {
+            for (const message of chunk) {
+              if (!message || typeof message !== 'object' || Array.isArray(message)) continue;
+              const id = String(message.id || '').trim();
+              if (id && seenMessageIds.has(id)) continue;
+              if (id) seenMessageIds.add(id);
+              messages.push(message);
+            }
+          }
+          completeRaw = {
+            ...initialRaw,
+            messages,
+            page_info: {
+              ...(initialRaw.page_info || {}),
+              ...(pageInfo || {}),
+              has_previous_page: false
+            }
+          };
+        }
+        const normalizedPayload = normalizeConversationPayloadForArcaia(completeRaw);
+        if (forceRefresh) observeTurnPageSnapshotFromConversation(normalizedPayload.raw, detailUrl);
+        model = observeReadOnlyConversationModel(normalizedPayload.raw, detailUrl);
+        if (all && model.historyComplete === false) {
+          return { ok: false, appVersion: APP_VERSION, error: 'read_only_history_incomplete' };
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          appVersion: APP_VERSION,
+          error: String(error?.message || 'read_only_conversation_model_unavailable').slice(0, 120)
+        };
+      }
+      if (!model || model.conversationId !== conversationId) {
+        return { ok: false, appVersion: APP_VERSION, error: 'read_only_conversation_model_unavailable' };
+      }
+    }
+    const safeTurnCount = all
+      ? model.totalTurnCount
+      : Math.max(1, Math.min(50, Math.floor(Number(requestedTurnCount) || 1)));
+    const turns = model.turns.slice(Math.max(0, model.turns.length - safeTurnCount));
+    return {
+      ok: true,
+      appVersion: APP_VERSION,
+      model: {
+        ...model,
+        turns,
+        visibleTurnCount: turns.length,
+        firstVisibleTurnNumber: turns[0]?.turnNumber || null
+      }
+    };
+  }
+
+  function findRendererAssetDownloadUrl(value, depth = 0) {
+    if (!value || depth > 5) return null;
+    if (typeof value === 'string') return rendererSafeHttpUrl(value);
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const result = findRendererAssetDownloadUrl(item, depth + 1);
+        if (result) return result;
+      }
+      return null;
+    }
+    if (typeof value !== 'object') return null;
+    for (const key of ['download_url', 'signed_url', 'image_url', 'url']) {
+      const result = rendererSafeHttpUrl(value[key], true);
+      if (result) return result;
+    }
+    for (const child of Object.values(value)) {
+      const result = findRendererAssetDownloadUrl(child, depth + 1);
+      if (result) return result;
+    }
+    return null;
+  }
+
+  function isRendererAssetResponseTypeAllowed(contentType, expectImage = false) {
+    if (!expectImage) return true;
+    const normalized = String(contentType || '').toLowerCase().split(';', 1)[0].trim();
+    return !normalized
+      || normalized.startsWith('image/')
+      || normalized === 'application/octet-stream'
+      || normalized === 'binary/octet-stream';
+  }
+
+  async function fetchRendererAssetBlob(url, headers = null, depth = 0, expectImage = false) {
+    if (depth > 3) return null;
+    const fetchImpl = state.originalFetch || window.fetch;
+    if (typeof fetchImpl !== 'function') return null;
+    const response = await fetchImpl.call(window, url, {
+      method: 'GET',
+      credentials: 'include',
+      redirect: 'follow',
+      headers: headers || undefined
+    });
+    if (!response?.ok) return null;
+    const contentType = String(response.headers?.get?.('content-type') || '').toLowerCase();
+    if (contentType.includes('json')) {
+      const payload = await response.json();
+      const signedUrl = findRendererAssetDownloadUrl(payload);
+      const nextHeaders = signedUrl?.startsWith('/backend-api/files') ? headers : null;
+      return signedUrl ? fetchRendererAssetBlob(signedUrl, nextHeaders, depth + 1, expectImage) : null;
+    }
+    if (!isRendererAssetResponseTypeAllowed(contentType, expectImage)) return null;
+    const blob = await response.blob();
+    if (!blob || blob.size <= 0 || blob.size > 25 * 1024 * 1024) return null;
+    return blob;
+  }
+
+  async function resolveReadOnlyRendererAsset(payload) {
+    payload = payload || {};
+    const conversationId = String(payload.conversationId || '').trim().slice(0, 240);
+    const messageId = String(payload.messageId || '').trim().slice(0, 240);
+    const sandboxPath = rendererSandboxPath(payload.sandboxPath);
+    const fileId = rendererFileIdFromPointer(payload.fileId || payload.assetPointer);
+    const directUrl = rendererSafeHttpUrl(payload.url, true);
+    const expectImage = payload.isImage === true || String(payload.mimeType || '').toLowerCase().startsWith('image/');
+    const candidates = [];
+    if (conversationId && messageId && sandboxPath) {
+      candidates.push(
+        `/backend-api/conversation/${encodeURIComponent(conversationId)}/interpreter/download?message_id=${encodeURIComponent(messageId)}&sandbox_path=${encodeURIComponent(sandboxPath)}`
+      );
+    }
+    if (directUrl) candidates.push(directUrl);
+    if (fileId) {
+      candidates.push(
+        `/backend-api/files/download/${encodeURIComponent(fileId)}`,
+        `/backend-api/files/${encodeURIComponent(fileId)}/download`,
+        `/backend-api/files/${encodeURIComponent(fileId)}`
+      );
+    }
+    const headers = new Headers();
+    if (state.authorization) headers.set('authorization', state.authorization);
+    for (const candidate of [...new Set(candidates)]) {
+      try {
+        const blob = await fetchRendererAssetBlob(candidate, candidate.startsWith('/') ? headers : null, 0, expectImage);
+        if (blob) {
+          return {
+            ok: true,
+            appVersion: APP_VERSION,
+            blob,
+            mimeType: blob.type || payload.mimeType || null
+          };
+        }
+      } catch {}
+    }
+    return { ok: false, appVersion: APP_VERSION, error: 'read_only_renderer_asset_unavailable' };
   }
 
   function applyLiteImagePlaceholderToMessage(message) {
@@ -1132,51 +1929,131 @@
       !isVisuallyHiddenMessage(message) &&
       (role === 'user' || role === 'assistant') &&
       !(role === 'assistant' && message.recipient && message.recipient !== 'all') &&
-      text
+      (role === 'user' || text)
     );
     return { id: nodeId, role, keep };
   }
 
-  function incrementLiteTraceCount(target, key) {
-    const normalized = String(key || 'unknown');
-    target[normalized] = (target[normalized] || 0) + 1;
+  function isCompletedHistoricalToolMessage(message) {
+    if (!message || message?.author?.role !== 'tool') return false;
+    const status = String(message.status || '').toLowerCase();
+    return status === 'finished_successfully'
+      || status === 'finished'
+      || status === 'complete'
+      || status === 'completed';
   }
 
-  function getLiteMessageDropReason(raw, nodeId) {
-    const node = raw?.mapping?.[nodeId];
-    const message = node?.message;
-    const role = message?.author?.role || null;
-    const text = extractTextFromMessage(message);
-    if (!message) return 'no_message';
-    if (isVisuallyHiddenMessage(message)) return 'visually_hidden';
-    if (!(role === 'user' || role === 'assistant')) return 'non_user_assistant_role';
-    if (role === 'assistant' && message.recipient && message.recipient !== 'all') return 'assistant_recipient_not_all';
-    if (!text) return 'empty_text';
-    return null;
-  }
+  function compactHistoricalToolPayload(raw, options) {
+    options = options && typeof options === 'object' ? options : {};
+    if (!raw || typeof raw !== 'object' || !raw.mapping || typeof raw.mapping !== 'object') {
+      return {
+        compactRaw: raw,
+        summary: { ok: false, changed: false, reason: 'conversation_mapping_missing' }
+      };
+    }
+    const root = findRootNode(raw);
+    if (!root?.id) {
+      return {
+        compactRaw: raw,
+        summary: { ok: false, changed: false, reason: 'conversation_root_missing' }
+      };
+    }
+    const reachableIds = collectReachableNodeIds(raw, root);
+    const latestLeaf = findLatestLeafNodeForLite(raw, reachableIds);
+    if (!latestLeaf?.id) {
+      return {
+        compactRaw: raw,
+        summary: { ok: false, changed: false, reason: 'conversation_leaf_missing' }
+      };
+    }
+    const pathIds = buildPathFromLeaf(raw, root, latestLeaf);
+    const preserveLatestUserTurnsRaw = Number(options?.preserveLatestUserTurns);
+    const preserveLatestUserTurns = Number.isFinite(preserveLatestUserTurnsRaw)
+      ? Math.max(1, Math.min(10, Math.floor(preserveLatestUserTurnsRaw)))
+      : TOOL_HISTORY_PAYLOAD_PRESERVE_LATEST_USER_TURNS;
+    const totalUserTurns = pathIds.reduce((count, nodeId) => {
+      return count + (raw?.mapping?.[nodeId]?.message?.author?.role === 'user' ? 1 : 0);
+    }, 0);
+    const compactThroughTurn = Math.max(0, totalUserTurns - preserveLatestUserTurns);
+    if (compactThroughTurn <= 0) {
+      return {
+        compactRaw: raw,
+        summary: {
+          ok: true,
+          changed: false,
+          reason: 'no_historical_turns',
+          preserveLatestUserTurns,
+          totalUserTurns,
+          compactThroughTurn,
+          historicalToolMessageCount: 0,
+          compactedToolMessageCount: 0,
+          clearedSearchResultGroupCount: 0,
+          clearedInlineCotCount: 0,
+          beforeToolBytes: 0,
+          afterToolBytes: 0
+        }
+      };
+    }
 
-  function summarizeLiteMessageNode(raw, nodeId, extra = {}) {
-    const node = raw?.mapping?.[nodeId] || null;
-    const message = node?.message || null;
-    const content = message?.content || null;
-    const text = extractTextFromMessage(message);
+    const compactRaw = JSON.parse(JSON.stringify(raw));
+    let currentTurn = 0;
+    let historicalToolMessageCount = 0;
+    let compactedToolMessageCount = 0;
+    let clearedSearchResultGroupCount = 0;
+    let clearedInlineCotCount = 0;
+    let beforeToolBytes = 0;
+    let afterToolBytes = 0;
+
+    for (const nodeId of pathIds) {
+      const originalMessage = raw?.mapping?.[nodeId]?.message;
+      if (originalMessage?.author?.role === 'user') currentTurn += 1;
+      if (currentTurn <= 0 || currentTurn > compactThroughTurn) continue;
+      if (!isCompletedHistoricalToolMessage(originalMessage)) continue;
+      historicalToolMessageCount += 1;
+
+      const compactMessage = compactRaw?.mapping?.[nodeId]?.message;
+      if (!compactMessage || typeof compactMessage !== 'object') continue;
+      let changed = false;
+      try { beforeToolBytes += JSON.stringify(compactMessage).length; } catch {}
+      const metadata = compactMessage.metadata && typeof compactMessage.metadata === 'object'
+        ? compactMessage.metadata
+        : null;
+      if (metadata) {
+        if (Array.isArray(metadata.search_result_groups) && metadata.search_result_groups.length > 0) {
+          clearedSearchResultGroupCount += metadata.search_result_groups.length;
+          metadata.search_result_groups = [];
+          changed = true;
+        }
+        if (Object.prototype.hasOwnProperty.call(metadata, 'inline_cot_expandable_content')
+          && metadata.inline_cot_expandable_content != null) {
+          delete metadata.inline_cot_expandable_content;
+          clearedInlineCotCount += 1;
+          changed = true;
+        }
+      }
+      if (changed) compactedToolMessageCount += 1;
+      try { afterToolBytes += JSON.stringify(compactMessage).length; } catch {}
+    }
+
     return {
-      id: nodeId || null,
-      parent: node?.parent || null,
-      childCount: Array.isArray(node?.children) ? node.children.length : 0,
-      role: message?.author?.role || null,
-      recipient: message?.recipient || null,
-      status: message?.status || null,
-      contentType: content?.content_type || null,
-      textLength: text ? text.length : 0,
-      textPreview: text ? text.slice(0, 80) : '',
-      createTime: message?.create_time || null,
-      updateTime: message?.update_time || null,
-      visuallyHidden: isVisuallyHiddenMessage(message),
-      hasImageLikeContent: hasLiteImageLikeContent(content),
-      hasImageLikeMetadata: hasLiteImageLikeContent(message?.metadata),
-      metadataKeys: message?.metadata && typeof message.metadata === 'object' ? Object.keys(message.metadata).slice(0, 30) : [],
-      ...extra
+      compactRaw,
+      summary: {
+        ok: true,
+        changed: compactedToolMessageCount > 0,
+        reason: compactedToolMessageCount > 0 ? 'historical_tool_payload_compacted' : 'no_heavy_historical_tool_payload',
+        preserveLatestUserTurns,
+        totalUserTurns,
+        compactThroughTurn,
+        historicalToolMessageCount,
+        compactedToolMessageCount,
+        clearedSearchResultGroupCount,
+        clearedInlineCotCount,
+        beforeToolBytes,
+        afterToolBytes,
+        toolBytesReductionPct: beforeToolBytes
+          ? Number(((1 - afterToolBytes / beforeToolBytes) * 100).toFixed(2))
+          : 0
+      }
     };
   }
 
@@ -1214,260 +2091,6 @@
     return out;
   }
 
-  function collectLiteImageSignalScan(raw, pathIdSet = null) {
-    const hits = [];
-    const roleCounts = {};
-    const contentTypeCounts = {};
-    for (const [nodeId, node] of Object.entries(raw?.mapping || {})) {
-      if (hits.length >= 80) break;
-      const message = node?.message || null;
-      if (!message) continue;
-      const content = message.content || null;
-      const metadata = message.metadata || null;
-      const imageLikeContent = hasLiteImageLikeContent(content);
-      const imageLikeMetadata = hasLiteImageLikeContent(metadata);
-      const signalKeys = collectLiteImageSignalKeys({ content, metadata });
-      if (!imageLikeContent && !imageLikeMetadata && signalKeys.length === 0) continue;
-      const role = message?.author?.role || null;
-      const contentType = content?.content_type || null;
-      incrementLiteTraceCount(roleCounts, role);
-      incrementLiteTraceCount(contentTypeCounts, contentType);
-      hits.push(summarizeLiteMessageNode(raw, nodeId, {
-        onSelectedPath: pathIdSet ? pathIdSet.has(nodeId) : null,
-        imageLikeContent,
-        imageLikeMetadata,
-        signalKeys: signalKeys.slice(0, 20)
-      }));
-    }
-    return {
-      hitCount: hits.length,
-      roleCounts,
-      contentTypeCounts,
-      hits
-    };
-  }
-
-  function buildLiteRewriteDecisionTrace(raw, reachableIds, latestLeaf, pathIds, kept, turns, retainedTurns, selectedSet, orderedSelectedNodeIds) {
-    const pathIdSet = new Set(pathIds || []);
-    const selectedRoleCounts = {};
-    const selectedContentTypeCounts = {};
-    const keptRoleCounts = {};
-    const pathRoleCounts = {};
-    const dropReasonCounts = {};
-    const pathMessageDiagnostics = (pathIds || []).map((nodeId, index) => {
-      const item = classifyLitePathMessage(raw, nodeId);
-      const dropReason = item.keep ? null : getLiteMessageDropReason(raw, nodeId);
-      const selected = selectedSet ? selectedSet.has(nodeId) : false;
-      const node = raw?.mapping?.[nodeId];
-      const message = node?.message;
-      const role = message?.author?.role || null;
-      const contentType = message?.content?.content_type || null;
-      incrementLiteTraceCount(pathRoleCounts, role);
-      if (item.keep) incrementLiteTraceCount(keptRoleCounts, role);
-      if (selected) {
-        incrementLiteTraceCount(selectedRoleCounts, role);
-        incrementLiteTraceCount(selectedContentTypeCounts, contentType);
-      }
-      if (dropReason) incrementLiteTraceCount(dropReasonCounts, dropReason);
-      if (item.keep && !selected) incrementLiteTraceCount(dropReasonCounts, 'kept_but_not_retained_turn');
-      return summarizeLiteMessageNode(raw, nodeId, {
-        pathIndex: index,
-        keep: item.keep,
-        selected,
-        dropReason,
-        keptButNotRetainedTurn: Boolean(item.keep && !selected)
-      });
-    });
-    const leafCandidates = getLeafNodes(raw, reachableIds || new Set()).filter((node) => node?.message);
-    const leafCandidateDiagnostics = leafCandidates
-      .slice()
-      .sort((a, b) => (b.message?.create_time || 0) - (a.message?.create_time || 0))
-      .slice(0, 20)
-      .map((node) => summarizeLiteMessageNode(raw, node.id, { selectedLeaf: node.id === latestLeaf?.id }));
-    const retainedTurnDiagnostics = (retainedTurns || []).map((turn, index) => {
-      const roleCounts = {};
-      const contentTypeCounts = {};
-      let imageLikeNodeCount = 0;
-      for (const item of turn.messages || []) {
-        const node = raw?.mapping?.[item.id];
-        const message = node?.message;
-        const role = message?.author?.role || item.role || null;
-        const contentType = message?.content?.content_type || null;
-        incrementLiteTraceCount(roleCounts, role);
-        incrementLiteTraceCount(contentTypeCounts, contentType);
-        if (hasLiteImageLikeContent(message?.content) || hasLiteImageLikeContent(message?.metadata)) imageLikeNodeCount += 1;
-      }
-      return {
-        retainedIndex: index,
-        originalTurnIndex: Math.max(0, (turns || []).length - (retainedTurns || []).length) + index,
-        messageIds: (turn.messages || []).map((item) => item.id),
-        roleCounts,
-        contentTypeCounts,
-        userOnly: Boolean(roleCounts.user && !roleCounts.assistant && !roleCounts.tool),
-        imageLikeNodeCount
-      };
-    });
-    return {
-      traceVersion: 'lite_rewrite_decision_trace_v1',
-      leafSelection: {
-        currentNodeId: raw?.current_node || null,
-        currentNodeExists: Boolean(raw?.current_node && raw?.mapping?.[raw.current_node]),
-        selectedLeafId: latestLeaf?.id || null,
-        selectedLeafFromCurrentNode: Boolean(raw?.current_node && raw?.mapping?.[raw.current_node] && latestLeaf?.id === raw.current_node),
-        leafCandidateCount: leafCandidates.length,
-        leafCandidates: leafCandidateDiagnostics
-      },
-      path: {
-        pathNodeCount: (pathIds || []).length,
-        pathRoleCounts,
-        keptRoleCounts,
-        selectedRoleCounts,
-        selectedContentTypeCounts,
-        selectedMessageNodeIds: (orderedSelectedNodeIds || []).slice(0, 80),
-        messageDiagnostics: pathMessageDiagnostics.slice(-120)
-      },
-      turns: {
-        keptTurnCount: (turns || []).length,
-        retainedTurnCount: (retainedTurns || []).length,
-        userOnlyRetainedTurnCount: retainedTurnDiagnostics.filter((turn) => turn.userOnly).length,
-        retainedTurnDiagnostics
-      },
-      excludedMessageReasonCounts: dropReasonCounts,
-      imageSignalScan: collectLiteImageSignalScan(raw, pathIdSet)
-    };
-  }
-
-  function buildLiteRewriteFlatDiagnosticsFromTrace(summary, trace) {
-    const safeJson = (value) => {
-      try { return JSON.stringify(value || {}); } catch { return '{}'; }
-    };
-    const cleanPreview = (value) => String(value || '').replace(/\s+/g, ' ').slice(0, 80);
-    const messageLine = (item) => [
-      `id=${item?.id || ''}`,
-      `pathIndex=${item?.pathIndex ?? ''}`,
-      `role=${item?.role || ''}`,
-      `contentType=${item?.contentType || ''}`,
-      `recipient=${item?.recipient || ''}`,
-      `status=${item?.status || ''}`,
-      `keep=${item?.keep === true}`,
-      `selected=${item?.selected === true}`,
-      `dropReason=${item?.dropReason || ''}`,
-      `keptButNotRetained=${item?.keptButNotRetainedTurn === true}`,
-      `textLength=${item?.textLength ?? 0}`,
-      `imageContent=${item?.hasImageLikeContent === true || item?.imageLikeContent === true}`,
-      `imageMetadata=${item?.hasImageLikeMetadata === true || item?.imageLikeMetadata === true}`,
-      `preview=${cleanPreview(item?.textPreview)}`
-    ].join(' | ');
-    const imageLine = (item) => [
-      messageLine(item),
-      `onSelectedPath=${item?.onSelectedPath === true}`,
-      `signalKeys=${Array.isArray(item?.signalKeys) ? item.signalKeys.map((x) => x?.path || x?.key || '').filter(Boolean).slice(0, 8).join(',') : ''}`
-    ].join(' | ');
-    const pathMessages = Array.isArray(trace?.path?.messageDiagnostics) ? trace.path.messageDiagnostics : [];
-    const imageHits = Array.isArray(trace?.imageSignalScan?.hits) ? trace.imageSignalScan.hits : [];
-    const retainedTurns = Array.isArray(trace?.turns?.retainedTurnDiagnostics) ? trace.turns.retainedTurnDiagnostics : [];
-    const leafCandidates = Array.isArray(trace?.leafSelection?.leafCandidates) ? trace.leafSelection.leafCandidates : [];
-    return {
-      ok: Boolean(summary && trace && !trace.omitted),
-      traceVersion: 'lite_rewrite_flat_diagnostics_v1',
-      summaryFound: Boolean(summary),
-      traceFound: Boolean(trace && !trace.omitted),
-      traceOmittedReason: trace?.omittedReason || null,
-      selectedRoleCountsText: safeJson(summary?.selectedRoleCounts || trace?.path?.selectedRoleCounts),
-      selectedContentTypeCountsText: safeJson(summary?.selectedContentTypeCounts || trace?.path?.selectedContentTypeCounts),
-      excludedReasonCountsText: safeJson(summary?.excludedMessageReasonCounts || trace?.excludedMessageReasonCounts),
-      imageSignalRoleCountsText: safeJson(summary?.imageSignalScanSummary?.roleCounts || trace?.imageSignalScan?.roleCounts),
-      imageSignalContentTypeCountsText: safeJson(summary?.imageSignalScanSummary?.contentTypeCounts || trace?.imageSignalScan?.contentTypeCounts),
-      userOnlyRetainedTurnCount: summary?.userOnlyRetainedTurnCount ?? trace?.turns?.userOnlyRetainedTurnCount ?? null,
-      imageSignalHitCount: summary?.imageSignalScanSummary?.hitCount ?? trace?.imageSignalScan?.hitCount ?? null,
-      liteShowImages: summary?.liteShowImages !== false,
-      liteImageDisplayNodeCount: summary?.liteImageDisplayNodeCount ?? null,
-      liteImageDisplayNodeSamplesFlat: Array.isArray(summary?.liteImageDisplayNodes) ? summary.liteImageDisplayNodes.map((item) => [`sourceUserNodeId=${item?.sourceUserNodeId || ''}`, `sourceNodeId=${item?.nodeId || ''}`, `sourceRole=${item?.role || ''}`, `sourceContentType=${item?.contentType || ''}`, `addedPathNodeCount=${item?.addedPathNodeCount ?? ''}`].join(' | ')) : [],
-      syntheticImagePlaceholderCount: summary?.syntheticImagePlaceholderCount ?? null,
-      syntheticImagePlaceholderSamplesFlat: Array.isArray(summary?.syntheticImagePlaceholders) ? summary.syntheticImagePlaceholders.map((item) => [`id=${item?.id || ''}`, `sourceUserNodeId=${item?.sourceUserNodeId || ''}`, `sourceNodeId=${item?.nodeId || ''}`, `sourceRole=${item?.role || ''}`, `sourceContentType=${item?.contentType || ''}`].join(' | ')) : [],
-      selectedMessageNodeIdsText: Array.isArray(trace?.path?.selectedMessageNodeIds) ? trace.path.selectedMessageNodeIds.join(',') : '',
-      leafSelectionText: trace?.leafSelection ? [
-        `currentNodeId=${trace.leafSelection.currentNodeId || ''}`,
-        `currentNodeExists=${trace.leafSelection.currentNodeExists === true}`,
-        `selectedLeafId=${trace.leafSelection.selectedLeafId || ''}`,
-        `selectedLeafFromCurrentNode=${trace.leafSelection.selectedLeafFromCurrentNode === true}`,
-        `leafCandidateCount=${trace.leafSelection.leafCandidateCount ?? ''}`
-      ].join(' | ') : '',
-      pathDropSamplesFlat: pathMessages.filter((item) => item?.dropReason || item?.keptButNotRetainedTurn).slice(-120).map(messageLine),
-      pathSelectedSamplesFlat: pathMessages.filter((item) => item?.selected).slice(-120).map(messageLine),
-      imageSignalHitSamplesFlat: imageHits.slice(-120).map(imageLine),
-      retainedTurnSamplesFlat: retainedTurns.slice(-80).map((turn) => [
-        `retainedIndex=${turn?.retainedIndex ?? ''}`,
-        `originalTurnIndex=${turn?.originalTurnIndex ?? ''}`,
-        `userOnly=${turn?.userOnly === true}`,
-        `imageLikeNodeCount=${turn?.imageLikeNodeCount ?? 0}`,
-        `roleCounts=${safeJson(turn?.roleCounts)}`,
-        `contentTypeCounts=${safeJson(turn?.contentTypeCounts)}`,
-        `messageIds=${Array.isArray(turn?.messageIds) ? turn.messageIds.join(',') : ''}`
-      ].join(' | ')),
-      leafCandidateSamplesFlat: leafCandidates.slice(0, 40).map((item) => [
-        `id=${item?.id || ''}`,
-        `selectedLeaf=${item?.selectedLeaf === true}`,
-        `role=${item?.role || ''}`,
-        `contentType=${item?.contentType || ''}`,
-        `status=${item?.status || ''}`,
-        `textLength=${item?.textLength ?? 0}`,
-        `imageContent=${item?.hasImageLikeContent === true}`,
-        `imageMetadata=${item?.hasImageLikeMetadata === true}`,
-        `preview=${cleanPreview(item?.textPreview)}`
-      ].join(' | '))
-    };
-  }
-
-  function buildFreshLiteRewriteDiagnostic(raw, requestedTurnCount, context = {}) {
-    const startedAt = Date.now();
-    if (!raw || typeof raw !== 'object' || !raw.mapping || typeof raw.mapping !== 'object') {
-      return {
-        ok: false,
-        appVersion: APP_VERSION,
-        action: 'fresh_lite_rewrite_diagnostic',
-        error: 'conversation mappingがありません。',
-        generatedAt: startedAt,
-        generatedAtIso: nowIso(),
-        context: context || null
-      };
-    }
-    try {
-      const safeTurnCount = Math.max(1, Math.min(50, Number(requestedTurnCount || NATIVE_LITE_TURN_COUNT) || NATIVE_LITE_TURN_COUNT));
-      const config = normalizeLiteDisplayConfig(state.liteDisplayConfig || defaultLiteDisplayConfig());
-      const built = buildLiteRawForPage(raw, safeTurnCount, { liteShowImages: config.liteShowImages !== false });
-      return {
-        ok: true,
-        appVersion: APP_VERSION,
-        action: 'fresh_lite_rewrite_diagnostic',
-        source: 'main_world_one_shot_lite_trace',
-        generatedAt: startedAt,
-        generatedAtIso: nowIso(),
-        elapsedMs: Date.now() - startedAt,
-        requestedTurnCount: safeTurnCount,
-        conversationId: raw?.conversation_id || context?.conversationId || extractConversationIdFromCurrentUrl() || null,
-        context: context || null,
-        before: analyzeConversationLikeJson(raw),
-        after: built?.liteRaw ? analyzeConversationLikeJson(built.liteRaw) : null,
-        summary: built?.summary || null,
-        liteRewriteFlatDiagnostics: built?.summary?.liteRewriteFlatDiagnostics || null
-      };
-    } catch (error) {
-      return {
-        ok: false,
-        appVersion: APP_VERSION,
-        action: 'fresh_lite_rewrite_diagnostic',
-        source: 'main_world_one_shot_lite_trace',
-        generatedAt: startedAt,
-        generatedAtIso: nowIso(),
-        elapsedMs: Date.now() - startedAt,
-        requestedTurnCount,
-        conversationId: raw?.conversation_id || context?.conversationId || extractConversationIdFromCurrentUrl() || null,
-        context: context || null,
-        error: error instanceof Error ? error.message : String(error)
-      };
-    }
-  }
   function buildLiteRawForPage(raw, requestedTurnCount, options = {}) {
     if (!raw || typeof raw !== 'object' || !raw.mapping || typeof raw.mapping !== 'object') {
       throw new Error('conversation mapping is missing.');
@@ -1519,13 +2142,14 @@
           renderedMessageNodeCount: pathIds.length,
           liteShowImages,
           syntheticImagePlaceholderCount: 0,
-          syntheticImagePlaceholders: [],
-          before: analyzeConversationLikeJson(raw),
-          after: analyzeConversationLikeJson(raw)
+          syntheticImagePlaceholders: []
         }
       };
     }
-    const renderAnchorTargetExtraTurnCount = 2;
+    const requestedRenderAnchorExtraTurnCount = Number(options?.renderAnchorExtraTurnCount);
+    const renderAnchorTargetExtraTurnCount = Number.isFinite(requestedRenderAnchorExtraTurnCount)
+      ? Math.max(0, Math.min(2, Math.floor(requestedRenderAnchorExtraTurnCount)))
+      : 2;
     const backendRetainedTurnCount = Math.min(turns.length, safeTurnCount + renderAnchorTargetExtraTurnCount);
     const retainedTurns = turns.slice(Math.max(0, turns.length - backendRetainedTurnCount));
     const selectedSet = new Set();
@@ -1539,13 +2163,6 @@
       .map((turn) => (turn.messages || []).find((item) => item.role === 'user')?.id)
       .filter(Boolean);
     const retainedUserNodeIdSet = new Set(retainedUserNodeIds);
-    const userOnlyTurnIds = new Set(retainedTurns
-      .filter((turn) => {
-        const roles = new Set((turn.messages || []).map((item) => item.role));
-        return roles.has('user') && !roles.has('assistant');
-      })
-      .map((turn) => (turn.messages || []).find((item) => item.role === 'user')?.id)
-      .filter(Boolean));
     const syntheticPlaceholderNodeById = new Map();
     const syntheticPlaceholderDiagnostics = [];
     const imageDisplayDiagnostics = [];
@@ -1560,7 +2177,7 @@
     };
     for (const id of orderedSelectedNodeIds) {
       appendRenderNodeId(id);
-      if (!userOnlyTurnIds.has(id)) continue;
+      if (!retainedUserNodeIdSet.has(id)) continue;
       const sourceSignal = findLiteImageSignalAfterUser(raw, pathIds, id, retainedUserNodeIdSet);
       if (!sourceSignal) continue;
       if (liteShowImages) {
@@ -1573,12 +2190,13 @@
         for (const imagePathNodeId of imagePathNodeIds) {
           if (appendRenderNodeId(imagePathNodeId)) addedPathNodeIds.push(imagePathNodeId);
         }
-        if (addedPathNodeIds.length > 0) {
+        if (renderNodeIdSet.has(sourceSignal.nodeId)) {
           imageDisplayDiagnostics.push({
             sourceUserNodeId: id,
             ...sourceSignal,
             addedPathNodeCount: addedPathNodeIds.length,
-            addedPathNodeIds
+            addedPathNodeIds,
+            sourceSignalAlreadyRetained: addedPathNodeIds.length === 0
           });
         } else {
           const syntheticNode = createSyntheticLiteImagePlaceholderNode(id, sourceSignal, syntheticPlaceholderNodeById.size + 1);
@@ -1588,6 +2206,7 @@
         }
         continue;
       }
+      if (selectedSet.has(sourceSignal.nodeId)) continue;
       const syntheticNode = createSyntheticLiteImagePlaceholderNode(id, sourceSignal, syntheticPlaceholderNodeById.size + 1);
       syntheticPlaceholderNodeById.set(syntheticNode.id, syntheticNode);
       syntheticPlaceholderDiagnostics.push({ id: syntheticNode.id, sourceUserNodeId: id, ...sourceSignal });
@@ -1652,9 +2271,7 @@
       liteRaw,
       summary: {
         ...liteSummary,
-        simulatedChainNodeCount: chain.length,
-        before: analyzeConversationLikeJson(raw),
-        after: analyzeConversationLikeJson(liteRaw)
+        simulatedChainNodeCount: chain.length
       }
     };
   }
@@ -1678,6 +2295,7 @@
       isCaptureUrl: getArcaiaCaptureMode().enabled,
       backendRewriteEnabled: Boolean(config.backendRewriteEnabled),
       backendRewriteExperiment: Boolean(config.backendRewriteExperiment),
+      toolHistoryCompaction: Boolean(config.toolHistoryCompaction),
       liteShowImages: config.liteShowImages !== false,
       fullLoadOnce: Boolean(config.fullLoadOnce),
       fullLoadConversationId: config.fullLoadConversationId || null,
@@ -1687,6 +2305,8 @@
       liteDisplayRewriteCount: state.liteDisplayRewriteCount || 0,
       lastRewrite: state.liteDisplayLastRewrite || null,
       liteDisplayLastRewrite: state.liteDisplayLastRewrite || null,
+      toolHistoryPayloadRewriteCount: state.toolHistoryPayloadRewriteCount || 0,
+      toolHistoryPayloadLastRewrite: state.toolHistoryPayloadLastRewrite || null,
       messageTimestampIndexSummary: state.messageTimestampIndex ? {
         ok: Boolean(state.messageTimestampIndex.ok),
         conversationId: state.messageTimestampIndex.conversationId || null,
@@ -1770,45 +2390,10 @@
       turnCountOverrideConversationId: result.turnCountOverrideConversationId,
       backendRewriteEnabled: Boolean(result.backendRewriteEnabled),
       backendRewriteExperiment: Boolean(result.backendRewriteExperiment),
+      toolHistoryCompaction: Boolean(result.toolHistoryCompaction),
       liteShowImages: result.liteShowImages !== false
     });
     return result;
-  }
-
-  function getLiteDisplayInternalDiagnostic() {
-    const capture = getArcaiaCaptureMode();
-    const conversationIdSync = getConversationIdSyncDiagnostic();
-    const normalizedConfig = normalizeLiteDisplayConfig(state.liteDisplayConfig || defaultLiteDisplayConfig());
-    return {
-      ok: true,
-      appVersion: APP_VERSION,
-      url: window.location.href,
-      isTopWindow: window.top === window,
-      historySearchBypass: Boolean(normalizedConfig.historySearchBypass),
-      explicitDiagnostic: true,
-      captureMode: capture,
-      storageKey: LITE_STORAGE_KEY,
-      rawStorage: readLiteDisplayRawStorageForDebug(),
-      stateLiteDisplayConfig: state.liteDisplayConfig || null,
-      publicLiteDisplay: getPublicLiteDisplayState(),
-      currentConversationId: conversationIdSync.currentConversationId,
-      conversationIdMismatch: conversationIdSync.mismatch,
-      conversationIdWarning: conversationIdSync.warning,
-      backendRewriteEnabled: Boolean(normalizedConfig.backendRewriteEnabled),
-      backendRewriteExperiment: Boolean(normalizedConfig.backendRewriteExperiment),
-      rewriteCount: state.liteDisplayRewriteCount || 0,
-      liteDisplayRewriteCount: state.liteDisplayRewriteCount || 0,
-      lastRewrite: state.liteDisplayLastRewrite || null,
-      liteDisplayLastRewrite: state.liteDisplayLastRewrite || null,
-      messageTimestampIndex: state.messageTimestampIndex || null,
-      messageTimestampIndexSummary: state.messageTimestampIndex ? {
-        ok: Boolean(state.messageTimestampIndex.ok),
-        conversationId: state.messageTimestampIndex.conversationId || null,
-        messageCount: state.messageTimestampIndex.messageCount || 0,
-        updatedAtIso: state.messageTimestampIndex.updatedAtIso || null
-      } : null,
-      messageTimestampIndexUpdateCount: state.messageTimestampIndexUpdateCount || 0
-    };
   }
 
   function isConversationJsonFetchResponse(method, url, response) {
@@ -1822,6 +2407,51 @@
   function shouldProcessConversationFetchResponse(method, url, response) {
     if (isConversationJsonFetchResponse(method, url, response)) return true;
     return false;
+  }
+
+  function shouldSuppressNativeRecentViewHistoryFetch(method, url) {
+    if (String(method || 'GET').toUpperCase() !== 'GET' || !url || !isMainExtensionEnabled()) return false;
+    let conversationId = null;
+    try {
+      const parsed = new URL(url, window.location.origin);
+      if (parsed.origin !== window.location.origin || !parsed.searchParams.has('before')) return false;
+      const match = parsed.pathname.match(/\/backend-api\/conversations\/([^/?#]+)\/messages$/);
+      if (!match) return false;
+      conversationId = decodeURIComponent(match[1]);
+    } catch {
+      return false;
+    }
+
+    const config = normalizeLiteDisplayConfig(state.liteDisplayConfig || defaultLiteDisplayConfig());
+    if (!config.enabled || config.historySearchBypass) return false;
+    if (config.fullLoadOnce
+      && config.fullLoadConversationId === conversationId
+      && Number(config.fullLoadExpiresAt || 0) > Date.now()) return false;
+
+    const currentConversationId = extractConversationIdFromCurrentUrl();
+    if (!currentConversationId || conversationId !== currentConversationId) return false;
+    if (config.conversationId && conversationId !== config.conversationId) return false;
+    return true;
+  }
+
+  function createSuppressedNativeRecentViewHistoryResponse() {
+    return new Response(JSON.stringify({
+      messages: [],
+      page_info: {
+        has_previous_page: false,
+        start_cursor: null,
+        has_next_page: false,
+        end_cursor: null
+      }
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    });
+  }
+
+  function isProjectSidebarJsonFetchResponse(method, url, response) {
+    if (String(method || 'GET').toUpperCase() !== 'GET' || !response?.ok || typeof response.clone !== 'function') return false;
+    try { return new URL(url, window.location.origin).pathname === '/backend-api/gizmos/snorlax/sidebar'; } catch { return false; }
   }
 
   function shouldApplyLiteDisplayToFetch(url, method, response) {
@@ -1871,17 +2501,59 @@
     return true;
   }
 
+  function shouldApplyToolHistoryCompactionToFetch(url, method, response) {
+    if (!isMainExtensionEnabled()) return false;
+    const config = normalizeLiteDisplayConfig(state.liteDisplayConfig || defaultLiteDisplayConfig());
+    if (!config.toolHistoryCompaction || config.historySearchBypass) return false;
+    if (!isConversationJsonFetchResponse(method, url, response)) return false;
+    const conversationId = extractConversationIdFromConversationDetailUrl(url);
+    const currentConversationId = extractConversationIdFromCurrentUrl();
+    if (!conversationId || !currentConversationId || conversationId !== currentConversationId) return false;
+    return true;
+  }
+
+  function buildProjectSidebarIndex(raw) {
+    const projects = [];
+    for (const item of Array.isArray(raw?.items) ? raw.items : []) {
+      const project = item?.gizmo?.gizmo;
+      const id = String(project?.id || '').trim();
+      const name = String(project?.display?.name || '').trim();
+      if (!id.startsWith('g-p-') || !name) continue;
+      projects.push({ id, name });
+    }
+    return { ok: true, appVersion: APP_VERSION, updatedAt: Date.now(), projects };
+  }
+
+  async function observeProjectSidebarIndexFromResponse(response) {
+    const raw = await response.clone().json();
+    const index = buildProjectSidebarIndex(raw);
+    state.projectSidebarIndex = index;
+    emitMainEvent('project_sidebar_index_updated', { projectCount: index.projects.length });
+    return index;
+  }
+
+  function getProjectSidebarIndexForContent() {
+    return { ok: true, appVersion: APP_VERSION, projectSidebarIndex: state.projectSidebarIndex || null };
+  }
+
   async function maybeRewriteFetchResponseForLiteDisplay(method, url, response) {
     const startedAt = Date.now();
     let text = null;
     let raw = null;
+    let arcaiaRaw = null;
+    let sourceFormat = 'unknown';
     const conversationFetch = shouldProcessConversationFetchResponse(method, url, response);
     if (conversationFetch) {
       try {
         text = await response.clone().text();
         raw = JSON.parse(text);
-        observeMessageTimestampIndexFromConversation(raw, url, 'conversation_fetch_response');
-        observeCurrentConversationModelConfig(raw, url, 'conversation_fetch_response');
+        const normalizedPayload = normalizeConversationPayloadForArcaia(raw);
+        arcaiaRaw = normalizedPayload.raw;
+        sourceFormat = normalizedPayload.sourceFormat;
+        observeMessageTimestampIndexFromConversation(arcaiaRaw, url, 'conversation_fetch_response');
+        observeToolHistorySummaryIndexFromConversation(arcaiaRaw, url, 'conversation_fetch_response');
+        observeCurrentConversationModelConfig(arcaiaRaw, url, 'conversation_fetch_response');
+        try { observeReadOnlyConversationModel(arcaiaRaw, url); } catch {}
       } catch (error) {
         state.messageTimestampIndex = {
           ok: false,
@@ -1894,150 +2566,170 @@
         };
       }
     }
-    if (!shouldApplyLiteDisplayToFetch(url, method, response)) return response;
+    const applyLiteRewrite = shouldApplyLiteDisplayToFetch(url, method, response);
+    const applyToolHistoryCompaction = shouldApplyToolHistoryCompactionToFetch(url, method, response);
+    if (!applyLiteRewrite && !applyToolHistoryCompaction) return response;
     try {
       const config = normalizeLiteDisplayConfig(state.liteDisplayConfig || {});
-      if (!text || !raw) {
+      if (!text || !raw || !arcaiaRaw) {
         text = await response.clone().text();
         raw = JSON.parse(text);
-        observeMessageTimestampIndexFromConversation(raw, url, 'conversation_fetch_response_before_rewrite');
-        observeCurrentConversationModelConfig(raw, url, 'conversation_fetch_response_before_rewrite');
+        const normalizedPayload = normalizeConversationPayloadForArcaia(raw);
+        arcaiaRaw = normalizedPayload.raw;
+        sourceFormat = normalizedPayload.sourceFormat;
+        observeMessageTimestampIndexFromConversation(arcaiaRaw, url, 'conversation_fetch_response_before_rewrite');
+        observeToolHistorySummaryIndexFromConversation(arcaiaRaw, url, 'conversation_fetch_response_before_rewrite');
+        observeCurrentConversationModelConfig(arcaiaRaw, url, 'conversation_fetch_response_before_rewrite');
+        try { observeReadOnlyConversationModel(arcaiaRaw, url); } catch {}
       }
-      const { liteRaw, summary } = buildLiteRawForPage(raw, config.turnCount, { liteShowImages: config.liteShowImages !== false });
-      if (summary?.skipped) {
+      let rewrittenCanonical = arcaiaRaw;
+      let liteSummary = null;
+      let liteChanged = false;
+      if (applyLiteRewrite) {
+        const liteResult = buildLiteRawForPage(arcaiaRaw, config.turnCount, {
+          liteShowImages: config.liteShowImages !== false,
+          renderAnchorExtraTurnCount: sourceFormat === 'messages' ? 0 : 2
+        });
+        liteSummary = liteResult.summary || null;
+        if (!liteSummary?.skipped) {
+          rewrittenCanonical = liteResult.liteRaw;
+          liteChanged = true;
+        }
+      }
+
+      let toolSummary = null;
+      if (applyToolHistoryCompaction) {
+        const toolResult = compactHistoricalToolPayload(rewrittenCanonical, {
+          preserveLatestUserTurns: TOOL_HISTORY_PAYLOAD_PRESERVE_LATEST_USER_TURNS
+        });
+        toolSummary = toolResult.summary || null;
+        if (toolSummary?.changed) rewrittenCanonical = toolResult.compactRaw;
+      }
+
+      if (applyLiteRewrite && !liteChanged) {
         state.liteDisplayLastRewrite = {
           ok: true,
           skipped: true,
-          reason: summary.skipReason || 'lite_rewrite_skipped',
+          reason: liteSummary?.skipReason || 'lite_rewrite_skipped',
           at: Date.now(),
           atIso: nowIso(),
           url: safeUrlInfo(url),
           elapsedMs: Date.now() - startedAt,
-          summary
+          summary: liteSummary
         };
-        return response;
       }
-      const rewrittenText = JSON.stringify(liteRaw);
+
+      if (applyToolHistoryCompaction) {
+        state.toolHistoryPayloadLastRewrite = {
+          ok: Boolean(toolSummary?.ok !== false),
+          changed: Boolean(toolSummary?.changed),
+          at: Date.now(),
+          atIso: nowIso(),
+          url: safeUrlInfo(url),
+          elapsedMs: Date.now() - startedAt,
+          summary: toolSummary
+        };
+      }
+
+      const toolChanged = Boolean(toolSummary?.changed);
+      if (!liteChanged && !toolChanged) return response;
+
+      const rewrittenPayload = liteChanged
+        ? restoreConversationPayloadShape(raw, rewrittenCanonical, sourceFormat)
+        : restoreToolCompactedPayloadShape(raw, rewrittenCanonical, sourceFormat);
+      const rewrittenText = JSON.stringify(rewrittenPayload);
       const headers = new Headers(response.headers || undefined);
       try { headers.delete('content-length'); } catch {}
       if (!headers.get('content-type')) headers.set('content-type', 'application/json');
       const beforeBytes = new TextEncoder().encode(text).length;
       const afterBytes = new TextEncoder().encode(rewrittenText).length;
-      state.liteDisplayRewriteCount = (state.liteDisplayRewriteCount || 0) + 1;
-      state.liteDisplayLastRewrite = {
-        ok: true,
-        at: Date.now(),
-        atIso: nowIso(),
-        url: safeUrlInfo(url),
-        elapsedMs: Date.now() - startedAt,
-        beforeBytes,
-        afterBytes,
-        bytesReductionPct: beforeBytes ? Number(((1 - afterBytes / beforeBytes) * 100).toFixed(2)) : null,
-        summary
-      };
-      emitMainEvent('lite_rewrite_success', {
-        conversationId: extractConversationIdFromConversationDetailUrl(url),
-        beforeBytes,
-        afterBytes,
-        bytesReductionPct: state.liteDisplayLastRewrite.bytesReductionPct,
-        retainedTurnCount: summary?.retainedTurnCount || null,
-        totalTurnCount: summary?.totalTurnCount || null,
-        turnCount: config.turnCount,
-        url: safeUrlInfo(url)
-      });
+      if (liteChanged) {
+        state.liteDisplayRewriteCount = (state.liteDisplayRewriteCount || 0) + 1;
+        state.liteDisplayLastRewrite = {
+          ok: true,
+          at: Date.now(),
+          atIso: nowIso(),
+          url: safeUrlInfo(url),
+          elapsedMs: Date.now() - startedAt,
+          beforeBytes,
+          afterBytes,
+          bytesReductionPct: beforeBytes ? Number(((1 - afterBytes / beforeBytes) * 100).toFixed(2)) : null,
+          summary: liteSummary,
+          toolHistoryCompaction: toolSummary
+        };
+        emitMainEvent('lite_rewrite_success', {
+          conversationId: extractConversationIdFromConversationDetailUrl(url),
+          beforeBytes,
+          afterBytes,
+          bytesReductionPct: state.liteDisplayLastRewrite.bytesReductionPct,
+          retainedTurnCount: liteSummary?.retainedTurnCount || null,
+          totalTurnCount: liteSummary?.totalTurnCount || null,
+          turnCount: config.turnCount,
+          url: safeUrlInfo(url)
+        });
+      }
+      if (toolChanged) {
+        state.toolHistoryPayloadRewriteCount = (state.toolHistoryPayloadRewriteCount || 0) + 1;
+        state.toolHistoryPayloadLastRewrite = {
+          ok: true,
+          changed: true,
+          at: Date.now(),
+          atIso: nowIso(),
+          url: safeUrlInfo(url),
+          elapsedMs: Date.now() - startedAt,
+          beforeBytes,
+          afterBytes,
+          bytesReductionPct: beforeBytes ? Number(((1 - afterBytes / beforeBytes) * 100).toFixed(2)) : null,
+          summary: toolSummary
+        };
+        emitMainEvent('tool_history_payload_compaction_success', {
+          conversationId: extractConversationIdFromConversationDetailUrl(url),
+          compactedToolMessageCount: toolSummary?.compactedToolMessageCount || 0,
+          clearedSearchResultGroupCount: toolSummary?.clearedSearchResultGroupCount || 0,
+          clearedInlineCotCount: toolSummary?.clearedInlineCotCount || 0,
+          toolBytesReductionPct: toolSummary?.toolBytesReductionPct || 0,
+          url: safeUrlInfo(url)
+        });
+      }
       return new Response(rewrittenText, {
         status: response.status,
         statusText: response.statusText,
         headers
       });
     } catch (error) {
-      state.liteDisplayLastRewrite = {
-        ok: false,
-        at: Date.now(),
-        atIso: nowIso(),
-        url: safeUrlInfo(url),
-        elapsedMs: Date.now() - startedAt,
-        error: error instanceof Error ? error.message : String(error)
-      };
-      emitMainEvent('lite_rewrite_failure', {
-        conversationId: extractConversationIdFromConversationDetailUrl(url),
-        error: state.liteDisplayLastRewrite.error,
-        url: safeUrlInfo(url)
-      });
+      const errorText = error instanceof Error ? error.message : String(error);
+      if (applyLiteRewrite) {
+        state.liteDisplayLastRewrite = {
+          ok: false,
+          at: Date.now(),
+          atIso: nowIso(),
+          url: safeUrlInfo(url),
+          elapsedMs: Date.now() - startedAt,
+          error: errorText
+        };
+        emitMainEvent('lite_rewrite_failure', {
+          conversationId: extractConversationIdFromConversationDetailUrl(url),
+          error: errorText,
+          url: safeUrlInfo(url)
+        });
+      }
+      if (applyToolHistoryCompaction) {
+        state.toolHistoryPayloadLastRewrite = {
+          ok: false,
+          changed: false,
+          at: Date.now(),
+          atIso: nowIso(),
+          url: safeUrlInfo(url),
+          elapsedMs: Date.now() - startedAt,
+          error: errorText
+        };
+        emitMainEvent('tool_history_payload_compaction_failure', {
+          conversationId: extractConversationIdFromConversationDetailUrl(url),
+          error: errorText,
+          url: safeUrlInfo(url)
+        });
+      }
       return response;
-    }
-  }
-
-  function recordResponseProbe(kind, method, url, responseMeta, textOrJson) {
-    if (!isConversationHistoryUrl(url)) return;
-    const at = Date.now();
-    const text = typeof textOrJson === 'string' ? textOrJson : null;
-    const json = text ? maybeParseJsonText(text) : (textOrJson && typeof textOrJson === 'object' ? textOrJson : null);
-    const approxBytes = text ? new TextEncoder().encode(text).length : null;
-    const urlInfo = safeUrlInfo(url);
-    const analysis = json ? analyzeConversationLikeJson(json) : null;
-    pushLimited(state.responseProbes, {
-      at,
-      atIso: nowIso(at),
-      kind,
-      method: method || 'GET',
-      url: urlInfo,
-      response: responseMeta || {},
-      approxBodyBytes: approxBytes,
-      parsedJson: Boolean(json),
-      historyShape: analysis,
-      note: 'Response body was inspected for aggregate metadata only. Full message text is not stored in this probe log.'
-    });
-  }
-
-  function isHistoryProbeArmed() {
-    return Date.now() < (state.historyProbeArmedUntil || 0);
-  }
-
-  function armHistoryProbe(durationMs = 20000) {
-    state.historyProbeArmedUntil = Math.max(state.historyProbeArmedUntil || 0, Date.now() + durationMs);
-  }
-
-  function inspectFetchResponseAsync(kind, method, url, response) {
-    try {
-      if (!isHistoryProbeArmed()) return;
-      if (!isConversationHistoryUrl(url) || !response || typeof response.clone !== 'function') return;
-      const responseMeta = {
-        status: response.status,
-        ok: response.ok,
-        redirected: response.redirected,
-        type: response.type,
-        contentType: response.headers?.get?.('content-type') || null,
-        contentLength: response.headers?.get?.('content-length') || null
-      };
-      response.clone().text()
-        .then((text) => recordResponseProbe(kind, method, url, responseMeta, text))
-        .catch((error) => recordResponseProbe(kind, method, url, { ...responseMeta, probeError: error instanceof Error ? error.message : String(error) }, null));
-    } catch {}
-  }
-
-  function inspectXhrResponseAsync(xhr) {
-    try {
-      if (!isHistoryProbeArmed()) return;
-      const url = xhr.__aice_probe_url;
-      if (!isConversationHistoryUrl(url)) return;
-      const contentType = typeof xhr.getResponseHeader === 'function' ? xhr.getResponseHeader('content-type') : null;
-      const contentLength = typeof xhr.getResponseHeader === 'function' ? xhr.getResponseHeader('content-length') : null;
-      const responseMeta = {
-        status: xhr.status,
-        ok: xhr.status >= 200 && xhr.status < 300,
-        contentType,
-        contentLength,
-        responseType: xhr.responseType || ''
-      };
-      let body = null;
-      if (!xhr.responseType || xhr.responseType === 'text') body = xhr.responseText;
-      else if (xhr.responseType === 'json') body = xhr.response;
-      recordResponseProbe('xhr_response', xhr.__aice_probe_method, url, responseMeta, body);
-    } catch (error) {
-      try {
-        recordResponseProbe('xhr_response', xhr.__aice_probe_method, xhr.__aice_probe_url, { probeError: error instanceof Error ? error.message : String(error) }, null);
-      } catch {}
     }
   }
 
@@ -2091,6 +2783,7 @@
     const conversationId = extractConversationIdFromCurrentUrl();
     const urlChanged = previousPageUrl !== pageUrl;
     const conversationChanged = previousConversationId !== conversationId;
+    if (conversationChanged) cancelAbsoluteTurnCounter();
     state.observedPageUrl = pageUrl;
     state.observedPageConversationId = conversationId;
     const syncResult = syncLiteDisplayConversationId(reason);
@@ -2182,6 +2875,7 @@
     if (liteConversationSyncHashchangeHandler) window.removeEventListener('hashchange', liteConversationSyncHashchangeHandler);
     liteConversationSyncPopstateHandler = null;
     liteConversationSyncHashchangeHandler = null;
+    cancelAbsoluteTurnCounter();
     uninstallMainWorldHistoryHooks();
     uninstallNetworkHooks();
     state.runtimeActive = false;
@@ -2209,6 +2903,9 @@
             const requestHeaders = (typeof Request !== 'undefined' && input instanceof Request) ? input.headers : null;
             const initHeaders = init && init.headers ? init.headers : null;
             rememberObservation('fetch', method, url, mergeHeaderSources(requestHeaders, initHeaders));
+            if (shouldSuppressNativeRecentViewHistoryFetch(method, url)) {
+              return Promise.resolve(createSuppressedNativeRecentViewHistoryResponse());
+            }
           } catch {}
           const fetchPromise = state.originalFetch.apply(this, arguments);
           if (!observedRequest) return fetchPromise;
@@ -2216,9 +2913,9 @@
             return Promise.resolve(fetchPromise).then(async (response) => {
               if (!isMainExtensionEnabled()) return response;
               try {
-                inspectFetchResponseAsync('fetch_response', method, url, response);
-              } catch {}
-              try {
+                if (url && isProjectSidebarJsonFetchResponse(method, url, response)) {
+                  try { await observeProjectSidebarIndexFromResponse(response); } catch {}
+                }
                 if (url && shouldProcessConversationFetchResponse(method, url, response)) {
                   return await maybeRewriteFetchResponseForLiteDisplay(method, url, response);
                 }
@@ -2264,12 +2961,6 @@
         try {
           if (!this.__aice_probe_observed) return state.originalXHRSend.apply(this, arguments);
           rememberObservation('xhr', this.__aice_probe_method, this.__aice_probe_url, this.__aice_probe_headers || {});
-          if (isHistoryProbeArmed() && isConversationHistoryUrl(this.__aice_probe_url)) {
-            this.addEventListener('loadend', () => {
-              if (!isMainExtensionEnabled()) return;
-              inspectXhrResponseAsync(this);
-            }, { once: true });
-          }
         } catch {}
         return state.originalXHRSend.apply(this, arguments);
       };
@@ -2304,21 +2995,8 @@
           authorization: state.authorization,
           extraHeaders: state.extraHeaders,
           updatedAt: state.updatedAt,
-          seenUrlCount: state.observations.length,
-          lastSeenUrl: state.observations.length ? state.observations[state.observations.length - 1].url.hrefRedacted : null,
           debug: publicSnapshot()
         }
-      }, '*');
-      return;
-    }
-
-    if (data.type === 'ARM_HISTORY_FETCH_PROBE') {
-      armHistoryProbe(Number(data.durationMs) || 20000);
-      window.postMessage({
-        source: MAIN_PROTOCOL_SOURCE,
-        type: 'HISTORY_FETCH_PROBE_ARMED',
-        requestId: data.requestId,
-        payload: publicSnapshot()
       }, '*');
       return;
     }
@@ -2328,6 +3006,7 @@
       const syncResult = handleMainWorldNavigation(data.payload?.reason || 'content_sync');
       const requestedConversationId = String(data.payload?.conversationId || '').trim();
       const conversationModelConfig = getConversationModelConfigForContent(requestedConversationId);
+      const toolHistorySummaryIndex = getToolHistorySummaryIndexForContent(requestedConversationId);
       window.postMessage({
         source: MAIN_PROTOCOL_SOURCE,
         type: 'PAGE_CONVERSATION_SYNC_RESULT',
@@ -2338,6 +3017,7 @@
           ...syncResult,
           historyHooksReady,
           conversationModelConfig: conversationModelConfig || null,
+          toolHistorySummaryIndex: toolHistorySummaryIndex || null,
           conversationIdMismatch: Boolean(syncResult.mismatch),
           conversationIdWarning: syncResult.warning || null,
           liteDisplay: getPublicLiteDisplayState()
@@ -2367,6 +3047,16 @@
       return;
     }
 
+    if (data.type === 'GET_PROJECT_SIDEBAR_INDEX') {
+      window.postMessage({
+        source: MAIN_PROTOCOL_SOURCE,
+        type: 'PROJECT_SIDEBAR_INDEX_RESULT',
+        requestId: data.requestId,
+        payload: getProjectSidebarIndexForContent()
+      }, '*');
+      return;
+    }
+
     if (data.type === 'GET_MESSAGE_TIMESTAMP_INDEX') {
       window.postMessage({
         source: MAIN_PROTOCOL_SOURCE,
@@ -2377,40 +3067,72 @@
       return;
     }
 
-    if (data.type === 'RESET_LITE_DISPLAY_CONFIG') {
-      const storageCleared = clearLiteDisplayConfigFromStorage();
-      state.liteDisplayConfig = defaultLiteDisplayConfig();
-      state.liteDisplayRewriteCount = 0;
-      state.liteDisplayLastRewrite = null;
-      window.postMessage({
-        source: MAIN_PROTOCOL_SOURCE,
-        type: 'LITE_DISPLAY_CONFIG_RESET',
-        requestId: data.requestId,
-        payload: { ok: true, appVersion: APP_VERSION, storageCleared, liteDisplay: getPublicLiteDisplayState(), mainWorldHook: publicSnapshot().mainWorldHook }
-      }, '*');
+    if (data.type === 'GET_ABSOLUTE_TURN_INDEX') {
+      getAbsoluteTurnIndexForContent(
+        data.payload?.conversationId || extractConversationIdFromCurrentUrl(),
+        data.payload?.anchorCache || null,
+        data.payload?.allowHistoryFetch !== false
+      )
+        .then((payload) => window.postMessage({
+          source: MAIN_PROTOCOL_SOURCE,
+          type: 'ABSOLUTE_TURN_INDEX_RESULT',
+          requestId: data.requestId,
+          payload
+        }, '*'))
+        .catch(() => window.postMessage({
+          source: MAIN_PROTOCOL_SOURCE,
+          type: 'ABSOLUTE_TURN_INDEX_RESULT',
+          requestId: data.requestId,
+          payload: { ok: false, appVersion: APP_VERSION, error: 'absolute_turn_failed' }
+        }, '*'));
       return;
     }
 
-    if (data.type === 'GET_LITE_DISPLAY_INTERNAL_DIAGNOSTIC') {
-      window.postMessage({
-        source: MAIN_PROTOCOL_SOURCE,
-        type: 'LITE_DISPLAY_INTERNAL_DIAGNOSTIC_RESULT',
-        requestId: data.requestId,
-        payload: getLiteDisplayInternalDiagnostic()
-      }, '*');
+    if (data.type === 'CANCEL_ABSOLUTE_TURN_INDEX') {
+      cancelAbsoluteTurnCounter();
       return;
     }
 
-    if (data.type === 'BUILD_LITE_REWRITE_DIAGNOSTIC') {
-      const raw = data.payload?.raw || null;
-      const turnCount = data.payload?.turnCount || data.payload?.requestedTurnCount || NATIVE_LITE_TURN_COUNT;
-      const context = data.payload?.context || {};
-      window.postMessage({
-        source: MAIN_PROTOCOL_SOURCE,
-        type: 'LITE_REWRITE_DIAGNOSTIC_RESULT',
-        requestId: data.requestId,
-        payload: buildFreshLiteRewriteDiagnostic(raw, turnCount, context)
-      }, '*');
+    if (data.type === 'GET_READ_ONLY_CONVERSATION_MODEL') {
+      getReadOnlyConversationModelForContent(
+        data.payload?.conversationId || extractConversationIdFromCurrentUrl(),
+        data.payload?.requestedTurnCount ?? 'all'
+      ).then((payload) => {
+        window.postMessage({
+          source: MAIN_PROTOCOL_SOURCE,
+          type: 'READ_ONLY_CONVERSATION_MODEL_RESULT',
+          requestId: data.requestId,
+          payload
+        }, '*');
+      }).catch(() => {
+        window.postMessage({
+          source: MAIN_PROTOCOL_SOURCE,
+          type: 'READ_ONLY_CONVERSATION_MODEL_RESULT',
+          requestId: data.requestId,
+          payload: { ok: false, appVersion: APP_VERSION, error: 'read_only_conversation_model_unavailable' }
+        }, '*');
+      });
+      return;
+    }
+
+    if (data.type === 'RESOLVE_READ_ONLY_RENDERER_ASSET') {
+      resolveReadOnlyRendererAsset(data.payload || {})
+        .then((payload) => {
+          window.postMessage({
+            source: MAIN_PROTOCOL_SOURCE,
+            type: 'READ_ONLY_RENDERER_ASSET_RESULT',
+            requestId: data.requestId,
+            payload
+          }, '*');
+        })
+        .catch(() => {
+          window.postMessage({
+            source: MAIN_PROTOCOL_SOURCE,
+            type: 'READ_ONLY_RENDERER_ASSET_RESULT',
+            requestId: data.requestId,
+            payload: { ok: false, appVersion: APP_VERSION, error: 'read_only_renderer_asset_failed' }
+          }, '*');
+        });
       return;
     }
 
@@ -2444,6 +3166,7 @@
       const liteDisplay = setLiteDisplayConfig({
         enabled: true,
         conversationId,
+        clearTurnCountOverride: true,
         fullLoadOnce: true,
         fullLoadConversationId: conversationId,
         fullLoadRequestedAt: now,

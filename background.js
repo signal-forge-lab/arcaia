@@ -2,6 +2,7 @@
 
 const ARCAIA_PLAY_COMPLETION_SOUND = 'ARCAIA_PLAY_COMPLETION_SOUND';
 const ARCAIA_COMPLETION_SOUND_STATUS = 'ARCAIA_COMPLETION_SOUND_STATUS';
+const ARCAIA_DOWNLOAD_TEXT = 'ARCAIA_DOWNLOAD_TEXT';
 const ARCAIA_OFFSCREEN_PLAY_COMPLETION_SOUND = 'ARCAIA_OFFSCREEN_PLAY_COMPLETION_SOUND';
 const ARCAIA_OFFSCREEN_DOCUMENT = 'offscreen.html';
 const ARCAIA_OPERATION_MODE_STORAGE_KEY = 'arcaia_operation_mode_v1';
@@ -9,7 +10,22 @@ const ARCAIA_COMPLETION_SOUND_ID_STORAGE_KEY = 'arcaia_assistant_completion_soun
 const ARCAIA_COMPLETION_SOUND_VOLUME_STORAGE_KEY = 'arcaia_assistant_completion_sound_volume_v1';
 const DEFAULT_COMPLETION_SOUND_ID = 'classic_chime';
 const DEFAULT_COMPLETION_SOUND_VOLUME = 0.153;
-const VALID_COMPLETION_SOUND_IDS = new Set(['classic_chime', 'soft_chime']);
+const VALID_COMPLETION_SOUND_IDS = new Set([
+  'classic_chime',
+  'soft_chime',
+  'notification_sound_03',
+  'notification_sound_04',
+  'notification_sound_05',
+  'notification_sound_06',
+  'notification_sound_07',
+  'notification_sound_08',
+  'notification_sound_09',
+  'notification_sound_10',
+  'notification_sound_11',
+  'notification_sound_12',
+  'notification_sound_13',
+  'notification_sound_14'
+]);
 
 let creatingOffscreenDocument = null;
 let completionSoundState = {
@@ -34,8 +50,38 @@ function getErrorMessage(error) {
   return error instanceof Error ? error.message : String(error || 'unknown error');
 }
 
+function normalizeDownloadFilename(value) {
+  const filename = String(value || 'chatgpt-conversation.md')
+    .replace(/[\\/]+/g, '_')
+    .replace(/[\u0000-\u001f]+/g, '')
+    .trim()
+    .slice(0, 180);
+  return filename || 'chatgpt-conversation.md';
+}
+
+function normalizeTextDownloadMimeType(value) {
+  const mimeType = String(value || '').toLowerCase();
+  if (mimeType.startsWith('text/markdown')) return 'text/markdown;charset=utf-8';
+  return 'text/plain;charset=utf-8';
+}
+
+async function downloadTextFromBackground(message = {}) {
+  const filename = normalizeDownloadFilename(message.filename);
+  const mimeType = normalizeTextDownloadMimeType(message.mimeType);
+  const text = String(message.text || '');
+  const url = `data:${mimeType},${encodeURIComponent(text)}`;
+  const downloadId = await chrome.downloads.download({
+    url,
+    filename,
+    conflictAction: 'uniquify',
+    saveAs: false
+  });
+  return { ok: Number.isInteger(downloadId), downloadId: Number.isInteger(downloadId) ? downloadId : null, filename };
+}
+
 function normalizeCompletionSoundId(value) {
   const id = String(value || '');
+  if (id === 'notification_08') return 'soft_chime';
   return VALID_COMPLETION_SOUND_IDS.has(id) ? id : DEFAULT_COMPLETION_SOUND_ID;
 }
 
@@ -166,6 +212,16 @@ async function playCompletionSoundInOffscreen(message) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === ARCAIA_DOWNLOAD_TEXT) {
+    (async () => {
+      try {
+        sendResponse(await downloadTextFromBackground(message));
+      } catch (error) {
+        sendResponse({ ok: false, error: getErrorMessage(error) });
+      }
+    })();
+    return true;
+  }
   if (message?.type === ARCAIA_COMPLETION_SOUND_STATUS) {
     sendResponse({ ok: true, route: 'background_offscreen_audio', state: completionSoundState });
     return false;

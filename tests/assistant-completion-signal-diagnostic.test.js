@@ -36,6 +36,12 @@ test('assistant completion diagnostic observes targeted DOM, lifecycle, and reso
   assert.match(source, /\/backend-api\//);
   assert.match(source, /type: 'heartbeat'/);
   assert.match(source, /candidateEvents/);
+  assert.match(source, /data-arcaia-assistant-loading-title/);
+  assert.match(source, /latestAssistantImageElementCount/);
+  assert.match(source, /latestAssistantCanvasCount/);
+  assert.match(source, /latestAssistantProgressbarCount/);
+  assert.match(source, /latestAssistantAriaBusyTrueCount/);
+  assert.match(source, /latestAssistantGenerationTestIds/);
 });
 
 test('assistant completion diagnostic does not retain conversation bodies or patch networking', () => {
@@ -49,8 +55,8 @@ test('assistant completion diagnostic does not retain conversation bodies or pat
 });
 
 test('assistant completion diagnostic exposes manual dump and cleanup methods', () => {
-  assert.match(source, /Object\.freeze\(\{ stop, dump, json, snapshot, mark, clear \}\)/);
-  assert.match(source, /copy\(window\.__ARCAIA_ASSISTANT_COMPLETION_SIGNAL_DIAG__\.json\(\)\)/);
+  assert.match(source, /Object\.freeze\(\{ stop, dump, json, download, snapshot, mark, clear \}\)/);
+  assert.match(source, /window\.__ARCAIA_ASSISTANT_COMPLETION_SIGNAL_DIAG__\.download\(\)/);
   assert.match(source, /observer\.disconnect\(\)/);
   assert.match(source, /resourceObserver\?\.disconnect\?\.\(\)/);
 });

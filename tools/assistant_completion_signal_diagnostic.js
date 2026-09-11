@@ -17,8 +17,10 @@
     'button[aria-label="Stop generating"]'
   ].join(', ');
   const ARCAIA_TIMESTAMP_SELECTOR = '[data-arcaia-message-time-badge="true"]';
+  const ARCAIA_ACTIVITY_ATTR = 'data-arcaia-assistant-loading-title';
   const RELEVANT_ATTRIBUTE_NAMES = new Set([
     'data-stream-active',
+    ARCAIA_ACTIVITY_ATTR,
     'data-testid',
     'data-turn',
     'data-turn-id',
@@ -139,6 +141,29 @@
     );
   }
 
+  function getLatestAssistantGenerationSignals(latestTurn) {
+    if (!latestTurn) {
+      return {
+        latestAssistantImageElementCount: 0,
+        latestAssistantCanvasCount: 0,
+        latestAssistantProgressbarCount: 0,
+        latestAssistantAriaBusyTrueCount: 0,
+        latestAssistantGenerationTestIds: null
+      };
+    }
+    const generationTestIds = Array.from(latestTurn.querySelectorAll('[data-testid]'))
+      .map((node) => sanitizeId(node.getAttribute('data-testid')))
+      .filter((value) => value && /(image|generat|progress|loading|dalle|artifact)/i.test(value))
+      .slice(0, 16);
+    return {
+      latestAssistantImageElementCount: latestTurn.querySelectorAll('img').length,
+      latestAssistantCanvasCount: latestTurn.querySelectorAll('canvas').length,
+      latestAssistantProgressbarCount: latestTurn.querySelectorAll('[role="progressbar"]').length,
+      latestAssistantAriaBusyTrueCount: latestTurn.querySelectorAll('[aria-busy="true"]').length,
+      latestAssistantGenerationTestIds: generationTestIds.length ? generationTestIds.join('|') : null
+    };
+  }
+
   function getState() {
     const streamRoot = getStreamRoot();
     const turns = getAssistantTurns();
@@ -149,6 +174,7 @@
     const stopButton = document.querySelector(STOP_BUTTON_SELECTOR);
     const arcaiaTimestamp = latestTurn?.querySelector?.(ARCAIA_TIMESTAMP_SELECTOR) || null;
     const composerTextState = getComposerTextState();
+    const generationSignals = getLatestAssistantGenerationSignals(latestTurn);
     return {
       streamRootExists: Boolean(streamRoot?.isConnected),
       streamActive: Boolean(streamRoot?.hasAttribute?.('data-stream-active')),
@@ -163,6 +189,8 @@
       latestAssistantTimestampBadge: Boolean(arcaiaTimestamp?.isConnected),
       latestAssistantButtonCount: latestTurn?.querySelectorAll?.('button')?.length || 0,
       stopButtonExists: Boolean(stopButton?.isConnected),
+      arcaiaActivityActive: Boolean(document.documentElement?.hasAttribute?.(ARCAIA_ACTIVITY_ATTR)),
+      ...generationSignals,
       ...composerTextState,
       totalCopyButtonCount: document.querySelectorAll(COPY_BUTTON_SELECTOR).length,
       totalErrorRetryButtonCount: Array.from(
@@ -400,6 +428,12 @@
         || changes.latestAssistantErrorRetry
         || changes.latestAssistantErrorBlock
         || changes.latestAssistantTimestampBadge
+        || changes.arcaiaActivityActive
+        || changes.latestAssistantImageElementCount
+        || changes.latestAssistantCanvasCount
+        || changes.latestAssistantProgressbarCount
+        || changes.latestAssistantAriaBusyTrueCount
+        || changes.latestAssistantGenerationTestIds
         || changes.composerHasText
         || changes.composerTextLength
       );
@@ -433,6 +467,20 @@
     return JSON.stringify(dump(), null, 2);
   }
 
+  function download() {
+    const blob = new Blob([json()], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `arcaia-assistant-completion-signal-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    link.hidden = true;
+    (document.body || document.documentElement).appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return true;
+  }
+
   function clear() {
     records.length = 0;
     previousState = getState();
@@ -460,13 +508,13 @@
     return dump();
   }
 
-  window[API_KEY] = Object.freeze({ stop, dump, json, snapshot, mark, clear });
+  window[API_KEY] = Object.freeze({ stop, dump, json, download, snapshot, mark, clear });
   previousState = getState();
   push({ type: 'installed', state: previousState });
   startResourceObserver();
   console.info(
     '[Arcaia] Assistant completion signal diagnostic installed. '
-    + 'Send a prompt, move this tab to the background, wait for completion, return, then run: '
-    + 'copy(window.__ARCAIA_ASSISTANT_COMPLETION_SIGNAL_DIAG__.json())'
+    + 'Send a prompt, reproduce the completion issue, then run: '
+    + 'window.__ARCAIA_ASSISTANT_COMPLETION_SIGNAL_DIAG__.download()'
   );
 })();

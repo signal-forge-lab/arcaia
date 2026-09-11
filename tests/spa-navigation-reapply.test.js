@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
-const { chromium } = require('playwright');
+const { launchBrowser } = require('../tools/playwright_browser');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
 const helperStart = source.indexOf('  let pageConversationPendingDomSync = null;');
@@ -13,7 +13,7 @@ const helperEnd = source.indexOf('  function scheduleConversationDependentStateS
 test('SPA pending sync waits for replacement header and Composer, then schedules once per DOM identity', async () => {
   assert.ok(helperStart > -1 && helperEnd > helperStart);
   const helperSource = source.slice(helperStart, helperEnd);
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser({ headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 1200, height: 800 } });
     await page.setContent(`
@@ -35,11 +35,13 @@ test('SPA pending sync waits for replacement header and Composer, then schedules
       window.__conversationId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
       window.__syncReasons = [];
       const prelude = `
+        const MESSAGE_SECTION_SELECTOR = 'section[data-testid^="conversation-turn-"]';
         let pageConversationMonitorStarted = true;
         function isArcaiaExtensionEnabled() { return true; }
         function isArcaiaFeatureEnabled() { return true; }
         function tryExtractConversationIdFromUrl() { return window.__conversationId; }
         function findNativeShareButton() { return document.querySelector('header [data-testid*="share"]'); }
+        function findRollingLiteContentRoot() { return document.querySelector('#conversation-root'); }
         function scheduleConversationDependentStateSync(reason) { window.__syncReasons.push(reason); }
         function hasObservedPageConversationStateChanged() { return false; }
       `;
@@ -101,6 +103,19 @@ test('SPA pending sync waits for replacement header and Composer, then schedules
     });
     assert.equal(await page.evaluate(() => window.__spaPendingTest.note('duplicate_mutation')), false);
     assert.deepEqual(await page.evaluate(() => window.__spaPendingTest.snapshot().syncReasons), ['replacement_dom_ready']);
+
+    await page.evaluate(() => {
+      document.body.insertAdjacentHTML('beforeend', `
+        <div id="conversation-root">
+          <section data-testid="conversation-turn-1"></section>
+        </div>
+      `);
+    });
+    assert.equal(await page.evaluate(() => window.__spaPendingTest.note('content_root_ready')), true);
+    assert.deepEqual(
+      await page.evaluate(() => window.__spaPendingTest.snapshot().syncReasons),
+      ['replacement_dom_ready', 'content_root_ready']
+    );
   } finally {
     await browser.close();
   }
@@ -109,7 +124,7 @@ test('SPA pending sync waits for replacement header and Composer, then schedules
 test('SPA pending observer completes when replacement header and Composer appear before the model trigger', async () => {
   assert.ok(helperStart > -1 && helperEnd > helperStart);
   const helperSource = source.slice(helperStart, helperEnd);
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser({ headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 1200, height: 800 } });
     await page.setContent(`
@@ -131,11 +146,13 @@ test('SPA pending observer completes when replacement header and Composer appear
       window.__conversationId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
       window.__syncReasons = [];
       const prelude = `
+        const MESSAGE_SECTION_SELECTOR = 'section[data-testid^="conversation-turn-"]';
         let pageConversationMonitorStarted = true;
         function isArcaiaExtensionEnabled() { return true; }
         function isArcaiaFeatureEnabled() { return true; }
         function tryExtractConversationIdFromUrl() { return window.__conversationId; }
         function findNativeShareButton() { return document.querySelector('header [data-testid*="share"]'); }
+        function findRollingLiteContentRoot() { return document.querySelector('#conversation-root'); }
         function scheduleConversationDependentStateSync(reason) { window.__syncReasons.push(reason); }
         function hasObservedPageConversationStateChanged() { return false; }
       `;
@@ -200,6 +217,19 @@ test('SPA pending observer completes when replacement header and Composer appear
       await page.evaluate(() => window.__spaPendingObserverTest.snapshot().syncReasons),
       ['pending_conversation_dom_mutation']
     );
+
+    await page.evaluate(() => {
+      document.body.insertAdjacentHTML('beforeend', `
+        <div id="conversation-root">
+          <section data-testid="conversation-turn-1"></section>
+        </div>
+      `);
+    });
+    await page.waitForFunction(() => window.__syncReasons.length === 2);
+    assert.deepEqual(
+      await page.evaluate(() => window.__spaPendingObserverTest.snapshot().syncReasons),
+      ['pending_conversation_dom_mutation', 'pending_conversation_dom_mutation']
+    );
     await page.evaluate(() => window.__spaPendingObserverTest.stop());
     assert.equal(await page.evaluate(() => window.__spaPendingObserverTest.snapshot().observerActive), false);
   } finally {
@@ -207,12 +237,98 @@ test('SPA pending observer completes when replacement header and Composer appear
   }
 });
 
-test('SPA pending observer is bounded to conversation routes and is disconnected during monitor cleanup', () => {
-  assert.match(source, /if \(\s*!pending\?\.conversationId/);
+test('SPA pending observer follows a conversation-to-new-chat Composer replacement without polling', async () => {
+  assert.ok(helperStart > -1 && helperEnd > helperStart);
+  const helperSource = source.slice(helperStart, helperEnd);
+  const browser = await launchBrowser({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+    await page.setContent(`
+      <!doctype html>
+      <html lang="ja">
+        <body>
+          <header><div><button data-testid="share-chat-button">共有する</button></div></header>
+          <div id="composer-shell">
+            <form id="old-composer" data-type="unified-composer">
+              <button aria-haspopup="menu">GPT-5.6</button>
+            </form>
+          </div>
+        </body>
+      </html>
+    `);
+    await page.evaluate((code) => {
+      window.__conversationId = null;
+      window.__syncReasons = [];
+      const prelude = `
+        const MESSAGE_SECTION_SELECTOR = 'section[data-testid^="conversation-turn-"]';
+        let observedPageConversationId = 'previous-conversation';
+        let pageConversationMonitorStarted = true;
+        function isArcaiaExtensionEnabled() { return true; }
+        function isArcaiaFeatureEnabled() { return true; }
+        function tryExtractConversationIdFromUrl() { return window.__conversationId; }
+        function findNativeShareButton() { return document.querySelector('header [data-testid*="share"]'); }
+        function findRollingLiteContentRoot() { return null; }
+        function scheduleConversationDependentStateSync(reason) { window.__syncReasons.push(reason); }
+        function hasObservedPageConversationStateChanged() { return false; }
+      `;
+      const expose = `
+        window.__newChatPendingTest = {
+          mark: markConversationDependentDomSyncPending,
+          stop: disconnectPageConversationPendingDomObserver,
+          complete: () => isConversationDependentDomSyncComplete(getConversationDependentDomIdentity()),
+          snapshot() {
+            return {
+              observerActive: Boolean(pageConversationPendingDomObserver),
+              syncReasons: [...window.__syncReasons]
+            };
+          }
+        };
+      `;
+      (0, eval)(`${prelude}${code}${expose}`);
+    }, helperSource);
+
+    assert.equal(await page.evaluate(() => Boolean(window.__newChatPendingTest.mark('page_navigation'))), true);
+    assert.equal(await page.evaluate(() => window.__newChatPendingTest.snapshot().observerActive), true);
+
+    await page.evaluate(() => {
+      document.querySelector('header').outerHTML = '<header><div>New Chat</div></header>';
+    });
+    await page.waitForTimeout(50);
+    assert.deepEqual(await page.evaluate(() => window.__newChatPendingTest.snapshot().syncReasons), []);
+    assert.equal(await page.evaluate(() => window.__newChatPendingTest.snapshot().observerActive), true);
+
+    await page.evaluate(() => {
+      document.getElementById('composer-shell').outerHTML = `
+        <div id="new-composer-shell">
+          <form id="new-composer" data-type="unified-composer">
+            <button aria-haspopup="menu">GPT-5.6</button>
+          </form>
+        </div>
+      `;
+    });
+    await page.waitForTimeout(50);
+    assert.deepEqual(
+      await page.evaluate(() => window.__newChatPendingTest.snapshot().syncReasons),
+      ['pending_conversation_dom_mutation']
+    );
+    assert.equal(await page.evaluate(() => window.__newChatPendingTest.complete()), true);
+    await page.evaluate(() => window.__newChatPendingTest.stop());
+  } finally {
+    await browser.close();
+  }
+});
+
+test('SPA pending observer is bounded to conversation routes or a conversation-to-new-chat transition and is disconnected during monitor cleanup', () => {
+  assert.match(source, /newChatTransitionFromConversation: Boolean\(!conversationId && observedPageConversationId\)/);
+  assert.match(source, /\(!pending\.conversationId && !pending\.newChatTransitionFromConversation\)/);
   assert.match(source, /function isPageConversationPendingDomMutationRelevant\(mutations\)/);
   assert.match(source, /target\?\.closest\?\.\('header'\)/);
   assert.match(source, /if \(!isPageConversationPendingDomMutationRelevant\(mutations\)\) return;/);
   assert.match(source, /pageConversationPendingDomObserver\.observe\(target, \{ childList: true, subtree: true \}\)/);
+  assert.match(source, /PAGE_CONVERSATION_PENDING_DOM_TIMEOUT_MS = 30000/);
+  assert.match(source, /pageConversationPendingDomObserverTimer = setTimeout\(/);
+  assert.match(source, /clearTimeout\(pageConversationPendingDomObserverTimer\)/);
+  assert.match(source, /disconnectPageConversationPendingDomObserver\(\);\s*pageConversationPendingDomSync = \{/);
   assert.match(source, /pageConversationPendingDomSync = null;\s*disconnectPageConversationPendingDomObserver\(\);/);
   assert.match(source, /function stopPageConversationMonitor\(\)[\s\S]*?disconnectPageConversationPendingDomObserver\(\);/);
   const readinessSource = source.slice(
@@ -221,4 +337,11 @@ test('SPA pending observer is bounded to conversation routes and is disconnected
   );
   assert.match(readinessSource, /identity\?\.composer\?\.isConnected/);
   assert.doesNotMatch(readinessSource, /modelTrigger/);
+  assert.match(source, /function isConversationDependentDomSyncComplete\(identity\)/);
+  assert.match(source, /identity\?\.contentRoot\?\.isConnected/);
+  assert.match(source, /markConversationDependentDomSyncPending\('monitor_started'\)/);
+  assert.match(source, /form\[data-type="unified-composer"\].*MESSAGE_SECTION_SELECTOR/);
+  assert.match(source, /mainWorldSynced: false/);
+  assert.match(source, /const shouldSyncMainWorld = conversationChanged \|\| urlChanged \|\| !pendingDomSync\?\.mainWorldSynced/);
+  assert.match(source, /mainWorldSync\?\.ok === true/);
 });

@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Arcaia Assistant Render Gap Watch Probe",
+  "version": "1.0.0",
+  "description": "Waits for assistant response content to disappear or return after reload while recording privacy-bounded Arcaia Recent View evidence.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://chatgpt.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/main/icon16.png",
+    "32": "icons/main/icon32.png",
+    "48": "icons/main/icon48.png",
+    "128": "icons/main/icon128.png"
+  },
+  "action": {
+    "default_title": "Arcaia Assistant Render Gap Watch Probe",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/toolbar/icon16.png",
+      "32": "icons/toolbar/icon32.png",
+      "48": "icons/toolbar/icon48.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

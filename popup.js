@@ -1,7 +1,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '0.1.275';
+  const APP_VERSION = '0.1.371';
   const OPERATION_MODE_STORAGE_KEY = 'arcaia_operation_mode_v1';
   const FEATURE_SETTINGS_STORAGE_KEY = 'arcaia_feature_settings_v1';
   const EXTENSION_ENABLED_STORAGE_KEY = 'arcaia_extension_enabled_v1';
@@ -11,9 +11,24 @@
   const ASSISTANT_COMPLETION_SOUND_ID_STORAGE_KEY = 'arcaia_assistant_completion_sound_id_v1';
   const ASSISTANT_COMPLETION_SOUND_VOLUME_STORAGE_KEY = 'arcaia_assistant_completion_sound_volume_v1';
   const DEFAULT_ASSISTANT_COMPLETION_SOUND_ID = 'classic_chime';
-  const VALID_ASSISTANT_COMPLETION_SOUND_IDS = new Set(['classic_chime', 'soft_chime']);
+  const VALID_ASSISTANT_COMPLETION_SOUND_IDS = new Set([
+    'classic_chime',
+    'soft_chime',
+    'notification_sound_03',
+    'notification_sound_04',
+    'notification_sound_05',
+    'notification_sound_06',
+    'notification_sound_07',
+    'notification_sound_08',
+    'notification_sound_09',
+    'notification_sound_10',
+    'notification_sound_11',
+    'notification_sound_12',
+    'notification_sound_13',
+    'notification_sound_14'
+  ]);
   const DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME = 0.153;
-  const ASSISTANT_COMPLETION_SOUND_REFERENCE_UI_PERCENT = 50;
+  const ASSISTANT_COMPLETION_SOUND_REFERENCE_UI_PERCENT = 30;
   const MAX_ASSISTANT_COMPLETION_SOUND_VOLUME = DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME / (ASSISTANT_COMPLETION_SOUND_REFERENCE_UI_PERCENT / 100);
   const DEFAULT_LITE_TURN_COUNT = 3;
   const UI_SETTINGS_SCHEMA_VERSION = 2;
@@ -26,18 +41,21 @@
   ];
   const CONTENT_SCRIPT_FILES = [
     'content_toolbar.js',
-    'content_diagnostics.js',
     'content_markdown.js',
     'content_filename.js',
     'content_model_selector.js',
+    'content_recent_view_renderer.js',
     'content.js'
   ];
   const DEFAULT_FEATURE_SETTINGS = Object.freeze({
     liteView: true,
     liteImages: true,
     messageTimestamps: true,
+    turnNumbers: true,
     modelDecoration: true,
+    modelDecorationStyle: 'aurora',
     blockCollapser: true,
+    toolHistoryCompaction: false,
     ctrlEnterSend: true,
     loadingTitle: true,
     completionSound: false,
@@ -50,8 +68,10 @@
     liteView: 'liteViewToggle',
     liteImages: 'liteShowImagesToggle',
     messageTimestamps: 'messageTimestampsToggle',
+    turnNumbers: 'turnNumbersToggle',
     modelDecoration: 'modelDecorationToggle',
     blockCollapser: 'blockCollapserToggle',
+    toolHistoryCompaction: 'toolHistoryCompactionToggle',
     ctrlEnterSend: 'ctrlEnterSendToggle',
     loadingTitle: 'loadingTitleToggle',
     completionSound: 'assistantCompletionSoundToggle',
@@ -67,8 +87,11 @@
     liteShowImagesToggle: document.getElementById('liteShowImagesToggle'),
     liteTurnCountSelect: document.getElementById('liteTurnCountSelect'),
     messageTimestampsToggle: document.getElementById('messageTimestampsToggle'),
+    turnNumbersToggle: document.getElementById('turnNumbersToggle'),
     modelDecorationToggle: document.getElementById('modelDecorationToggle'),
+    modelDecorationStyleSelect: document.getElementById('modelDecorationStyleSelect'),
     blockCollapserToggle: document.getElementById('blockCollapserToggle'),
+    toolHistoryCompactionToggle: document.getElementById('toolHistoryCompactionToggle'),
     ctrlEnterSendToggle: document.getElementById('ctrlEnterSendToggle'),
     loadingTitleToggle: document.getElementById('loadingTitleToggle'),
     assistantCompletionSoundToggle: document.getElementById('assistantCompletionSoundToggle'),
@@ -97,7 +120,11 @@
     const source = value && typeof value === 'object' ? value : {};
     const next = {};
     for (const [key, defaultValue] of Object.entries(DEFAULT_FEATURE_SETTINGS)) {
-      next[key] = typeof source[key] === 'boolean' ? source[key] : defaultValue;
+      if (key === 'modelDecorationStyle') {
+        next[key] = source[key] === 'classic' || source[key] === 'aurora' || source[key] === 'outline' ? source[key] : defaultValue;
+      } else {
+        next[key] = typeof source[key] === 'boolean' ? source[key] : defaultValue;
+      }
     }
     return next;
   }
@@ -109,6 +136,7 @@
 
   function normalizeAssistantCompletionSoundId(value) {
     const soundId = String(value || '');
+    if (soundId === 'notification_08') return 'soft_chime';
     return VALID_ASSISTANT_COMPLETION_SOUND_IDS.has(soundId) ? soundId : DEFAULT_ASSISTANT_COMPLETION_SOUND_ID;
   }
 
@@ -206,6 +234,14 @@
       controls.liteTurnCountSelect.value = String(liteTurnCount);
       controls.liteTurnCountSelect.disabled = !extensionEnabled || featureSettings.liteView === false;
       controls.liteTurnCountSelect.closest('.select-row')?.classList.toggle('is-disabled', controls.liteTurnCountSelect.disabled);
+    }
+    const turnNumbersDisabled = !extensionEnabled || featureSettings.messageTimestamps === false;
+    if (controls.turnNumbersToggle) controls.turnNumbersToggle.disabled = turnNumbersDisabled;
+    controls.turnNumbersToggle?.closest('.switch-row')?.classList.toggle('is-disabled', turnNumbersDisabled);
+    if (controls.modelDecorationStyleSelect) {
+      controls.modelDecorationStyleSelect.value = featureSettings.modelDecorationStyle;
+      controls.modelDecorationStyleSelect.disabled = !extensionEnabled || featureSettings.modelDecoration === false;
+      controls.modelDecorationStyleSelect.closest('.select-row')?.classList.toggle('is-disabled', controls.modelDecorationStyleSelect.disabled);
     }
     const liteImagesDisabled = !extensionEnabled || featureSettings.liteView === false;
     if (controls.liteShowImagesToggle) controls.liteShowImagesToggle.disabled = liteImagesDisabled;
@@ -383,6 +419,15 @@
     return queued;
   }
 
+  async function closePopupAfterFocusLoss() {
+    await settingsCommitQueue;
+    if (!document.hasFocus()) window.close();
+  }
+
+  window.addEventListener('blur', () => {
+    void closePopupAfterFocusLoss();
+  });
+
   function sendRuntimeMessage(payload) {
     return new Promise((resolve) => {
       try {
@@ -482,6 +527,13 @@
     void commitSettings(() => {
       liteTurnCount = normalizeLiteTurnCount(nextValue);
     }, 'ターン数');
+  });
+
+  controls.modelDecorationStyleSelect?.addEventListener('change', () => {
+    const nextStyle = controls.modelDecorationStyleSelect.value;
+    void commitSettings(() => {
+      featureSettings = normalizeFeatureSettings({ ...featureSettings, modelDecorationStyle: nextStyle });
+    }, 'モデル装飾スタイル');
   });
 
   controls.assistantCompletionSoundSelect?.addEventListener('change', () => {

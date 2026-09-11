@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Arcaia ChatGPT Toolkit",
   "short_name": "Arcaia",
-  "version": "0.1.275",
+  "version": "0.1.371",
   "description": "Customize ChatGPT with Recent View, timestamps, pinned chat icons, and Markdown export.",
   "action": {
     "default_title": "Arcaia ChatGPT Toolkit",
@@ -22,6 +22,7 @@
   },
   "permissions": [
     "activeTab",
+    "downloads",
     "offscreen",
     "scripting",
     "tabs",
@@ -40,10 +41,10 @@
       ],
       "js": [
         "content_toolbar.js",
-        "content_diagnostics.js",
         "content_markdown.js",
         "content_filename.js",
         "content_model_selector.js",
+        "content_recent_view_renderer.js",
         "content.js"
       ],
       "run_at": "document_start",

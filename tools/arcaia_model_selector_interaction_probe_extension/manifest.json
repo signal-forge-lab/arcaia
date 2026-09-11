@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Arcaia Model Selector Interaction Probe",
+  "version": "1.1.0",
+  "description": "Captures model-selector overlap and Chat/Work selection propagation without storing conversation text or raw account state.",
+  "permissions": [
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*"
+  ],
+  "action": {
+    "default_title": "Arcaia Model Selector Interaction Probe",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}

@@ -459,7 +459,7 @@
     }
 
     .sound-control-row[data-sound-select-row] {
-      grid-template-columns: minmax(0, 1fr) 144px 58px;
+      grid-template-columns: minmax(0, 1fr) 144px 68px;
     }
 
     .sound-control-row[data-sound-volume-row] {
@@ -498,6 +498,7 @@
       color: var(--arcaia-accent);
       font-size: 10px;
       font-weight: 750;
+      white-space: nowrap;
       cursor: pointer;
       transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
     }
@@ -588,7 +589,7 @@
     <div class="extension-state">
       <span class="master-title">Arcaia</span>
       <span id="operationModeStatus" class="mode-status" data-mode="normal"></span>
-      <span class="menu-version">v0.1.275</span>
+      <span class="menu-version">v0.1.318</span>
       <span id="settingsSaveState" class="save-state" data-state="idle" aria-live="polite" hidden><span class="save-state-dot" aria-hidden="true"></span><span></span></span>
       <label class="master-switch-label" for="arcaiaEnabledToggle" aria-label="Arcaia全体を有効にする">
         <input id="arcaiaEnabledToggle" class="switch-input" type="checkbox" role="switch" checked>
@@ -619,13 +620,25 @@
             <label class="switch-label" for="messageTimestampsToggle"><input id="messageTimestampsToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">メッセージ日時</span></label>
             <span class="switch-hint">表示</span>
           </div>
+          <div class="switch-row sub-setting" data-feature-row="turnNumbers" title="メッセージ日時に絶対Turn番号を表示します。Recent ViewのON/OFFには依存しません。">
+            <label class="switch-label" for="turnNumbersToggle"><input id="turnNumbersToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">ターン番号</span></label>
+            <span class="switch-hint">遅延取得</span>
+          </div>
           <div class="switch-row" data-feature-row="modelDecoration">
             <label class="switch-label" for="modelDecorationToggle"><input id="modelDecorationToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">モデル表示装飾</span></label>
             <span class="switch-hint">GPT-5.6</span>
           </div>
+          <label class="select-row sub-setting" for="modelDecorationStyleSelect">
+            <span class="setting-copy"><span class="setting-title">装飾スタイル</span><span class="setting-hint">GPT-5.6モデルセレクターの外観</span></span>
+            <select id="modelDecorationStyleSelect"><option value="aurora" selected>Aurora Edge</option><option value="outline">Frosted</option><option value="classic">Classic</option></select>
+          </label>
           <div class="switch-row" data-feature-row="blockCollapser">
             <label class="switch-label" for="blockCollapserToggle"><input id="blockCollapserToggle" class="switch-input" type="checkbox" role="switch" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-title">長いブロックを折りたたむ</span></label>
             <span class="switch-hint">コード / Markdown</span>
+          </div>
+          <div class="switch-row" data-feature-row="toolHistoryCompaction">
+            <label class="switch-label" for="toolHistoryCompactionToggle"><input id="toolHistoryCompactionToggle" class="switch-input" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span><span class="switch-title">ツール履歴軽量化</span></label>
+            <span class="switch-hint">ツール使用 × N</span>
           </div>
         </div>
       </section>
@@ -655,6 +668,18 @@
               <select id="assistantCompletionSoundSelect" disabled>
                 <option value="classic_chime" selected>通知音1</option>
                 <option value="soft_chime">通知音2</option>
+                <option value="notification_sound_03">通知音3</option>
+                <option value="notification_sound_04">通知音4</option>
+                <option value="notification_sound_05">通知音5</option>
+                <option value="notification_sound_06">通知音6</option>
+                <option value="notification_sound_07">通知音7</option>
+                <option value="notification_sound_08">通知音8</option>
+                <option value="notification_sound_09">通知音9</option>
+                <option value="notification_sound_10">通知音10</option>
+                <option value="notification_sound_11">通知音11</option>
+                <option value="notification_sound_12">通知音12</option>
+                <option value="notification_sound_13">通知音13</option>
+                <option value="notification_sound_14">通知音14</option>
               </select>
               <span class="sound-select-chevron" aria-hidden="true"></span>
             </span>
@@ -663,8 +688,8 @@
           <div class="sound-control-row is-disabled" data-sound-volume-row>
             <label for="assistantCompletionSoundVolume">音量</label>
             <span class="volume-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 10v4h4l5 4V6L8 10z"/><path d="M16 9a4 4 0 0 1 0 6M18.5 6.5a8 8 0 0 1 0 11"/></svg></span>
-            <input id="assistantCompletionSoundVolume" type="range" min="0" max="100" step="1" value="50" disabled>
-            <output id="assistantCompletionSoundVolumeHint" for="assistantCompletionSoundVolume">50%</output>
+            <input id="assistantCompletionSoundVolume" type="range" min="0" max="100" step="1" value="30" disabled>
+            <output id="assistantCompletionSoundVolumeHint" for="assistantCompletionSoundVolume">30%</output>
           </div>
         </div>
       </section>

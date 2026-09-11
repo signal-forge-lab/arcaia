@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Arcaia Backend Contract Probe",
+  "version": "1.0.8",
+  "description": "Diagnoses ChatGPT backend identity, pagination/branch shape, Recent View full-history timing, and DOM effects without collecting conversation text or IDs.",
+  "permissions": ["tabs"],
+  "host_permissions": ["https://chatgpt.com/*"],
+  "action": {
+    "default_title": "Arcaia Backend Contract Probe",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}

@@ -83,13 +83,13 @@
   }
 
   function makeBaseExportName(result, normalizeDate) {
-    const title = makeSafeFileName(result?.title || result?.conversationId || 'chatgpt-conversation');
+    const title = makeSafeFileName(result?.title || 'chatgpt-conversation');
     const date = formatDateTimeForFile(pickLatestAssistantDateFromResult(result), normalizeDate);
     return `${date}_${title}`;
   }
 
   function makeSingleTurnExportName(result, turn, normalizeDate) {
-    const title = makeSafeFileName(result?.title || result?.conversationId || 'chatgpt-conversation');
+    const title = makeSafeFileName(result?.title || 'chatgpt-conversation');
     const date = formatDateTimeForFile(pickLatestAssistantDateFromTurn(turn) || pickLatestAssistantDateFromResult(result), normalizeDate);
     return `${date}_${title}_${formatTurnNumberForFile(turn, result)}`;
   }

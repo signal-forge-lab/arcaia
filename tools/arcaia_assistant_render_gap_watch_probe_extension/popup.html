@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Assistant Render Gap Watch</title>
+  <style>
+    :root { color-scheme: dark; font: 13px/1.45 system-ui, sans-serif; }
+    body { width: 340px; margin: 0; padding: 14px; background: #202123; color: #ececf1; }
+    h1 { margin: 0 0 12px; font-size: 14px; }
+    .card { padding: 10px; border: 1px solid #3d3d40; border-radius: 10px; background: #292a2d; }
+    .row { display: flex; justify-content: space-between; gap: 12px; margin-top: 6px; }
+    .muted { color: #a9a9b0; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+    button { padding: 8px 9px; border: 1px solid #4b4c50; border-radius: 8px; background: #34363a; color: inherit; cursor: pointer; }
+    button:hover { background: #3c3e42; }
+  </style>
+</head>
+<body>
+  <h1>Assistant Render Gap Watch</h1>
+  <div class="card">
+    <div id="status">接続確認中…</div>
+    <div class="row"><span class="muted">最新assistant DOM</span><span id="dom-length">-</span></div>
+    <div class="row"><span class="muted">raw / rewrite</span><span id="payload-length">-</span></div>
+    <div class="row"><span class="muted">incident</span><span id="incident">なし</span></div>
+  </div>
+  <div class="actions">
+    <button id="capture">現在を記録</button>
+    <button id="download">JSON保存</button>
+    <button id="ack">マーク解除</button>
+    <button id="reset">記録をリセット</button>
+    <button id="stop">このページで停止</button>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

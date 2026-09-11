@@ -1,6 +1,167 @@
-# Arcaia ChatGPT Toolkit v0.1.275
+# Arcaia ChatGPT Toolkit v0.1.299
 
-Chrome版ChatGPT向けの表示・操作支援拡張です。現在の基準バージョンは **v0.1.275** です。
+Chrome版ChatGPT向けの表示・操作支援拡張です。現在の基準バージョンは **v0.1.299** です。
+
+## v0.1.299の変更点
+
+- 右側ファイルプレビューのコピーtooltipをChatGPT標準の`bg-token-bg-tooltip`、枠線、余白、角丸へ合わせました。
+- tooltipは約200ms後に表示し、上側に空間がなければ下側へ反転、左右はviewport内へ収めます。
+- ターン単位Markdown保存ボタンも同じ共通tooltipへ移行し、ブラウザ標準`title`を削除しました。
+- 新しいObserverやポーリングは追加していません。
+
+## v0.1.298の変更点
+
+- 右側ファイルプレビューのコピー成功時、コピーアイコンをチェックアイコンへ切り替え、2秒後に元へ戻すようにしました。
+- コピー用ツールチップはブラウザ標準`title`を使わず、ChatGPTの既存背景色・文字色・角丸・影のutility classで表示します。
+- ホバーとキーボードフォーカスの両方でツールチップを表示し、成功中は文言も「コピーしました」へ切り替えます。
+
+## v0.1.297の変更点
+
+- 右側ファイルプレビューのダウンロードボタン横へコピーボタンを追加しました。
+- Markdownプレビューは見出し、リスト、リンク、コードフェンスなどをMarkdown形式へ戻してコピーします。
+- CSS、JavaScript、JSONなどのコード系プレビューは、コードフェンスを付けず表示中のソース本文をそのままコピーします。
+- PDF、画像などテキスト抽出元がないプレビューにはコピーボタンを表示しません。
+- 右ペインの既存`stage-thread-flyout`だけを局所監視し、ポーリングは追加していません。
+
+## v0.1.296の変更点
+
+- 同一会話でGPT-5.6が確定済みの場合、minor versionを含まない一時的なGPT-5系model slugを「詳細待ち」として扱い、既存装飾を維持するようにしました。
+- 明示的なGPT-5.5など別version、Pickerの確定選択、別会話への遷移では従来どおり装飾を解除します。
+- 新しいObserver、timer、追加取得処理は導入していません。
+
+## v0.1.295の変更点
+
+- 各メッセージの日時左側に表示するターン番号の誤記を、`Trun 12`から`Turn 12`へ修正しました。
+
+## v0.1.294の変更点
+
+- Model Decoration Watch Probe v1.0.5から明示要求された場合だけ、モデル装飾の内部解決境界をboolean・固定enumで返す一時probeを追加しました。
+- `activeSurfaceMode`、New Chat用モデル設定の有無、状態候補、解決context、trigger、直近scan結果を記録します。
+- Cookie、Storage、model slug、thinking effortの実値は返さず、常時ログ、追加Observer、ポーリングも追加していません。
+
+## v0.1.293の変更点
+
+- 同じGPT画面・同じ会話に対する重複`page_navigation`では、取得済みモデル状態と装飾を維持するようにしました。
+- 別会話・別surface・文脈判定不能では従来どおり状態と装飾を解除し、新しいauthorityを待ちます。
+- Observer、ポーリング、タイマー、追加のモデル取得処理は増やしていません。
+
+## v0.1.292の変更点
+
+- ヘッダーの全履歴Markdownダウンロードボタンを、独自MDアイコンからLucide公式の`file-down`アイコンへ変更しました。
+- SVGはLucide公式の24×24パスと線幅2をそのまま使用し、ChatGPT標準の線画アイコンに近い密度へ揃えています。
+- Lucide IconsはISC Licenseで配布されています。
+
+## v0.1.291の変更点
+
+- 全履歴Markdownボタンを、20×20表示向けの「角丸正方形＋大きな`MD`＋下向き矢印」アイコンへ変更しました。
+- ドキュメント輪郭と独立バッジを廃止し、3要素を1つの正方形内へ整理して小サイズでの潰れを抑えています。
+- 既存ボタンも内容version更新により新しいアイコンへ差し替わります。
+
+## v0.1.290の変更点
+
+- 全履歴Markdownボタンを、20×20表示向けの「ドキュメント＋下向き矢印＋右側へはみ出す`MD`バッジ」アイコンへ変更しました。
+- 小サイズでの判別性を優先し、紙本文の装飾線は省略しています。既存ボタンも内容version更新によって新しいアイコンへ差し替わります。
+
+## v0.1.289の変更点
+
+- ChatGPT標準の共有ボタンがアイコンのみへ変わり、従来のダウンロード矢印と見分けにくくなったため、全履歴Markdownボタンを折り返し付きドキュメント＋`MD`の線画アイコンへ変更しました。
+- 既存ボタンがSPA遷移後も再利用される場合に、新しいアイコンへ確実に差し替わるよう内容versionを更新しました。
+
+## v0.1.288の変更点
+
+- ChatGPT標準Shareボタンが専用`span`ラッパー内へ移動した後、全履歴Markdownボタンを同じラッパーへ挿入して上下に積んでいた問題を修正しました。
+- Shareの直親ではなく、実際のflex／gridアクションコンテナと、その直下のShareアクション単位を解決して直前へ配置します。旧来のShare直下構造にも対応します。
+- 原因となる直親挿入前提はv0.1.239で導入されていましたが、当時のChatGPT DOMでは正常でした。今回の表示崩れはChatGPT側のShareラッパー追加によって表面化したものです。
+
+## v0.1.287の変更点
+
+- Recent Viewの閲覧専用rendererが`/mnt/data/...`などの内部パスを画像URLとして扱い、HTML応答を画像Blobとして表示していた問題を修正しました。
+- 画像assetは確認済みのfiles API経路を優先し、画像ではない応答を棄却して次の候補へ進みます。画像読込に失敗した場合は壊れた画像を残さず添付カードへ戻します。
+- 添付名に内部パスが含まれる場合は、カード上ではファイル名部分だけを表示します。
+
+## v0.1.286の変更点
+
+- Recent Viewの「さらに表示」「全部表示」を、同一会話のdocument reloadから閲覧専用の独自DOM表示へ変更しました。
+- Main Worldが既存conversation responseからUser本文とAssistant最終本文だけを選別し、system、tool、code、thoughts、reasoning recapなどの内部nodeをトップレベルへ表示しません。
+- 閲覧モードはMarkdown見出し、リスト、引用、表、コードブロック、画像、添付カード、citationを静的に表示します。ChatGPTのReact管理DOMは変更せず、一時的に非表示にします。
+- 画像assetは表示時だけ解決し、Blob URLを閲覧モード終了時に破棄します。解決できないassetは静的カードのまま残します。
+- 「Recent Viewへ戻る」でnative表示へ即時復帰します。新しいObserver、interval、scroll listener、Content側conversation追加fetchは導入していません。
+
+## v0.1.285の変更点
+
+- Ogg Opus形式の通知音を12件追加し、既存の通知音1・2に続く通知音3〜14として選択・試聴できるようにしました。
+- 既存の通知音1・2、保存済みID、旧通知音8から通知音2への移行処理は変更していません。
+
+## v0.1.284の変更点
+
+- Recent Viewの画像表示ONで、画像経路の補完対象がassistantを含まないuser-onlyターンに限定されていた問題を修正しました。保持対象の全user開始ターンについて、次のuser開始までの画像node経路を保持します。
+- 既に選択済みの画像signalは重複placeholderへ置換せず、そのまま実画像として保持します。
+- PromptジャンプリストをArcaia側のCSS属性で非表示にする処理を撤去しました。ChatGPTが生成したジャンプリストはそのまま表示します。
+
+## v0.1.283の変更点
+
+- 各メッセージの日時左側は総ターン数を表示せず、全ターンMarkdownと同じユーザー開始ターン定義による現在番号だけを`Turn 12`形式で表示します。
+- 初期表示・会話切替・conversation content root交換時だけ既存メッセージへ全体適用し、送信時は追加されたuser要素、受信完了時は該当assistant要素だけを更新します。送受信イベントで過去メッセージ全体を再走査しません。
+- 通知音は旧通知音1と旧通知音8だけを残し、旧通知音8を新しい通知音2へ繰り上げました。旧通知音3〜10の選択肢と音源を削除しています。
+- 保存済みIDが旧通知音8の場合は新通知音2へ移行し、それ以外の削除済みIDは通知音1へフォールバックします。
+
+## v0.1.282の変更点
+
+- 各メッセージの日時表示左側へ、全ターンMarkdownと同じユーザー開始ターン定義による`T現在/総数`を表示します。
+- ファイル添付だけのユーザーメッセージをRecent Viewが空メッセージとして除外していた判定を修正しました。
+- 通知音1〜10をWebM/Opusから、圧縮前の生成波形を直接保持するPCM 16-bit WAVへ戻しました。
+- 通知音の保存ID、選択肢、音量設定、offscreen再生経路は変更していません。
+
+## v0.1.281の変更点
+
+- ChatGPT自身が`200`で取得した現在conversationのRequestをcloneして再実行しても、conversation DOM、React状態、section数は変化しないことを専用probeで確認しました。単純な同一スレッド再fetchはdocument reloadの代替になりません。
+- `React Router revalidate()`、限定React Query `refetch()`、同一サイドバーリンク再クリック、同一URLへの`popstate`もconversation再取得・UI更新を起こさないことを確認しました。
+- 結論が出た同一スレッド再検証probeのソース、配布ZIP、専用テストを通常treeから削除しました。
+- 通常runtimeに残っていた履歴probe arm、response body複製検査、内部Lite診断protocol、未使用Dry Run推定、旧診断bundle helperを削除しました。
+- 実際にはdocument reloadを行う関数・action名を`in_place`から`with_reload`へ変更し、実装と名称を一致させました。
+- Recent View経路にはContent側追加fetch、常時ポーリング、scroll listener、旧SPA往復を追加していません。初期DOM待ちObserverの30秒上限と段階同期の重複抑制も維持しています。
+
+## v0.1.280の変更点
+
+- Recent Viewの「さらに10件表示」「全部表示」で、reloadとconversation再取得までは成功していた一方、reload後のstartup設定同期がMain World設定を`replaceExisting`で作り直し、保存済みの`turnCountOverride`／`fullLoadOnce`をconversation取得前に消していた問題を修正しました。
+- startup同期は通常の保持件数・画像設定だけをmergeし、会話単位の一時状態を保持します。
+- Content側からの追加conversation fetch、常時ポーリング、scroll listener、旧SPA往復は追加していません。
+- 原因確定後、v0.1.279の内部probe、probe専用session trace、`beforeunload`／`pagehide` listener、750ms診断timer、外部reload probe一式を通常treeから削除しました。
+- `全部表示`はoverride解除と`fullLoadOnce`設定を1回のMain World要求へ統合し、中間状態と余分な往復をなくしました。
+- 初期DOM待ちのpending Observerは30秒で必ず終了し、header／Composerとconversation content rootの二段階同期でもMain World同期は最初の1回だけ実行します。
+- 動作を持たなかった`disableLite`引数、probe用詳細state、startup専用関数の未使用レスポンス構築を削除しました。
+
+## v0.1.279の変更点
+
+- v0.1.278のdocument reload修正後も実ブラウザ挙動が変わらなかったため、推定修正を継続せず、Recent View操作専用の限定probe経路を追加しました。
+- 外部probeが明示的にarmされている間だけ、Content Scriptの操作受付・Main World設定・検証・reload呼び出し・内部例外・ロールバックをprivacy-safeな段階イベントとして記録します。
+- Main World側も、conversation response観測、rewrite gate、`fullLoadOnce`消費、rewrite試行・成功・失敗を一致／不一致のbooleanと件数だけで記録します。
+- reload直前のイベント消失を避けるため、probe専用のbounded session traceへ同期保存し、次document startで外部probeが回収します。
+- 通常利用時はprobe arm情報が存在しないため、診断イベント・trace書き込み・追加timerは動作しません。
+- 専用probe拡張をv2.0.0へ更新しました。今回の版は原因特定用であり、Recent Viewの挙動を直したとみなしていません。
+
+## v0.1.278の変更点
+
+- Recent Viewの「さらに10件表示」「全部表示」で、設定は更新される一方、ChatGPTがSPA往復時にconversation responseを再取得せず、初回のRecent View payloadを再利用する問題を修正しました。
+- 会話単位の`turnCountOverride`または`fullLoadOnce`をMain Worldとsession storageへ確定させた後、同一会話をdocument reloadしてChatGPT自身の通常conversation取得へ通す方式へ変更しました。
+- 旧来の新規チャット→元会話のSPA往復、サイドバーリンク探索、広域の一時DOM待機、手動スクロール復元を削除しました。
+- Content側からの追加conversation fetch、常時ポーリング、scroll listenerは追加していません。
+
+## v0.1.277の変更点
+
+- 回答完了通知音を通知音1〜10へ拡張しました。プルダウン表示名と実ファイル名は連番で統一しています。
+- 全通知音をWebM/Opusの非可逆圧縮音源へ統一し、旧runtime合成音と旧`assistant-complete.ogg`を廃止しました。
+- 音源は同一RMS目標とピーク上限でノーマライズし、圧縮後のデコード結果でも確認しています。10音間のRMS差は0.16dBです。
+- 既存の通知音1／通知音2の保存IDは維持しているため、アップデート後も現在の選択が変わりません。
+- Recent Viewの「さらに10件表示」「全部表示」について、SPA往復・override・rewrite・再描画DOMを記録する外部probe拡張を追加しました。Arcaia本体runtimeへ診断処理は追加していません。
+
+## v0.1.276の変更点
+
+- 初期表示でChatGPTの仮ヘッダーへMarkdownボタンを追加した後、最終ヘッダーへ交換されるとボタンが消えたままになる問題を修正しました。
+- 初回の`page_navigation`がContent側Monitor開始前に発生しても、Monitor開始時に既存のconversation pending syncを開始するようにしました。
+- 一時Observerは、置換後のheader／Composerが揃った時点でヘッダー系UIを再同期し、会話content rootが後から現れた時点でもう一度共有再同期経路を実行します。
+- 会話content rootの準備後に、ターンMarkdown、Recent View controls、タイムスタンプなどを既存のconversation observerへbindします。
+- 新しい永続Observer、interval、固定待機、追加conversation fetchは導入していません。
 
 ## v0.1.275の変更点
 
@@ -149,14 +310,13 @@ Chrome版ChatGPT向けの表示・操作支援拡張です。現在の基準バ�
 
 ```text
 content_toolbar.js
-content_diagnostics.js
 content_markdown.js
 content_filename.js
 content_model_selector.js
 content.js
 ```
 
-`content_zip.js`は削除済みで、現在のmanifestには登録されていません。
+`content_zip.js`と未使用になった`content_diagnostics.js`は削除済みで、現在のmanifestには登録されていません。
 
 ## 診断機能の方針
 

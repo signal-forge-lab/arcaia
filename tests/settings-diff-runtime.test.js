@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { pathToFileURL } = require('node:url');
-const { chromium } = require('playwright');
+const { launchBrowser } = require('../tools/playwright_browser');
 
 const root = path.join(__dirname, '..');
 const popupSource = fs.readFileSync(path.join(root, 'popup.js'), 'utf8');
@@ -19,8 +19,11 @@ const DEFAULT_FEATURE_SETTINGS = {
   liteView: true,
   liteImages: true,
   messageTimestamps: true,
+  turnNumbers: true,
   modelDecoration: true,
+  modelDecorationStyle: 'aurora',
   blockCollapser: true,
+  toolHistoryCompaction: false,
   ctrlEnterSend: true,
   loadingTitle: true,
   completionSound: false,
@@ -40,7 +43,7 @@ const DEFAULT_FINGERPRINT = JSON.stringify({
 });
 
 test('popup follows prefers-color-scheme dark with the soft graphite palette', async () => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser({ headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 430, height: 900 }, colorScheme: 'dark' });
     await page.addInitScript(() => {
@@ -107,8 +110,38 @@ test('popup follows prefers-color-scheme dark with the soft graphite palette', a
   }
 });
 
+test('toolbar popup closes after losing focus', async () => {
+  const browser = await launchBrowser({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 430, height: 900 } });
+    await page.addInitScript(() => {
+      globalThis.chrome = {
+        action: { setBadgeText() {}, setBadgeBackgroundColor() {} },
+        storage: { local: { async get() { return {}; }, async set() {}, async remove() {} } },
+        tabs: { async query() { return []; } },
+        scripting: { async executeScript() {} },
+        runtime: { lastError: null, sendMessage(_message, callback) { callback?.({ ok: true }); }, getURL(value) { return value; } }
+      };
+    });
+
+    await page.goto(pathToFileURL(path.join(root, 'popup.html')).href);
+    const closeCalls = await page.evaluate(async () => {
+      let calls = 0;
+      Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => false });
+      Object.defineProperty(window, 'close', { configurable: true, value: () => { calls += 1; } });
+      window.dispatchEvent(new Event('blur'));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return calls;
+    });
+    assert.equal(closeCalls, 1);
+    assert.match(popupSource, /await settingsCommitQueue/);
+  } finally {
+    await browser.close();
+  }
+});
+
 test('popup opening with identical settings performs a status check but sends no settings update', async () => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser({ headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 430, height: 900 } });
     await page.addInitScript(({ fingerprint }) => {
@@ -164,7 +197,7 @@ test('popup opening with identical settings performs a status check but sends no
 });
 
 test('changing one popup feature sends one settings update after the status comparison', async () => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser({ headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 430, height: 900 } });
     await page.addInitScript(({ fingerprint }) => {
@@ -220,8 +253,59 @@ test('changing one popup feature sends one settings update after the status comp
   }
 });
 
+test('model decoration style can switch to Frosted through popup settings', async () => {
+  const browser = await launchBrowser({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 430, height: 900 } });
+    await page.addInitScript(({ fingerprint }) => {
+      globalThis.__arcaiaMessages = [];
+      globalThis.chrome = {
+        action: { setBadgeText() {}, setBadgeBackgroundColor() {} },
+        storage: { local: { async get() { return {}; }, async set() {}, async remove() {} } },
+        tabs: {
+          async query() { return [{ id: 18, url: 'https://chatgpt.com/c/example' }]; },
+          sendMessage(tabId, message, options, callback) {
+            if (typeof options === 'function') callback = options;
+            globalThis.__arcaiaMessages.push({ tabId, message: structuredClone(message) });
+            if (message.type === 'AICE_GET_UI_SETTINGS_STATUS') {
+              callback({ ok: true, result: { settingsFingerprint: fingerprint } });
+              return;
+            }
+            callback({ ok: true, result: { changedSubsystems: ['model_decoration'] } });
+          }
+        },
+        scripting: { async executeScript() {} },
+        runtime: { lastError: null, sendMessage(_message, callback) { callback?.({ ok: true }); }, getURL(value) { return value; } }
+      };
+    }, { fingerprint: DEFAULT_FINGERPRINT });
+
+    await page.goto(pathToFileURL(path.join(root, 'popup.html')).href);
+    await page.waitForFunction(() => globalThis.__arcaiaMessages.some((entry) => entry.message.type === 'AICE_GET_UI_SETTINGS_STATUS'));
+    const initial = await page.locator('#modelDecorationStyleSelect').inputValue();
+    assert.equal(initial, 'aurora');
+    await page.selectOption('#modelDecorationStyleSelect', 'outline');
+    await page.waitForFunction(() => globalThis.__arcaiaMessages.some((entry) => entry.message.type === 'AICE_SET_UI_SETTINGS'));
+    const update = await page.evaluate(() => globalThis.__arcaiaMessages.filter((entry) => entry.message.type === 'AICE_SET_UI_SETTINGS').at(-1).message);
+    assert.equal(update.featureSettings.modelDecorationStyle, 'outline');
+  } finally {
+    await browser.close();
+  }
+});
+
+test('content settings apply model style changes only to the model-decoration subsystem', () => {
+  assert.match(contentSource, /modelDecorationStyle:\s*'aurora'/);
+  assert.match(contentSource, /featureChanged\('modelDecorationStyle'\)/);
+  assert.match(contentSource, /setVisualStyle\?\.\(featureSettings\.modelDecorationStyle\)/);
+  assert.match(modelSelectorSource, /setVisualStyle/);
+  assert.match(popupHtmlSource, /id="modelDecorationStyleSelect"/);
+  assert.match(popupHtmlSource, /value="classic"/);
+  assert.match(popupHtmlSource, /value="aurora"/);
+  assert.match(popupHtmlSource, /value="outline"/);
+  assert.match(popupHtmlSource, /value="outline">Frosted</);
+});
+
 test('failed active-tab apply rolls storage and popup state back to the previous settings', async () => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser({ headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 430, height: 900 } });
     await page.addInitScript(({ fingerprint, defaults }) => {
@@ -291,7 +375,7 @@ test('failed active-tab apply rolls storage and popup state back to the previous
 });
 
 test('rapid popup changes are serialized and the later payload includes earlier successful changes', async () => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchBrowser({ headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 430, height: 900 } });
     await page.addInitScript(({ fingerprint }) => {
@@ -389,6 +473,7 @@ test('ordinary settings changes are applied by subsystem and full cleanup is res
   assert.match(ordinaryBranches, /changedSubsystems\.add\('header_markdown'\)/);
   assert.match(ordinaryBranches, /changedSubsystems\.add\('timestamps'\)/);
   assert.match(ordinaryBranches, /changedSubsystems\.add\('recent_view'\)/);
+  assert.match(ordinaryBranches, /changedSubsystems\.add\('tool_history_compaction'\)/);
 });
 
 test('assistant feedback settings reconfigure only the stream monitor and release generation DOM state', () => {
@@ -406,7 +491,7 @@ test('assistant feedback settings reconfigure only the stream monitor and releas
   assert.doesNotMatch(assistantBranch, /cleanupArcaiaPageUiForDisabled|startArcaiaPageUi/);
 
   const stopStart = contentSource.indexOf('  function stopAssistantLoadingFaviconMonitor(');
-  const stopEnd = contentSource.indexOf('  function isElementActuallyVisible', stopStart);
+  const stopEnd = contentSource.indexOf('  function isHistorySearchNavigationUrl', stopStart);
   assert.ok(stopStart >= 0 && stopEnd > stopStart);
   const stopHandler = contentSource.slice(stopStart, stopEnd);
   assert.match(stopHandler, /cancelPendingAssistantLoadingFaviconCheck\(/);

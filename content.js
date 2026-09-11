@@ -1,9 +1,12 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '0.1.275';
+  const APP_VERSION = '0.1.371';
   const MAIN_PROTOCOL_SOURCE = 'aice-probe-main-v159';
   const CONTENT_PROTOCOL_SOURCE = 'aice-probe-content-v159';
+  const MODEL_DECORATION_WATCH_PROBE_SOURCE = 'arcaia-model-decoration-watch-v1';
+  const MODEL_DECORATION_INTERNAL_PROBE_REQUEST = 'ARCAIA_MODEL_SELECTOR_INTERNAL_PROBE_REQUEST';
+  const MODEL_DECORATION_INTERNAL_PROBE_RESPONSE = 'ARCAIA_MODEL_SELECTOR_INTERNAL_PROBE_RESPONSE';
   const MAIN_SCRIPT_BASE_ID = 'aice-probe-injected-main-script';
   const MAIN_SCRIPT_ID = `${MAIN_SCRIPT_BASE_ID}-${APP_VERSION.replace(/\./g, '-')}`;
   const CONTENT_READY_KEY = '__AICE_PROBE_CONTENT_READY__';
@@ -12,15 +15,17 @@
   const EXTENSION_ENABLED_STORAGE_KEY = 'arcaia_extension_enabled_v1';
   const LITE_SHOW_IMAGES_STORAGE_KEY = 'arcaia_lite_show_images_v1';
   const LITE_TURN_COUNT_STORAGE_KEY = 'arcaia_lite_turn_count_v1';
+  const TURN_ANCHOR_CACHE_STORAGE_KEY = 'arcaia_turn_anchor_cache_v1';
+  const MAX_TURN_ANCHOR_CACHE_CONVERSATIONS = 32;
+  const MAX_TURN_ANCHORS_PER_CONVERSATION = 12;
+  const TURN_ANCHOR_HISTORY_FALLBACK_COOLDOWN_MS = 5 * 60 * 1000;
   const ASSISTANT_COMPLETION_SOUND_ENABLED_STORAGE_KEY = 'arcaia_assistant_completion_sound_enabled_v1';
   const ASSISTANT_COMPLETION_SOUND_ID_STORAGE_KEY = 'arcaia_assistant_completion_sound_id_v1';
   const ASSISTANT_COMPLETION_SOUND_VOLUME_STORAGE_KEY = 'arcaia_assistant_completion_sound_volume_v1';
   const DEFAULT_ASSISTANT_COMPLETION_SOUND_ID = 'classic_chime';
   const DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME = 0.153;
-  const ASSISTANT_COMPLETION_SOUND_REFERENCE_UI_PERCENT = 50;
+  const ASSISTANT_COMPLETION_SOUND_REFERENCE_UI_PERCENT = 30;
   const DEFAULT_LITE_TURN_COUNT = 3;
-  const RECENT_VIEW_EXPANSION_STEP = 10;
-  const RECENT_VIEW_EXPANDED_TURN_COUNT_MAX = 50;
   const MAX_ASSISTANT_COMPLETION_SOUND_VOLUME = DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME / (ASSISTANT_COMPLETION_SOUND_REFERENCE_UI_PERCENT / 100);
   const OPERATION_MODE_STORAGE_KEY = 'arcaia_operation_mode_v1';
   const FEATURE_SETTINGS_STORAGE_KEY = 'arcaia_feature_settings_v1';
@@ -31,8 +36,11 @@
     liteView: true,
     liteImages: true,
     messageTimestamps: true,
+    turnNumbers: true,
     modelDecoration: true,
+    modelDecorationStyle: 'aurora',
     blockCollapser: true,
+    toolHistoryCompaction: false,
     ctrlEnterSend: true,
     loadingTitle: true,
     completionSound: false,
@@ -51,6 +59,11 @@
   let featureSettings = { ...DEFAULT_FEATURE_SETTINGS };
   let currentUiSettingsFingerprint = null;
   let arcaiaPageUiStarted = false;
+  let longAnswerJumpUiStarted = false;
+  let longAnswerJumpButton = null;
+  let longAnswerJumpTarget = null;
+  let longAnswerJumpAnimationFrame = 0;
+  const turnAnchorHistoryFallbackBlockedUntilByConversation = new Map();
 
   if (window[CONTENT_READY_KEY] && window[CONTENT_VERSION_KEY] === APP_VERSION) {
     try { window[ENSURE_MAIN_KEY]?.(); } catch {}
@@ -66,7 +79,11 @@
     const source = value && typeof value === 'object' ? value : {};
     const next = {};
     for (const [key, defaultValue] of Object.entries(DEFAULT_FEATURE_SETTINGS)) {
-      next[key] = typeof source[key] === 'boolean' ? source[key] : defaultValue;
+      if (key === 'modelDecorationStyle') {
+        next[key] = source[key] === 'classic' || source[key] === 'aurora' || source[key] === 'outline' ? source[key] : defaultValue;
+      } else {
+        next[key] = typeof source[key] === 'boolean' ? source[key] : defaultValue;
+      }
     }
     return next;
   }
@@ -139,7 +156,7 @@
 
   function nodeContainsPinnedSortEarlyTarget(node) {
     if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
-    const selector = '#stage-slideover-sidebar, nav[aria-label="チャット履歴"], nav[aria-label="Chat history"], .group\\/sidebar-expando-section, a[data-sidebar-item="true"][href*="/c/"]';
+    const selector = '#stage-slideover-sidebar, nav[aria-label="チャット履歴"], nav[aria-label="Chat history"], .group\\/sidebar-expando-section, .group\\/project-unfurl-row, a[data-sidebar-item="true"][href*="/c/"]';
     if (node.matches?.(selector)) return true;
     return Boolean(node.querySelector?.(selector));
   }
@@ -184,13 +201,6 @@
     return new Date(ts).toISOString();
   }
 
-  function redactSnapshotUrl(value) {
-    return String(value || '')
-      .replace(/\/(c|g|gg|share)\/([a-f0-9-]+)/ig, '/$1/<conversationId>')
-      .replace(/([?&](?:token|access_token|authorization|auth|key|session|code|state)=)[^&]+/ig, '$1…')
-      .replace(/([?&]arcaia_(?:capture_request|soft_refresh|reason)=)[^&]+/ig, '$1…');
-  }
-
   function injectMainScript() {
     try {
       const staleScripts = Array.from(document.querySelectorAll(`script[id^="${MAIN_SCRIPT_BASE_ID}"]`));
@@ -229,48 +239,6 @@
   }
 
   const FULL_LOAD_MODE_STORAGE_KEY = 'arcaia_full_load_mode_v1';
-  const RECENT_VIEW_EXPANSION_STORAGE_KEY = 'arcaia_recent_view_expansion_v1';
-
-  function readRecentViewExpansionFromStorage() {
-    try {
-      const raw = window.sessionStorage?.getItem?.(RECENT_VIEW_EXPANSION_STORAGE_KEY);
-      if (!raw) return { conversationId: null, turnCount: null, requestedAt: null };
-      const parsed = JSON.parse(raw);
-      const turnCount = Math.max(
-        DEFAULT_LITE_TURN_COUNT,
-        Math.min(RECENT_VIEW_EXPANDED_TURN_COUNT_MAX, Math.floor(Number(parsed?.turnCount || 0)))
-      );
-      if (parsed?.appVersion !== APP_VERSION || !parsed?.conversationId || !Number.isFinite(turnCount)) {
-        window.sessionStorage?.removeItem?.(RECENT_VIEW_EXPANSION_STORAGE_KEY);
-        return { conversationId: null, turnCount: null, requestedAt: null };
-      }
-      return {
-        conversationId: String(parsed.conversationId),
-        turnCount,
-        requestedAt: Number(parsed.requestedAt || Date.now())
-      };
-    } catch {
-      return { conversationId: null, turnCount: null, requestedAt: null };
-    }
-  }
-
-  function writeRecentViewExpansionToStorage(state) {
-    try {
-      if (state?.conversationId && Number.isFinite(Number(state?.turnCount))) {
-        window.sessionStorage?.setItem?.(RECENT_VIEW_EXPANSION_STORAGE_KEY, JSON.stringify({
-          appVersion: APP_VERSION,
-          conversationId: state.conversationId,
-          turnCount: Math.max(
-            DEFAULT_LITE_TURN_COUNT,
-            Math.min(RECENT_VIEW_EXPANDED_TURN_COUNT_MAX, Math.floor(Number(state.turnCount)))
-          ),
-          requestedAt: Number(state.requestedAt || Date.now())
-        }));
-      } else {
-        window.sessionStorage?.removeItem?.(RECENT_VIEW_EXPANSION_STORAGE_KEY);
-      }
-    } catch {}
-  }
 
   function readFullLoadModeFromStorage() {
     try {
@@ -304,43 +272,13 @@
   }
 
   let fullLoadModeState = readFullLoadModeFromStorage();
-  let recentViewExpansionState = readRecentViewExpansionFromStorage();
-  let recentViewRefreshState = {
-    active: false,
-    conversationId: null,
-    mode: null,
-    requestedTurnCount: null,
-    startedAt: null,
-    sourceContentRoot: null,
-    sourceRoutePath: null
-  };
-  const recentViewRefreshConditionSignals = new Set();
-
-  function signalRecentViewRefreshConditions() {
-    for (const signal of Array.from(recentViewRefreshConditionSignals)) {
-      try { signal(); } catch {}
-    }
-  }
-
-  function getContentFailedTraceSummary(extra = {}) {
-    return {
-      appVersion: APP_VERSION,
-      traceEnabled: false,
-      traceCount: 0,
-      lastEvent: null,
-      recent: [],
-      note: '汎用Debugトレースは削除済みです。必要な調査は専用probeを使用します。',
-      ...extra
-    };
-  }
-
+  let recentViewRefreshActive = false;
 
   function isArcaiaExtensionEnabled() {
     return isArcaiaNormalMode();
   }
 
   function cleanupArcaiaPageUiForDisabled(reason = 'extension_disabled') {
-    try { clearRecentViewExpansionState(); } catch {}
     try {
       fullLoadModeState = { active: false, conversationId: null, requestedAt: null, reason };
       writeFullLoadModeToStorage(fullLoadModeState);
@@ -351,8 +289,11 @@
     try { stopMessageTimestampUi(); } catch {}
     try { stopTurnExportUi(); } catch {}
     try { stopHeaderMarkdownButtonUi(); } catch {}
+    try { stopFilePreviewCopyUi(); } catch {}
     try { stopPinnedSortUi(reason); } catch {}
     try { stopCtrlEnterSendUi(); } catch {}
+    try { stopLongAnswerJumpUi(); } catch {}
+    try { cleanupToolHistoryCompactionArtifacts(); } catch {}
     try { window.__ARCAIA_MODEL_SELECTOR_UI__?.cleanup?.(reason); } catch {}
     try { removeAssistantLoadingFaviconLink(); } catch {}
     try {
@@ -367,9 +308,9 @@
     try { document.documentElement?.removeAttribute?.('data-arcaia-assistant-loading-title'); } catch {}
     try { document.getElementById(LITE_BAR_ID)?.remove?.(); } catch {}
     try { removeRecentViewHistoryControls(); } catch {}
+    try { closeRecentViewReadOnlyRenderer(reason); } catch {}
     try { removeRecentViewLoadingOverlay(); } catch {}
     try { removeRecentViewFailureNotice(); } catch {}
-    try { setPromptTocHiddenActive(false); } catch {}
     try {
       for (const el of Array.from(document.querySelectorAll(`[${ROLLING_HIDE_ATTR}="true"]`))) {
         const originalDisplay = el.getAttribute?.(ROLLING_ORIGINAL_DISPLAY_ATTR);
@@ -398,9 +339,7 @@
       operationMode: operationMode === 'off' ? 'off' : 'normal',
       featureSettings: normalizeFeatureSettings(featureSettings),
       liteTurnCount: normalizeLiteTurnCount(liteTurnCount),
-      assistantCompletionSoundId: isValidAssistantCompletionSoundId(assistantCompletionSoundId)
-        ? assistantCompletionSoundId
-        : DEFAULT_ASSISTANT_COMPLETION_SOUND_ID,
+      assistantCompletionSoundId: normalizeAssistantCompletionSoundId(assistantCompletionSoundId),
       assistantCompletionSoundVolume: normalizeAssistantCompletionSoundVolume(assistantCompletionSoundVolume)
     };
   }
@@ -456,9 +395,11 @@
   function syncConversationDomObserverForFeatures() {
     const needed = Boolean(
       featureSettings.blockCollapser
+      || featureSettings.toolHistoryCompaction
       || featureSettings.turnMarkdownButtons
       || featureSettings.messageTimestamps
       || featureSettings.liteView
+      || longAnswerJumpUiStarted
     );
     if (needed && isArcaiaExtensionEnabled()) startConversationDomObserver();
     else stopConversationDomObserver();
@@ -472,18 +413,19 @@
         cleanupArcaiaPageUiForDisabled(`ui_settings:${reason}`);
         try { await runLiteDisplayDisable({ requestedBy: reason, commandId: reason }); } catch {}
       } else if (window.top === window) {
-        if (featureSettings.liteView) {
-          try {
-            await setMainWorldLiteDisplayConfig({
+        try {
+          await setMainWorldLiteDisplayConfig({
+            ...(featureSettings.liteView ? {
               enabled: true,
               turnCount: liteTurnCount,
               liteShowImages: liteShowImagesEnabled,
-              clearFullLoadMode: true,
-              requestedBy: reason,
-              configSource: 'runtime_reenabled'
-            }, 1800);
-          } catch {}
-        }
+              clearFullLoadMode: true
+            } : {}),
+            toolHistoryCompaction: Boolean(featureSettings.toolHistoryCompaction),
+            requestedBy: reason,
+            configSource: 'runtime_reenabled'
+          }, 1800);
+        } catch {}
         startArcaiaPageUi();
       }
       return { modeChanged: true, changedSubsystems: ['runtime'] };
@@ -502,9 +444,10 @@
       else stopCtrlEnterSendUi();
     }
 
-    if (featureChanged('modelDecoration')) {
+    if (featureChanged('modelDecoration') || featureChanged('modelDecorationStyle')) {
       changedSubsystems.add('model_decoration');
       if (featureSettings.modelDecoration) {
+        try { window.__ARCAIA_MODEL_SELECTOR_UI__?.setVisualStyle?.(featureSettings.modelDecorationStyle); } catch {}
         try { window.__ARCAIA_MODEL_SELECTOR_UI__?.start?.(); } catch {}
       } else {
         try { window.__ARCAIA_MODEL_SELECTOR_UI__?.cleanup?.('feature_disabled'); } catch {}
@@ -515,6 +458,22 @@
       changedSubsystems.add('block_collapser');
       if (featureSettings.blockCollapser) startCodeBlockCollapserUi();
       else cleanupCodeBlockCollapserUi();
+    }
+
+    if (featureChanged('toolHistoryCompaction')) {
+      changedSubsystems.add('tool_history_compaction');
+      try {
+        await setMainWorldLiteDisplayConfig({
+          toolHistoryCompaction: Boolean(featureSettings.toolHistoryCompaction),
+          requestedBy: reason,
+          configSource: 'tool_history_compaction_option'
+        }, 1800);
+      } catch {}
+      if (featureSettings.toolHistoryCompaction) {
+        installToolHistoryHideStyle();
+        scheduleToolHistoryHydrationRelease('ui_settings_enabled');
+      }
+      else cleanupToolHistoryCompactionArtifacts();
     }
 
     const assistantMonitorKeys = ['loadingTitle', 'completionSound', 'liteView'];
@@ -558,6 +517,19 @@
       }
     }
 
+    if (featureChanged('turnNumbers') && !featureChanged('messageTimestamps')) {
+      changedSubsystems.add('turn_numbers');
+      if (featureSettings.turnNumbers && featureSettings.messageTimestamps) {
+        clearAbsoluteTurnIndexState();
+        scheduleAbsoluteTurnIndex('turn_numbers_enabled', { refresh: true, cancelInFlight: true, delayMs: 0 });
+      } else {
+        clearScheduledAbsoluteTurnIndex();
+        clearAbsoluteTurnPendingWork();
+        clearAbsoluteTurnIndexState();
+        if (featureSettings.messageTimestamps) scheduleApplyAllMessageTimestamps('turn_numbers_disabled');
+      }
+    }
+
     const liteSettingsChanged = featureChanged('liteView')
       || featureChanged('liteImages')
       || previous.liteTurnCount !== next.liteTurnCount;
@@ -576,7 +548,6 @@
         } catch {}
         scheduleRollingLiteApply('ui_settings_diff');
       } else {
-        clearRecentViewExpansionState();
         fullLoadModeState = { active: false, conversationId: null, requestedAt: null, reason: 'lite_view_disabled' };
         writeFullLoadModeToStorage(fullLoadModeState);
         stopRollingLiteUi();
@@ -623,9 +594,7 @@
     liteShowImagesEnabled = Boolean(featureSettings.liteImages);
     liteTurnCount = normalizeLiteTurnCount(data?.[LITE_TURN_COUNT_STORAGE_KEY]);
     assistantCompletionSoundEnabled = Boolean(featureSettings.completionSound);
-    assistantCompletionSoundId = isValidAssistantCompletionSoundId(data?.[ASSISTANT_COMPLETION_SOUND_ID_STORAGE_KEY])
-      ? data[ASSISTANT_COMPLETION_SOUND_ID_STORAGE_KEY]
-      : DEFAULT_ASSISTANT_COMPLETION_SOUND_ID;
+    assistantCompletionSoundId = normalizeAssistantCompletionSoundId(data?.[ASSISTANT_COMPLETION_SOUND_ID_STORAGE_KEY]);
     assistantCompletionSoundVolume = normalizeAssistantCompletionSoundVolume(data?.[ASSISTANT_COMPLETION_SOUND_VOLUME_STORAGE_KEY]);
     extensionEnabled = isArcaiaRuntimeEnabled();
     currentUiSettingsFingerprint = getUiSettingsFingerprint();
@@ -635,18 +604,22 @@
   function primeMainWorldStorageForUiSettings() {
     try { window.sessionStorage?.removeItem?.('arcaia_debug_mode_enabled_v1'); } catch {}
     try { window.sessionStorage?.setItem?.(EXTENSION_ENABLED_STORAGE_KEY, isArcaiaRuntimeEnabled() ? 'true' : 'false'); } catch {}
-    if (isArcaiaNormalMode() && featureSettings.liteView !== false) return;
     try {
       const raw = window.sessionStorage?.getItem?.(MAIN_LITE_STORAGE_KEY);
       const parsed = raw ? JSON.parse(raw) : {};
-      window.sessionStorage?.setItem?.(MAIN_LITE_STORAGE_KEY, JSON.stringify({
+      const next = {
         ...parsed,
-        enabled: false,
-        userDisabled: operationMode === 'off',
-        configSource: 'feature_lite_disabled_bootstrap',
+        appVersion: APP_VERSION,
+        toolHistoryCompaction: Boolean(isArcaiaNormalMode() && featureSettings.toolHistoryCompaction),
         updatedAt: Date.now(),
         updatedAtIso: nowIso()
-      }));
+      };
+      if (!isArcaiaNormalMode() || featureSettings.liteView === false) {
+        next.enabled = false;
+        next.userDisabled = operationMode === 'off';
+        next.configSource = 'feature_lite_disabled_bootstrap';
+      }
+      window.sessionStorage?.setItem?.(MAIN_LITE_STORAGE_KEY, JSON.stringify(next));
     } catch {}
   }
 
@@ -657,9 +630,9 @@
     const nextLiteTurnCount = normalizeLiteTurnCount(
       Object.prototype.hasOwnProperty.call(payload || {}, 'liteTurnCount') ? payload.liteTurnCount : liteTurnCount
     );
-    const nextSoundId = isValidAssistantCompletionSoundId(payload?.assistantCompletionSoundId)
-      ? payload.assistantCompletionSoundId
-      : assistantCompletionSoundId;
+    const nextSoundId = Object.prototype.hasOwnProperty.call(payload || {}, 'assistantCompletionSoundId')
+      ? normalizeAssistantCompletionSoundId(payload.assistantCompletionSoundId)
+      : normalizeAssistantCompletionSoundId(assistantCompletionSoundId);
     const nextSoundVolume = normalizeAssistantCompletionSoundVolume(
       Object.prototype.hasOwnProperty.call(payload || {}, 'assistantCompletionSoundVolume')
         ? payload.assistantCompletionSoundVolume
@@ -763,29 +736,15 @@
     return { ok: true, appVersion: APP_VERSION, action: 'set_lite_image_display', liteShowImages: liteShowImagesEnabled, liteDisplay, reason };
   }
 
-  async function syncLiteShowImagesFromStorage() {
-    let storedEnabled = true;
-    try {
-      const data = await chrome.storage.local.get(LITE_SHOW_IMAGES_STORAGE_KEY);
-      storedEnabled = data && data[LITE_SHOW_IMAGES_STORAGE_KEY] === false ? false : true;
-    } catch {
-      storedEnabled = true;
-    }
-    liteShowImagesEnabled = storedEnabled;
-    try {
-      await setMainWorldLiteDisplayConfig({
-        turnCount: getConfiguredLiteTurnCount(),
-        liteShowImages: liteShowImagesEnabled,
-        requestedBy: 'content_init_storage_sync',
-        configSource: 'lite_image_display_storage_sync'
-      }, 1800);
-    } catch {}
-    return liteShowImagesEnabled;
-  }
-
   function isValidAssistantCompletionSoundId(soundId) {
     const id = String(soundId || '');
     return Boolean(id && ASSISTANT_COMPLETION_SOUND_PRESETS[id]);
+  }
+
+  function normalizeAssistantCompletionSoundId(soundId) {
+    const id = String(soundId || '');
+    if (id === 'notification_08') return 'soft_chime';
+    return isValidAssistantCompletionSoundId(id) ? id : DEFAULT_ASSISTANT_COMPLETION_SOUND_ID;
   }
 
   async function setAssistantCompletionSoundEnabled(enabled, reason = 'manual') {
@@ -810,31 +769,6 @@
     };
   }
 
-  async function syncAssistantCompletionSoundFromStorage() {
-    let storedEnabled = false;
-    let storedSoundId = assistantCompletionSoundId;
-    let storedVolume = assistantCompletionSoundVolume;
-    try {
-      const data = await chrome.storage.local.get([
-        ASSISTANT_COMPLETION_SOUND_ENABLED_STORAGE_KEY,
-        ASSISTANT_COMPLETION_SOUND_ID_STORAGE_KEY,
-        ASSISTANT_COMPLETION_SOUND_VOLUME_STORAGE_KEY
-      ]);
-      storedEnabled = Boolean(data && data[ASSISTANT_COMPLETION_SOUND_ENABLED_STORAGE_KEY] === true);
-      if (isValidAssistantCompletionSoundId(data?.[ASSISTANT_COMPLETION_SOUND_ID_STORAGE_KEY])) storedSoundId = data[ASSISTANT_COMPLETION_SOUND_ID_STORAGE_KEY];
-      storedVolume = normalizeAssistantCompletionSoundVolume(data?.[ASSISTANT_COMPLETION_SOUND_VOLUME_STORAGE_KEY]);
-    } catch {
-      storedEnabled = false;
-      storedSoundId = assistantCompletionSoundId;
-      storedVolume = assistantCompletionSoundVolume;
-    }
-    assistantCompletionSoundEnabled = storedEnabled;
-    assistantCompletionSoundId = storedSoundId;
-    assistantCompletionSoundVolume = storedVolume;
-    updateAssistantCompletionSoundState({ lastReason: 'content_init_storage_sync', lastError: null });
-    return { enabled: assistantCompletionSoundEnabled, soundId: assistantCompletionSoundId, volume: assistantCompletionSoundVolume };
-  }
-
   async function syncStartupSettingsFromStorage() {
     await syncUiSettingsFromStorage();
     primeMainWorldStorageForUiSettings();
@@ -842,35 +776,6 @@
     await sleep(40);
     await syncExtensionEnabledFromStorage();
     updateAssistantCompletionSoundState({ lastReason: 'content_init_storage_sync', lastError: null });
-  }
-
-  function trimLargeForDebug(value, depth = 0) {
-    if (depth > 6) return '[MaxDepth]';
-    if (value == null) return value;
-    if (typeof value === 'string') {
-      return value.length > 12000 ? `${value.slice(0, 12000)}...[truncated ${value.length - 12000} chars]` : value;
-    }
-    if (typeof value === 'number' || typeof value === 'boolean') return value;
-    if (Array.isArray(value)) {
-      const recent = value.slice(-80);
-      const out = recent.map((v) => trimLargeForDebug(v, depth + 1));
-      if (value.length > 80) out.unshift(`[truncated first ${value.length - 80} items; showing latest 80]`);
-      return out;
-    }
-    if (typeof value === 'object') {
-      const out = {};
-      for (const [k, v] of Object.entries(value).slice(0, 80)) {
-        if (k === 'html' && typeof v === 'string') {
-          out[k] = v ? `[omitted html ${v.length} chars]` : '';
-        } else if (k === 'rawConversation') {
-          out[k] = '[omitted rawConversation]';
-        } else {
-          out[k] = trimLargeForDebug(v, depth + 1);
-        }
-      }
-      return out;
-    }
-    return String(value);
   }
 
   function tryExtractConversationIdFromUrl(url = '') {
@@ -948,19 +853,68 @@
     try {
       if (event.source !== window) return;
       const data = event.data;
+      if (
+        data?.source === MODEL_DECORATION_WATCH_PROBE_SOURCE
+        && data.type === MODEL_DECORATION_INTERNAL_PROBE_REQUEST
+        && typeof data.requestId === 'string'
+        && data.requestId
+      ) {
+        const api = window.__ARCAIA_MODEL_SELECTOR_UI__ || null;
+        let snapshot = null;
+        try {
+          snapshot = api?.getProbeSnapshot?.() || null;
+        } catch {}
+        window.postMessage({
+          source: MODEL_DECORATION_WATCH_PROBE_SOURCE,
+          type: MODEL_DECORATION_INTERNAL_PROBE_RESPONSE,
+          requestId: data.requestId,
+          payload: {
+            apiPresent: Boolean(api),
+            snapshotAvailable: Boolean(snapshot),
+            ...(snapshot || {})
+          }
+        }, '*');
+        return;
+      }
       if (!data || data.source !== MAIN_PROTOCOL_SOURCE || data.type !== 'AICE_MAIN_EVENT') return;
       const mainEventType = data.eventType || data.payload?.event || null;
+      if (mainEventType === 'project_sidebar_index_updated') {
+        void refreshPinnedSortProjectSidebarIndex('main_event');
+      }
       if (mainEventType === 'message_timestamp_index_updated') {
         const currentConversationId = tryExtractConversationIdFromUrl(window.location.href);
         const eventConversationId = data.payload?.conversationId || null;
         if (currentConversationId && eventConversationId === currentConversationId) {
-          scheduleRefreshMessageTimestampIndex('main_event_message_timestamp_index_updated');
+          const changedMessageIds = Array.isArray(data.payload?.changedMessageIds)
+            ? data.payload.changedMessageIds.filter(Boolean)
+            : [];
+          if (changedMessageIds.length) {
+            scheduleRefreshMessageTimestampIndex('main_event_message_timestamp_index_updated', {
+              targetMessageIds: changedMessageIds
+            });
+          }
+          if (isArcaiaFeatureEnabled('turnNumbers') && changedMessageIds.length) {
+            scheduleAbsoluteTurnIndex('main_event_message_timestamp_index_updated', {
+              refresh: true,
+              targetMessageIds: changedMessageIds
+            });
+          }
+        }
+      }
+      if (mainEventType === 'tool_history_summary_index_updated') {
+        const currentConversationId = tryExtractConversationIdFromUrl(window.location.href);
+        const eventConversationId = data.payload?.conversationId || null;
+        if (currentConversationId && eventConversationId === currentConversationId) {
+          const index = data.payload?.toolHistorySummaryIndex || null;
+          if (index) applyToolHistoryPayloadSummaryIndex(index, 'main_event_tool_history_summary_index_updated');
         }
       }
       if (mainEventType === 'page_navigation') {
         const navigationReason = data.payload?.reason || 'navigation';
+        closeRecentViewReadOnlyRenderer(`main_world_${navigationReason}`, { restoreRecentView: false });
         markConversationDependentDomSyncPending(`main_world_${navigationReason}`);
         handleAssistantPageNavigationIntent(navigationReason);
+        resetToolHistoryHydrationGuard(`main_world_${navigationReason}`);
         try {
           window.__ARCAIA_MODEL_SELECTOR_UI__?.resetForNavigation?.({
             reason: navigationReason
@@ -999,8 +953,22 @@
   }
 
 
-  function requestMainWorldFullLoadOnce(payload = {}, timeoutMs = 2500) {
-    return postToMainAndWait('REQUEST_FULL_LOAD_ONCE', 'FULL_LOAD_ONCE_RESULT', timeoutMs, payload || {});
+  function requestMainWorldReadOnlyConversationModel(payload = {}, timeoutMs = 5000) {
+    return postToMainAndWait(
+      'GET_READ_ONLY_CONVERSATION_MODEL',
+      'READ_ONLY_CONVERSATION_MODEL_RESULT',
+      timeoutMs,
+      payload || {}
+    );
+  }
+
+  function requestMainWorldReadOnlyRendererAsset(payload = {}, timeoutMs = 15000) {
+    return postToMainAndWait(
+      'RESOLVE_READ_ONLY_RENDERER_ASSET',
+      'READ_ONLY_RENDERER_ASSET_RESULT',
+      timeoutMs,
+      payload || {}
+    );
   }
 
   function syncMainWorldConversation(timeoutMs = 1800, reason = 'content_sync') {
@@ -1015,31 +983,265 @@
     return postToMainAndWait('GET_LITE_DISPLAY_CONFIG', 'LITE_DISPLAY_CONFIG_RESULT', timeoutMs);
   }
 
+  function getMainWorldProjectSidebarIndex(timeoutMs = 1500) {
+    return postToMainAndWait('GET_PROJECT_SIDEBAR_INDEX', 'PROJECT_SIDEBAR_INDEX_RESULT', timeoutMs);
+  }
+
+  async function refreshPinnedSortProjectSidebarIndex(reason = 'manual') {
+    const result = await getMainWorldProjectSidebarIndex(1500);
+    const index = result?.projectSidebarIndex || null;
+    if (!index || !Array.isArray(index.projects)) return false;
+    pinnedSortProjectSidebarIndex = index;
+    schedulePinnedSortScan(0, `project_index:${reason}`);
+    return true;
+  }
+
   function getMainWorldMessageTimestampIndex(timeoutMs = 2500, conversationId = tryExtractConversationIdFromUrl(window.location.href)) {
     return postToMainAndWait('GET_MESSAGE_TIMESTAMP_INDEX', 'MESSAGE_TIMESTAMP_INDEX_RESULT', timeoutMs, {
       conversationId
     });
   }
 
-  function resetMainWorldLiteDisplayConfig(timeoutMs = 2500) {
-    clearLiteDisplayMainCache('reset_lite_display_config');
-    return postToMainAndWait('RESET_LITE_DISPLAY_CONFIG', 'LITE_DISPLAY_CONFIG_RESET', timeoutMs)
-      .then((result) => {
-        clearLiteDisplayMainCache('reset_lite_display_config_result');
-        return result;
-      });
+  function normalizeTurnAnchorCacheEntry(value, conversationId) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const expectedConversationId = String(conversationId || '').trim();
+    const cachedConversationId = String(value.conversationId || expectedConversationId).trim();
+    if (!expectedConversationId || cachedConversationId !== expectedConversationId) return null;
+    const totalTurnCount = Math.floor(Number(value.totalTurnCount));
+    if (!Number.isInteger(totalTurnCount) || totalTurnCount < 1) return null;
+    const anchors = [];
+    const seen = new Set();
+    for (const rawAnchor of Array.isArray(value.anchors) ? value.anchors : []) {
+      const messageId = String(rawAnchor?.messageId || '').trim();
+      const turnNumber = Math.floor(Number(rawAnchor?.turnNumber));
+      if (!messageId || seen.has(messageId) || !Number.isInteger(turnNumber) || turnNumber < 1 || turnNumber > totalTurnCount) continue;
+      seen.add(messageId);
+      anchors.push({ messageId, turnNumber });
+    }
+    if (!anchors.length) return null;
+    return {
+      conversationId: expectedConversationId,
+      totalTurnCount,
+      anchors: anchors.slice(-MAX_TURN_ANCHORS_PER_CONVERSATION),
+      updatedAt: Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : 0
+    };
   }
 
-  function getMainWorldLiteDisplayInternalDiagnostic(timeoutMs = 2500) {
-    return postToMainAndWait('GET_LITE_DISPLAY_INTERNAL_DIAGNOSTIC', 'LITE_DISPLAY_INTERNAL_DIAGNOSTIC_RESULT', timeoutMs);
+  async function readTurnAnchorCacheEntry(conversationId) {
+    const id = String(conversationId || '').trim();
+    if (!id) return null;
+    try {
+      const data = await chrome.storage.local.get(TURN_ANCHOR_CACHE_STORAGE_KEY);
+      return normalizeTurnAnchorCacheEntry(data?.[TURN_ANCHOR_CACHE_STORAGE_KEY]?.[id], id);
+    } catch {
+      return null;
+    }
   }
 
-  function requestMainWorldFreshLiteRewriteDiagnostic(raw, payload = {}, timeoutMs = 8000) {
-    return postToMainAndWait('BUILD_LITE_REWRITE_DIAGNOSTIC', 'LITE_REWRITE_DIAGNOSTIC_RESULT', timeoutMs, {
-      raw,
-      requestedTurnCount: payload.requestedTurnCount || payload.turnCount || NATIVE_LITE_TURN_COUNT,
-      context: payload.context || {}
+  async function writeTurnAnchorCacheEntry(conversationId, entry) {
+    const id = String(conversationId || '').trim();
+    const normalized = normalizeTurnAnchorCacheEntry(entry, id);
+    if (!normalized) return false;
+    try {
+      const data = await chrome.storage.local.get(TURN_ANCHOR_CACHE_STORAGE_KEY);
+      const rawCache = data?.[TURN_ANCHOR_CACHE_STORAGE_KEY];
+      const next = {};
+      if (rawCache && typeof rawCache === 'object' && !Array.isArray(rawCache)) {
+        for (const [cachedId, cachedEntry] of Object.entries(rawCache)) {
+          const valid = normalizeTurnAnchorCacheEntry(cachedEntry, cachedId);
+          if (valid) next[cachedId] = valid;
+        }
+      }
+      next[id] = normalized;
+      const bounded = Object.fromEntries(
+        Object.entries(next)
+          .sort((a, b) => Number(b[1]?.updatedAt || 0) - Number(a[1]?.updatedAt || 0))
+          .slice(0, MAX_TURN_ANCHOR_CACHE_CONVERSATIONS)
+      );
+      await chrome.storage.local.set({ [TURN_ANCHOR_CACHE_STORAGE_KEY]: bounded });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function getMainWorldAbsoluteTurnIndex(
+    timeoutMs = 120000,
+    conversationId = tryExtractConversationIdFromUrl(window.location.href),
+    anchorCache = null,
+    allowHistoryFetch = true
+  ) {
+    return postToMainAndWait('GET_ABSOLUTE_TURN_INDEX', 'ABSOLUTE_TURN_INDEX_RESULT', timeoutMs, {
+      conversationId,
+      anchorCache,
+      allowHistoryFetch: allowHistoryFetch !== false
     });
+  }
+
+  function cancelMainWorldAbsoluteTurnIndex() {
+    try { window.postMessage({ source: CONTENT_PROTOCOL_SOURCE, type: 'CANCEL_ABSOLUTE_TURN_INDEX' }, '*'); } catch {}
+  }
+
+  function clearScheduledAbsoluteTurnIndex({ cancelMain = true } = {}) {
+    if (turnNumberDelayTimer) clearTimeout(turnNumberDelayTimer);
+    turnNumberDelayTimer = null;
+    if (turnNumberIdleHandle != null) {
+      try {
+        if (turnNumberIdleUsesTimeout) clearTimeout(turnNumberIdleHandle);
+        else if (typeof cancelIdleCallback === 'function') cancelIdleCallback(turnNumberIdleHandle);
+      } catch {}
+    }
+    turnNumberIdleHandle = null;
+    turnNumberIdleUsesTimeout = false;
+    if (turnNumberVisibilityHandler) {
+      try { document.removeEventListener('visibilitychange', turnNumberVisibilityHandler); } catch {}
+      turnNumberVisibilityHandler = null;
+    }
+    if (cancelMain) {
+      cancelMainWorldAbsoluteTurnIndex();
+      turnNumberRequestToken += 1;
+      turnNumberRequestInFlight = false;
+    }
+  }
+
+  function clearAbsoluteTurnPendingWork() {
+    turnNumberPendingMessageIds.clear();
+    turnNumberPendingApplyAll = false;
+  }
+
+  function clearAbsoluteTurnIndexState() {
+    messageTimeState = {
+      ...messageTimeState,
+      absoluteTurnIndexLoaded: false,
+      absoluteTurnTotalCount: null,
+      absoluteTurnByMessageId: {},
+      absoluteTurnByNodeId: {}
+    };
+  }
+
+  async function requestAbsoluteTurnIndexNow(reason = 'idle') {
+    if (!messageTimeUiStarted || turnNumberRequestInFlight || !isArcaiaFeatureEnabled('messageTimestamps') || !isArcaiaFeatureEnabled('turnNumbers')) return;
+    const conversationId = tryExtractConversationIdFromUrl(window.location.href);
+    if (!conversationId || document.hidden) return;
+    const applyAll = turnNumberPendingApplyAll || turnNumberPendingMessageIds.size === 0;
+    const targetMessageIds = applyAll ? [] : Array.from(turnNumberPendingMessageIds);
+    clearAbsoluteTurnPendingWork();
+    const requestToken = ++turnNumberRequestToken;
+    turnNumberRequestInFlight = true;
+    try {
+      const anchorCache = await readTurnAnchorCacheEntry(conversationId);
+      if (requestToken !== turnNumberRequestToken) return;
+      const fallbackBlockedUntil = Number(turnAnchorHistoryFallbackBlockedUntilByConversation.get(conversationId) || 0);
+      const result = await getMainWorldAbsoluteTurnIndex(
+        120000,
+        conversationId,
+        anchorCache,
+        Date.now() >= fallbackBlockedUntil
+      );
+      if (result?.historyFetchAttempted && !result?.ok) {
+        if (
+          !turnAnchorHistoryFallbackBlockedUntilByConversation.has(conversationId)
+          && turnAnchorHistoryFallbackBlockedUntilByConversation.size >= MAX_TURN_ANCHOR_CACHE_CONVERSATIONS
+        ) {
+          turnAnchorHistoryFallbackBlockedUntilByConversation.delete(
+            turnAnchorHistoryFallbackBlockedUntilByConversation.keys().next().value
+          );
+        }
+        turnAnchorHistoryFallbackBlockedUntilByConversation.set(
+          conversationId,
+          Date.now() + TURN_ANCHOR_HISTORY_FALLBACK_COOLDOWN_MS
+        );
+      } else if (result?.ok) {
+        turnAnchorHistoryFallbackBlockedUntilByConversation.delete(conversationId);
+      }
+      if (requestToken !== turnNumberRequestToken) return;
+      if (!result?.ok || !result.index) return;
+      if (result.anchorCache) await writeTurnAnchorCacheEntry(conversationId, result.anchorCache);
+      if (conversationId !== tryExtractConversationIdFromUrl(window.location.href)) return;
+      if (!isArcaiaFeatureEnabled('messageTimestamps') || !isArcaiaFeatureEnabled('turnNumbers')) return;
+      const index = result.index;
+      messageTimeState = {
+        ...messageTimeState,
+        absoluteTurnIndexLoaded: true,
+        absoluteTurnTotalCount: Number.isInteger(Number(index.totalTurnCount)) ? Number(index.totalTurnCount) : null,
+        absoluteTurnByMessageId: index.byMessageId || {},
+        absoluteTurnByNodeId: index.byNodeId || {}
+      };
+      updateRecentViewHistoryAbsoluteCount();
+      if (applyAll) scheduleApplyAllMessageTimestamps(`absolute_turn_index:${reason}`);
+      else if (targetMessageIds.length) scheduleApplyMessageTimestampsForMessageIds(targetMessageIds, `absolute_turn_index:${reason}`);
+    } finally {
+      if (requestToken !== turnNumberRequestToken) return;
+      turnNumberRequestInFlight = false;
+      if (
+        (turnNumberPendingApplyAll || turnNumberPendingMessageIds.size)
+        && messageTimeUiStarted
+        && isArcaiaFeatureEnabled('messageTimestamps')
+        && isArcaiaFeatureEnabled('turnNumbers')
+      ) {
+        const pendingTargets = turnNumberPendingApplyAll ? [] : Array.from(turnNumberPendingMessageIds);
+        scheduleAbsoluteTurnIndex('pending_after_request', {
+          refresh: true,
+          delayMs: 0,
+          targetMessageIds: pendingTargets
+        });
+      }
+    }
+  }
+
+  function scheduleAbsoluteTurnIndex(
+    reason = 'timestamp_ready',
+    { refresh = false, cancelInFlight = false, delayMs = 2500, targetMessageIds = [] } = {}
+  ) {
+    if (Array.isArray(targetMessageIds) && targetMessageIds.length) {
+      for (const id of targetMessageIds) if (id) turnNumberPendingMessageIds.add(id);
+    } else {
+      turnNumberPendingApplyAll = true;
+    }
+    clearScheduledAbsoluteTurnIndex({ cancelMain: cancelInFlight });
+    if (!messageTimeUiStarted || !isArcaiaFeatureEnabled('messageTimestamps') || !isArcaiaFeatureEnabled('turnNumbers')) {
+      clearAbsoluteTurnPendingWork();
+      return;
+    }
+    const conversationId = tryExtractConversationIdFromUrl(window.location.href);
+    if (!conversationId) {
+      clearAbsoluteTurnPendingWork();
+      return;
+    }
+    if (turnNumberRequestInFlight) return;
+    if (!refresh && messageTimeState.absoluteTurnIndexLoaded && messageTimeState.conversationId === conversationId) {
+      clearAbsoluteTurnPendingWork();
+      return;
+    }
+    const startIdle = () => {
+      if (document.hidden) {
+        turnNumberVisibilityHandler = () => {
+          if (document.hidden) return;
+          document.removeEventListener('visibilitychange', turnNumberVisibilityHandler);
+          turnNumberVisibilityHandler = null;
+          startIdle();
+        };
+        document.addEventListener('visibilitychange', turnNumberVisibilityHandler);
+        return;
+      }
+      if (typeof requestIdleCallback === 'function') {
+        turnNumberIdleUsesTimeout = false;
+        turnNumberIdleHandle = requestIdleCallback(() => {
+          turnNumberIdleHandle = null;
+          void requestAbsoluteTurnIndexNow(reason);
+        }, { timeout: 1500 });
+      } else {
+        turnNumberIdleUsesTimeout = true;
+        turnNumberIdleHandle = setTimeout(() => {
+          turnNumberIdleHandle = null;
+          void requestAbsoluteTurnIndexNow(reason);
+        }, 0);
+      }
+    };
+    turnNumberDelayTimer = setTimeout(() => {
+      turnNumberDelayTimer = null;
+      startIdle();
+    }, Math.max(0, Number(delayMs) || 0));
   }
 
   async function tryGetAccessTokenFromSession() {
@@ -1065,8 +1267,6 @@
       hasAuthorization: Boolean(auth.authorization),
       extraHeaderKeys: Object.keys(auth.extraHeaders || {}).sort(),
       updatedAt: auth.updatedAt || null,
-      seenUrlCount: auth.seenUrlCount || 0,
-      lastSeenUrl: auth.lastSeenUrl || null,
       mainWorldDebug: auth.debug || null
     };
   }
@@ -1211,6 +1411,7 @@
   }
 
   function findLatestLeafNode(raw, reachableIds) {
+    if (raw?.current_node && raw?.mapping?.[raw.current_node]) return raw.mapping[raw.current_node];
     const leaves = getLeafNodes(raw, reachableIds).filter((node) => node?.message);
     let latest = null;
     for (const node of leaves) {
@@ -1238,12 +1439,46 @@
     return message?.metadata?.is_visually_hidden_from_conversation === true;
   }
 
+  const FILE_ATTACHMENT_PLACEHOLDER_TEXT = '[添付ファイル]';
+
+  function isFileAttachmentLikeObject(value) {
+    if (!value || typeof value !== 'object') return false;
+    const contentType = String(value.content_type || value.type || value.mime_type || '').toLowerCase();
+    const fileLikeContentType = contentType === 'file'
+      || contentType.startsWith('file_')
+      || contentType.startsWith('file-')
+      || contentType.includes('attachment')
+      || contentType.includes('document')
+      || contentType.includes('pdf')
+      || contentType.includes('spreadsheet')
+      || contentType.includes('presentation')
+      || contentType.includes('archive');
+    if (fileLikeContentType) return true;
+    if (value.file_id || value.file_name || value.filename || value.upload_id) return true;
+    if (typeof value.asset_pointer === 'string') {
+      const pointer = value.asset_pointer.toLowerCase();
+      if (pointer.startsWith('file-service://') || pointer.startsWith('sediment://')) return true;
+    }
+    if (Array.isArray(value.attachments) && value.attachments.length > 0) return true;
+    if (Array.isArray(value.files) && value.files.length > 0) return true;
+    return false;
+  }
+
+  function hasFileAttachmentLikeContent(value, depth = 0) {
+    if (!value || depth > 5) return false;
+    if (Array.isArray(value)) return value.some((item) => hasFileAttachmentLikeContent(item, depth + 1));
+    if (typeof value !== 'object') return false;
+    if (isFileAttachmentLikeObject(value)) return true;
+    return Object.values(value).some((item) => hasFileAttachmentLikeContent(item, depth + 1));
+  }
+
   function normalizePartToText(part) {
     if (typeof part === 'string') return part;
     if (!part || typeof part !== 'object') return '';
     if (part.content_type === 'text' && typeof part.text === 'string') return part.text;
     if (part.content_type === 'image_asset_pointer') return '[image_asset_pointer]';
-    if (part.asset_pointer) return `[asset_pointer: ${part.asset_pointer}]`;
+    if (hasFileAttachmentLikeContent(part)) return FILE_ATTACHMENT_PLACEHOLDER_TEXT;
+    if (part.asset_pointer) return '[asset_pointer]';
     return '';
   }
 
@@ -1374,11 +1609,6 @@
     return null;
   }
 
-  function normalizeTimestampToIso(value) {
-    const date = normalizeTimestampToDate(value);
-    return date ? date.toISOString() : null;
-  }
-
   function pickFirstValidTimestamp(candidates) {
     for (const candidate of candidates || []) {
       const date = normalizeTimestampToDate(candidate?.value ?? candidate);
@@ -1435,13 +1665,17 @@
     const texts = extractTextContents(message?.content);
     const text = texts.join('\n\n').trim();
     const nonText = detectNonTextResponse(message);
+    const hasFileAttachment = role === 'user' && hasFileAttachmentLikeContent({
+      content: message?.content || null,
+      metadata: message?.metadata || null
+    });
     const isHidden = message ? isVisuallyHiddenMessage(message) : false;
     const isTextConversationMessage = Boolean(
       message &&
       !isHidden &&
       (role === 'user' || role === 'assistant') &&
       !(role === 'assistant' && message.recipient && message.recipient !== 'all') &&
-      text
+      (text || hasFileAttachment)
     );
     const hasStrongImageSignal = nonText.type === 'image' && (nonText.imageCount > 0 || nonText.confidence === 'high');
     const isImageResponseCarrier = Boolean(
@@ -1466,7 +1700,9 @@
     }
 
     const included = isTextConversationMessage || isImageResponseCarrier;
-    const includedKind = isImageResponseCarrier ? 'image_response' : (isTextConversationMessage ? 'text' : null);
+    const includedKind = isImageResponseCarrier
+      ? 'image_response'
+      : (isTextConversationMessage ? (hasFileAttachment && !text ? 'file_attachment' : 'text') : null);
     const normalizedRole = isImageResponseCarrier ? 'assistant' : role;
     return {
       indexInPath,
@@ -1481,8 +1717,8 @@
       authorName: message?.author?.name || null,
       recipient: message?.recipient || null,
       contentType,
-      textLength: includedKind === 'image_response' ? 0 : text.length,
-      textPreview: includedKind === 'image_response' ? '[image response]' : makeTextPreview(text),
+      textLength: includedKind === 'image_response' ? 0 : (includedKind === 'file_attachment' ? FILE_ATTACHMENT_PLACEHOLDER_TEXT.length : text.length),
+      textPreview: includedKind === 'image_response' ? '[image response]' : (includedKind === 'file_attachment' ? FILE_ATTACHMENT_PLACEHOLDER_TEXT : makeTextPreview(text)),
       nonTextResponseType: nonText.type,
       hasImageLikeContent: nonText.hasImageLikeContent,
       hasVideoLikeContent: nonText.hasVideoLikeContent,
@@ -1967,7 +2203,24 @@
   }
 
   function downloadText(filename, text, mimeType = 'text/plain;charset=utf-8') {
-    downloadBlob(filename, new Blob([String(text || '')], { type: mimeType }));
+    const payload = {
+      type: 'ARCAIA_DOWNLOAD_TEXT',
+      filename: String(filename || ''),
+      text: String(text || ''),
+      mimeType: String(mimeType || 'text/plain;charset=utf-8')
+    };
+    if (!chrome?.runtime?.sendMessage) {
+      downloadBlob(payload.filename, new Blob([payload.text], { type: payload.mimeType }));
+      return;
+    }
+    try {
+      chrome.runtime.sendMessage(payload, (response) => {
+        if (!chrome.runtime.lastError && response?.ok) return;
+        downloadBlob(payload.filename, new Blob([payload.text], { type: payload.mimeType }));
+      });
+    } catch {
+      downloadBlob(payload.filename, new Blob([payload.text], { type: payload.mimeType }));
+    }
   }
 
   function buildExportPlan(messages, turns, context = {}) {
@@ -2040,7 +2293,8 @@
       const message = node?.message;
       const rawText = extractTextContents(message.content).join('\n\n').trim();
       const isImageResponse = candidate.includedKind === 'image_response';
-      const text = isImageResponse ? '' : rawText;
+      const isFileAttachment = candidate.includedKind === 'file_attachment';
+      const text = isImageResponse ? '' : (isFileAttachment ? FILE_ATTACHMENT_PLACEHOLDER_TEXT : rawText);
       messages.push({
         index: messages.length,
         id: node.id,
@@ -2051,7 +2305,7 @@
         text,
         textLength: text.length,
         textPreview: isImageResponse ? '[image response]' : makeTextPreview(text, 320),
-        nonTextResponseType: isImageResponse ? 'image' : null,
+        nonTextResponseType: isImageResponse ? 'image' : (isFileAttachment ? 'file_attachment' : null),
         hasImageLikeContent: Boolean(isImageResponse),
         hasVideoLikeContent: Boolean(isImageResponse ? false : candidate.hasVideoLikeContent),
         imageCount: candidate.imageCount || 0,
@@ -2158,706 +2412,7 @@
     };
   }
 
-  function sanitizeUrlCandidate(url) {
-    if (url == null) return null;
-    let value = String(url || '').trim();
-    if (!value) return null;
-    value = value.replace(/&amp;/g, '&');
-    value = value.replace(/[\s)\]}>.,;]+$/g, '');
-    value = value.replace(/^[({\[<]+/g, '');
-    if (!/^https?:\/\//i.test(value)) return null;
-    try {
-      const parsed = new URL(value);
-      if (!['http:', 'https:'].includes(parsed.protocol)) return null;
-      return parsed.href;
-    } catch {
-      return null;
-    }
-  }
-
-  function getUrlDomain(url) {
-    try { return new URL(url).hostname; } catch { return null; }
-  }
-
-  function extractUrlsFromString(value) {
-    const text = String(value || '');
-    const matches = [];
-    const re = /https?:\/\/[^\s"'<>`\\)\]]+/gi;
-    let match;
-    while ((match = re.exec(text))) {
-      const url = sanitizeUrlCandidate(match[0]);
-      if (url && !matches.includes(url)) matches.push(url);
-      if (matches.length >= 40) break;
-    }
-    return matches;
-  }
-
-  function makePathKind(path = '') {
-    const lower = String(path || '').toLowerCase();
-    if (/citation|citations|cite|source|sources|attribution|reference|references|webpage|web_page|search_result|searchresult/.test(lower)) return 'citation_or_source_like';
-    if (/metadata/.test(lower)) return 'metadata';
-    if (/content/.test(lower)) return 'content';
-    if (/url|href|link|uri|domain/.test(lower)) return 'url_key_like';
-    return 'generic_url_value';
-  }
-
-  function collectUrlLikeValues(value, path = '$', out = [], context = {}, depth = 0, seen = new WeakSet()) {
-    if (out.length >= 280 || depth > 9 || value == null) return out;
-    if (typeof value === 'string') {
-      const urls = extractUrlsFromString(value);
-      for (const url of urls) {
-        if (out.length >= 280) break;
-        out.push({
-          source: context.source || 'unknown',
-          messageId: context.messageId || null,
-          nodeId: context.nodeId || null,
-          role: context.role || null,
-          path,
-          pathKind: makePathKind(path),
-          key: path.split('.').pop() || null,
-          url,
-          domain: getUrlDomain(url),
-          valuePreview: makeTextPreview(value, 260)
-        });
-      }
-      return out;
-    }
-    if (typeof value !== 'object') return out;
-    if (seen.has(value)) return out;
-    seen.add(value);
-    if (Array.isArray(value)) {
-      const limit = Math.min(value.length, 100);
-      for (let i = 0; i < limit; i++) collectUrlLikeValues(value[i], `${path}[${i}]`, out, context, depth + 1, seen);
-      if (value.length > limit && out.length < 280) out.push({ source: context.source || 'unknown', messageId: context.messageId || null, nodeId: context.nodeId || null, role: context.role || null, path: `${path}[${limit}...]`, pathKind: 'truncated_array', key: null, url: null, domain: null, valuePreview: `[truncated ${value.length - limit} items]` });
-      return out;
-    }
-    const entries = Object.entries(value);
-    const limit = Math.min(entries.length, 140);
-    for (let i = 0; i < limit; i++) {
-      const [key, child] = entries[i];
-      if (key === 'html' || key === 'rawConversation') continue;
-      const childPath = path ? `${path}.${key}` : key;
-      collectUrlLikeValues(child, childPath, out, context, depth + 1, seen);
-    }
-    return out;
-  }
-
-  function collectCitationReferenceTokensFromText(text) {
-    const src = String(text || '');
-    const tokens = [];
-    const patterns = [
-      /[^]{1,240}/g,
-      /turn\d+(?:search|news|view|file|forecast|sports|finance|image|product)?\d+/gi,
-      /【\d+†[^】]{0,120}】/g
-    ];
-    for (const pattern of patterns) {
-      let match;
-      while ((match = pattern.exec(src))) {
-        const token = match[0];
-        if (!tokens.includes(token)) tokens.push(token);
-        if (tokens.length >= 40) return tokens;
-      }
-    }
-    return tokens;
-  }
-
-  function buildApiUrlMetadataDiagnostics(raw) {
-    const mapping = raw?.mapping || {};
-    const urlMatches = [];
-    const tokenMessages = [];
-    let messageCount = 0;
-    let messagesWithUrlMatches = 0;
-    for (const [nodeId, node] of Object.entries(mapping)) {
-      const message = node?.message;
-      if (!message) continue;
-      messageCount += 1;
-      const role = message?.author?.role || null;
-      const messageId = message?.id || null;
-      const before = urlMatches.length;
-      collectUrlLikeValues(message.metadata, `mapping.${nodeId}.message.metadata`, urlMatches, { source: 'api_message_metadata', messageId, nodeId, role });
-      collectUrlLikeValues(message.content, `mapping.${nodeId}.message.content`, urlMatches, { source: 'api_message_content', messageId, nodeId, role });
-      collectUrlLikeValues(message.author, `mapping.${nodeId}.message.author`, urlMatches, { source: 'api_message_author', messageId, nodeId, role });
-      if (urlMatches.length > before) messagesWithUrlMatches += 1;
-      const text = extractTextContents(message.content).join('\n\n');
-      const tokens = collectCitationReferenceTokensFromText(text);
-      if (tokens.length) {
-        tokenMessages.push({
-          nodeId,
-          messageId,
-          role,
-          tokenCount: tokens.length,
-          tokens: tokens.slice(0, 12),
-          textPreview: makeTextPreview(text, 360)
-        });
-      }
-    }
-    const topLevelMatches = [];
-    const topLevelShallow = { ...raw };
-    delete topLevelShallow.mapping;
-    collectUrlLikeValues(topLevelShallow, 'conversation', topLevelMatches, { source: 'api_conversation_top_level' });
-    const allMatches = [...urlMatches, ...topLevelMatches];
-    const byDomain = {};
-    const byPathKind = {};
-    const bySource = {};
-    for (const item of allMatches) {
-      if (item.domain) byDomain[item.domain] = (byDomain[item.domain] || 0) + 1;
-      if (item.pathKind) byPathKind[item.pathKind] = (byPathKind[item.pathKind] || 0) + 1;
-      if (item.source) bySource[item.source] = (bySource[item.source] || 0) + 1;
-    }
-    const citationLikeMatches = allMatches.filter((item) => item.pathKind === 'citation_or_source_like' || item.pathKind === 'metadata' || /citation|source|webpage|reference|attribution|search/i.test(item.path || ''));
-    return {
-      ok: true,
-      action: 'api_url_metadata_diagnostics',
-      conversationId: raw?.conversation_id || null,
-      title: raw?.title || null,
-      mappingNodeCount: Object.keys(mapping).length,
-      messageCount,
-      totalUrlMatchCount: allMatches.filter((item) => item.url).length,
-      messageUrlMatchCount: urlMatches.filter((item) => item.url).length,
-      topLevelUrlMatchCount: topLevelMatches.filter((item) => item.url).length,
-      citationLikeUrlMatchCount: citationLikeMatches.filter((item) => item.url).length,
-      messagesWithUrlMatches,
-      messagesWithReferenceTokens: tokenMessages.length,
-      byDomain,
-      byPathKind,
-      bySource,
-      citationLikeMatches: citationLikeMatches.filter((item) => item.url).slice(0, 80),
-      urlMatches: allMatches.filter((item) => item.url).slice(0, 120),
-      referenceTokenMessages: tokenMessages.slice(0, 40),
-      note: 'API JSON内のURL候補をmetadata/content等から再帰的に探索した結果です。DOM citation pillのURLと突合するため、path/source/messageIdを含めています。'
-    };
-  }
-
-  function countByValues(values) {
-    const counts = {};
-    for (const value of values || []) {
-      const key = String(value || 'unknown');
-      counts[key] = (counts[key] || 0) + 1;
-    }
-    return counts;
-  }
-
-  const PAGINATION_FALSE_POSITIVE_KEYS = new Set([
-    'previewable',
-    'preview_language',
-    'custom_symbol_offsets'
-  ]);
-
-  function isPaginationLikeKey(key) {
-    const lower = String(key || '').toLowerCase();
-    if (!lower || PAGINATION_FALSE_POSITIVE_KEYS.has(lower)) return false;
-    if (/^(cursor|limit|offset|pagination|before|after|previous|has_more|hasmore|end_cursor|start_cursor|page_token|next_page_token|previous_page_token|continuation|continuation_token)$/.test(lower)) return true;
-    return /(cursor|limit|offset|pagination|before|after|has_more|hasmore|end_cursor|start_cursor|page_token|next_page_token|previous_page_token|continuation_token)/.test(lower);
-  }
-
-  function classifyChatGPTEndpoint(pathOrUrl) {
-    let pathname = String(pathOrUrl || '');
-    try { pathname = new URL(pathOrUrl, window.location.origin).pathname; } catch {}
-    if (/\/backend-api\/conversation\/[^/?#]+$/.test(pathname)) return 'conversation_detail';
-    if (pathname === '/backend-api/conversations') return 'conversation_list';
-    if (/\/backend-api\/files\/download\//.test(pathname)) return 'file_download';
-    if (/\/backend-api\//.test(pathname)) return 'other_backend_api';
-    return 'other';
-  }
-
-  function walkForPaginationLikeKeys(value, path = '', out = [], depth = 0) {
-    if (!value || typeof value !== 'object' || depth > 6 || out.length > 180) return out;
-    if (Array.isArray(value)) {
-      for (let i = 0; i < Math.min(value.length, 10); i += 1) {
-        walkForPaginationLikeKeys(value[i], `${path}[]`, out, depth + 1);
-      }
-      return out;
-    }
-    for (const [key, child] of Object.entries(value)) {
-      const childPath = path ? `${path}.${key}` : key;
-      const lower = key.toLowerCase();
-      if (isPaginationLikeKey(key)) {
-        out.push({ path: childPath, key, valueType: child == null ? 'null' : Array.isArray(child) ? 'array' : typeof child });
-      }
-      walkForPaginationLikeKeys(child, childPath, out, depth + 1);
-    }
-    return out;
-  }
-
-  function buildHistoryProbeFromRaw(raw, context = {}) {
-    const mapping = raw?.mapping && typeof raw.mapping === 'object' ? raw.mapping : null;
-    const nodes = mapping ? Object.values(mapping) : [];
-    const messages = nodes.map((node) => node?.message).filter(Boolean);
-    const roles = messages.map((message) => message?.author?.role || 'unknown');
-    const contentTypes = messages.map((message) => message?.content?.content_type || 'unknown');
-    const statuses = messages.map((message) => message?.status || 'unknown');
-    const childCounts = nodes.map((node) => Array.isArray(node?.children) ? node.children.length : 0);
-    const leafNodeCount = childCounts.filter((count) => count === 0).length;
-    const paginationLikeKeyPaths = walkForPaginationLikeKeys(raw).slice(0, 120);
-    const approxJsonBytes = (() => {
-      try { return new TextEncoder().encode(JSON.stringify(raw)).length; } catch { return null; }
-    })();
-    const hasConversationLimitSignal = paginationLikeKeyPaths.some((item) => /limit|cursor|pagination|before|after|offset|has_more|end_cursor|start_cursor|page_token|continuation/i.test(item.key));
-
-    return {
-      ok: true,
-      appVersion: APP_VERSION,
-      probeType: 'history_fetch_probe',
-      probedAt: nowIso(),
-      note: '本文はこのprobe結果には保存しません。件数・サイズ・キー構造だけを集計します。',
-      source: 'active_internal_api_fetch',
-      conversationId: context.conversationId || raw?.conversation_id || null,
-      url: window.location.href,
-      title: raw?.title || '',
-      request: {
-        endpointPath: context.endpointPath || null,
-        endpointKind: classifyChatGPTEndpoint(context.endpointPath || ''),
-        method: 'GET',
-        queryParamKeys: [],
-        modifiedRequest: false
-      },
-      responseShape: {
-        approxJsonBytes,
-        topLevelKeys: raw && typeof raw === 'object' && !Array.isArray(raw) ? Object.keys(raw).sort().slice(0, 100) : [],
-        hasMapping: Boolean(mapping),
-        mappingNodeCount: nodes.length,
-        messageNodeCount: messages.length,
-        leafNodeCount,
-        roleCounts: countByValues(roles),
-        contentTypeCounts: countByValues(contentTypes),
-        statusCounts: countByValues(statuses),
-        hasTitle: Boolean(raw?.title),
-        hasConversationId: Boolean(raw?.conversation_id),
-        defaultModelSlug: raw?.default_model_slug || null,
-        paginationLikeKeyCount: paginationLikeKeyPaths.length,
-        paginationLikeKeyPaths
-      },
-      initialReadinessForServerSideLimitTest: {
-        hasObviousPaginationOrLimitKeys: hasConversationLimitSignal,
-        suggestedNextStep: hasConversationLimitSignal
-          ? '候補キーを精査し、別fetchでlimit/cursor系パラメータが効くか試す。'
-          : 'このレスポンス形状だけでは、サーバー側で直近N件だけ取得できる明確な手掛かりはまだありません。次は実通信ログのURL/query/body差分も確認します。'
-      },
-      authDebug: context.authDebug || null,
-      mainWorldObservedFetchProbe: context.mainWorldProbe || null
-    };
-  }
-
-
-  function summarizeConversationLikeRaw(raw) {
-    const mapping = raw?.mapping && typeof raw.mapping === 'object' ? raw.mapping : null;
-    const nodes = mapping ? Object.values(mapping) : [];
-    const messages = nodes.map((node) => node?.message).filter(Boolean);
-    const roles = messages.map((message) => message?.author?.role || 'unknown');
-    const contentTypes = messages.map((message) => message?.content?.content_type || 'unknown');
-    const statuses = messages.map((message) => message?.status || 'unknown');
-    const childCounts = nodes.map((node) => Array.isArray(node?.children) ? node.children.length : 0);
-    const paginationLikeKeyPaths = walkForPaginationLikeKeys(raw).slice(0, 80);
-    const approxJsonBytes = (() => {
-      try { return new TextEncoder().encode(JSON.stringify(raw)).length; } catch { return null; }
-    })();
-    return {
-      approxJsonBytes,
-      hasMapping: Boolean(mapping),
-      mappingNodeCount: nodes.length,
-      messageNodeCount: messages.length,
-      leafNodeCount: childCounts.filter((count) => count === 0).length,
-      roleCounts: countByValues(roles),
-      contentTypeCounts: countByValues(contentTypes),
-      statusCounts: countByValues(statuses),
-      hasTitle: Boolean(raw?.title),
-      hasConversationId: Boolean(raw?.conversation_id),
-      defaultModelSlug: raw?.default_model_slug || null,
-      currentNode: raw?.current_node || null,
-      paginationLikeKeyCount: paginationLikeKeyPaths.length,
-      paginationLikeKeyPaths
-    };
-  }
-
-  function buildConversationFetchHeaders(auth) {
-    const headers = {
-      Accept: 'application/json',
-      ...(auth?.extraHeaders || {}),
-      Authorization: auth?.authorization || ''
-    };
-    if (auth?.oaiDeviceId) headers['oai-device-id'] = auth.oaiDeviceId;
-    return headers;
-  }
-
-  function queryParamsToObject(params) {
-    const out = {};
-    for (const [key, value] of Object.entries(params || {})) {
-      if (value !== undefined && value !== null && value !== '') out[key] = String(value);
-    }
-    return out;
-  }
-
-  function buildRecentLimitCandidateParams(turnCount, messageLimit) {
-    return [
-      { name: 'limit', description: 'limit=messageLimit', params: { limit: messageLimit } },
-      { name: 'offset_limit', description: 'offset=0&limit=messageLimit', params: { offset: 0, limit: messageLimit } },
-      { name: 'message_limit', description: 'message_limit=messageLimit', params: { message_limit: messageLimit } },
-      { name: 'turn_limit', description: 'turn_limit=turnCount', params: { turn_limit: turnCount } },
-      { name: 'last_n', description: 'last_n=turnCount', params: { last_n: turnCount } }
-    ];
-  }
-
-  async function fetchConversationVariantSummary(conversationId, params, auth) {
-    const queryParams = queryParamsToObject(params);
-    const url = new URL(`/backend-api/conversation/${conversationId}`, window.location.origin);
-    for (const [key, value] of Object.entries(queryParams)) url.searchParams.set(key, value);
-    const startedAt = performance.now();
-    const response = await fetch(`${url.pathname}${url.search}`, {
-      method: 'GET',
-      credentials: 'include',
-      headers: buildConversationFetchHeaders(auth)
-    });
-    const elapsedMs = Math.round(performance.now() - startedAt);
-    const contentType = response.headers.get('content-type') || '';
-    let parsedJson = false;
-    let shape = null;
-    let approxTextBytes = null;
-    let errorPreview = null;
-    try {
-      if (contentType.includes('application/json')) {
-        const body = await response.json();
-        parsedJson = true;
-        shape = summarizeConversationLikeRaw(body);
-      } else {
-        const text = await response.text();
-        approxTextBytes = new TextEncoder().encode(text).length;
-        errorPreview = text.slice(0, 500);
-        try {
-          const body = JSON.parse(text);
-          parsedJson = true;
-          shape = summarizeConversationLikeRaw(body);
-        } catch {}
-      }
-    } catch (error) {
-      errorPreview = error instanceof Error ? error.message : String(error);
-    }
-    return {
-      ok: response.ok,
-      status: response.status,
-      statusText: response.statusText,
-      elapsedMs,
-      endpointPath: url.pathname,
-      endpointKind: classifyChatGPTEndpoint(url.pathname),
-      queryParamKeys: Object.keys(queryParams).sort(),
-      queryParams,
-      modifiedRequest: Object.keys(queryParams).length > 0,
-      contentType,
-      parsedJson,
-      approxTextBytes,
-      shape,
-      errorPreview
-    };
-  }
-
-  function compareVariantToBaseline(variant, baseline) {
-    const baseShape = baseline?.shape || {};
-    const shape = variant?.shape || {};
-    const bytesRatio = baseShape.approxJsonBytes && shape.approxJsonBytes ? shape.approxJsonBytes / baseShape.approxJsonBytes : null;
-    const mappingRatio = baseShape.mappingNodeCount && shape.mappingNodeCount ? shape.mappingNodeCount / baseShape.mappingNodeCount : null;
-    const messageRatio = baseShape.messageNodeCount && shape.messageNodeCount ? shape.messageNodeCount / baseShape.messageNodeCount : null;
-    const mappingReduced = Number.isFinite(mappingRatio) ? mappingRatio < 0.8 : false;
-    const bytesReduced = Number.isFinite(bytesRatio) ? bytesRatio < 0.8 : false;
-    const messageReduced = Number.isFinite(messageRatio) ? messageRatio < 0.8 : false;
-    return {
-      bytesRatio: bytesRatio == null ? null : Number(bytesRatio.toFixed(4)),
-      mappingRatio: mappingRatio == null ? null : Number(mappingRatio.toFixed(4)),
-      messageRatio: messageRatio == null ? null : Number(messageRatio.toFixed(4)),
-      mappingReduced,
-      bytesReduced,
-      messageReduced,
-      looksEffective: Boolean(variant?.ok && variant?.parsedJson && (mappingReduced || messageReduced) && bytesReduced)
-    };
-  }
-
-  async function runRecentLimitFetchTest(message = {}) {
-    const conversationId = extractConversationIdFromMessageOrUrl(message);
-    const turnCountRaw = Number(message.turnCount || 3);
-    const turnCount = Math.max(1, Math.min(20, Number.isFinite(turnCountRaw) ? Math.floor(turnCountRaw) : 3));
-    const messageLimit = turnCount * 2;
-    const auth = await getAuthForInternalApi();
-
-    const baseline = await fetchConversationVariantSummary(conversationId, {}, auth);
-    const candidates = [];
-    for (const candidate of buildRecentLimitCandidateParams(turnCount, messageLimit)) {
-      const result = await fetchConversationVariantSummary(conversationId, candidate.params, auth);
-      candidates.push({
-        name: candidate.name,
-        description: candidate.description,
-        request: {
-          endpointPath: result.endpointPath,
-          endpointKind: result.endpointKind,
-          method: 'GET',
-          queryParamKeys: result.queryParamKeys,
-          queryParams: result.queryParams,
-          modifiedRequest: result.modifiedRequest
-        },
-        response: {
-          ok: result.ok,
-          status: result.status,
-          statusText: result.statusText,
-          elapsedMs: result.elapsedMs,
-          contentType: result.contentType,
-          parsedJson: result.parsedJson,
-          approxTextBytes: result.approxTextBytes,
-          errorPreview: result.errorPreview
-        },
-        shape: result.shape,
-        comparisonToBaseline: compareVariantToBaseline(result, baseline)
-      });
-    }
-    const effectiveCandidates = candidates.filter((candidate) => candidate.comparisonToBaseline?.looksEffective);
-    const bestCandidate = effectiveCandidates.length ? effectiveCandidates[0] : null;
-
-    return {
-      ok: true,
-      appVersion: APP_VERSION,
-      probeType: 'recent_limit_fetch_test',
-      testedAt: nowIso(),
-      note: '実ページの通信は改変していません。候補queryを付けた別fetchで、サーバー側の直近N件取得が可能かを比較します。本文はこの結果には保存しません。',
-      conversationId,
-      url: window.location.href,
-      title: baseline?.shape?.hasTitle ? null : document.title,
-      requestedTurnCount: turnCount,
-      requestedMessageLimit: messageLimit,
-      baseline: {
-        request: {
-          endpointPath: baseline.endpointPath,
-          endpointKind: baseline.endpointKind,
-          method: 'GET',
-          queryParamKeys: baseline.queryParamKeys,
-          modifiedRequest: baseline.modifiedRequest
-        },
-        response: {
-          ok: baseline.ok,
-          status: baseline.status,
-          statusText: baseline.statusText,
-          elapsedMs: baseline.elapsedMs,
-          contentType: baseline.contentType,
-          parsedJson: baseline.parsedJson,
-          approxTextBytes: baseline.approxTextBytes,
-          errorPreview: baseline.errorPreview
-        },
-        shape: baseline.shape
-      },
-      candidates,
-      conclusion: {
-        serverSideLimitLikely: effectiveCandidates.length > 0,
-        bestCandidate: bestCandidate ? {
-          name: bestCandidate.name,
-          queryParams: bestCandidate.request.queryParams,
-          comparisonToBaseline: bestCandidate.comparisonToBaseline
-        } : null,
-        explanation: effectiveCandidates.length > 0
-          ? '少なくとも1つの候補でmapping/message/bytesが大きく減っています。サーバー側取得制限として使える可能性があります。'
-          : '今回の候補queryでは、会話本文レスポンスのmapping/message/bytesは有意に減りませんでした。サーバー側の直近N件取得は難しい可能性が高いです。'
-      },
-      authDebug: auth.debug
-    };
-  }
-
-
-  function estimateJsonBytes(value) {
-    try { return new TextEncoder().encode(JSON.stringify(value)).length; } catch { return null; }
-  }
-
-  function cloneJsonLike(value) {
-    try { return JSON.parse(JSON.stringify(value)); } catch { return value; }
-  }
-
-  function summarizeMappingObject(mapping) {
-    const nodes = Object.values(mapping || {});
-    const messages = nodes.map((node) => node?.message).filter(Boolean);
-    const roles = messages.map((message) => message?.author?.role || 'unknown');
-    const contentTypes = messages.map((message) => message?.content?.content_type || 'unknown');
-    const statuses = messages.map((message) => message?.status || 'unknown');
-    const childCounts = nodes.map((node) => Array.isArray(node?.children) ? node.children.length : 0);
-    return {
-      mappingNodeCount: nodes.length,
-      messageNodeCount: messages.length,
-      leafNodeCount: childCounts.filter((count) => count === 0).length,
-      roleCounts: countByValues(roles),
-      contentTypeCounts: countByValues(contentTypes),
-      statusCounts: countByValues(statuses)
-    };
-  }
-
-  function buildReparentedLiteRawForEstimate(raw, selectedNodeIds) {
-    const originalMapping = raw?.mapping || {};
-    const root = findRootNode(raw);
-    const selected = Array.from(new Set(selectedNodeIds || [])).filter((id) => id && originalMapping[id]);
-    const liteMapping = {};
-    const chain = [];
-
-    if (root?.id && originalMapping[root.id]) {
-      const rootClone = cloneJsonLike(originalMapping[root.id]);
-      rootClone.parent = null;
-      rootClone.children = [];
-      liteMapping[root.id] = rootClone;
-      chain.push(root.id);
-    }
-
-    for (const id of selected) {
-      if (chain.includes(id)) continue;
-      const clone = cloneJsonLike(originalMapping[id]);
-      clone.children = [];
-      liteMapping[id] = clone;
-      chain.push(id);
-    }
-
-    for (let i = 0; i < chain.length; i += 1) {
-      const id = chain[i];
-      const prev = chain[i - 1] || null;
-      const next = chain[i + 1] || null;
-      if (!liteMapping[id]) continue;
-      liteMapping[id].parent = prev;
-      liteMapping[id].children = next ? [next] : [];
-    }
-
-    const liteRaw = cloneJsonLike(raw || {});
-    liteRaw.mapping = liteMapping;
-    liteRaw.current_node = chain.length ? chain[chain.length - 1] : raw?.current_node || null;
-    return { liteRaw, chain, rootNodeId: root?.id || null };
-  }
-
-  function buildLiteDisplayDryRunModel(raw, normalized, requestedTurnCount) {
-    const baselineShape = summarizeConversationLikeRaw(raw);
-    const allTurns = Array.isArray(normalized?.turns) ? normalized.turns : [];
-    const totalTurnCount = allTurns.length;
-    const safeTurnCount = Math.max(1, Math.min(50, Number.isFinite(Number(requestedTurnCount)) ? Math.floor(Number(requestedTurnCount)) : 3));
-    const retainedTurns = allTurns.slice(Math.max(0, totalTurnCount - safeTurnCount));
-    const selectedMessageNodeIds = [];
-    for (const turn of retainedTurns) {
-      for (const msg of turn.messages || []) {
-        if (msg?.id) selectedMessageNodeIds.push(msg.id);
-      }
-    }
-
-    const selectedSet = new Set(selectedMessageNodeIds);
-    const latestPathNodeIds = normalized?.debug?.branch?.selectedPathNodeIds || [];
-    const orderedSelectedNodeIds = latestPathNodeIds.filter((id) => selectedSet.has(id));
-    for (const id of selectedMessageNodeIds) {
-      if (!orderedSelectedNodeIds.includes(id)) orderedSelectedNodeIds.push(id);
-    }
-
-    const { liteRaw, chain, rootNodeId } = buildReparentedLiteRawForEstimate(raw, orderedSelectedNodeIds);
-    const liteShapeBase = summarizeConversationLikeRaw(liteRaw);
-    const liteMappingStats = summarizeMappingObject(liteRaw.mapping || {});
-    const liteApproxJsonBytes = estimateJsonBytes(liteRaw);
-    const baselineBytes = baselineShape.approxJsonBytes || null;
-    const bytesRatio = baselineBytes && liteApproxJsonBytes ? liteApproxJsonBytes / baselineBytes : null;
-    const mappingRatio = baselineShape.mappingNodeCount && liteShapeBase.mappingNodeCount ? liteShapeBase.mappingNodeCount / baselineShape.mappingNodeCount : null;
-    const messageRatio = baselineShape.messageNodeCount && liteShapeBase.messageNodeCount ? liteShapeBase.messageNodeCount / baselineShape.messageNodeCount : null;
-
-    const retainedTurnSummaries = retainedTurns.map((turn) => ({
-      turnIndex: turn.turnIndex,
-      turnNumber: turn.turnIndex + 1,
-      messageCount: Array.isArray(turn.messages) ? turn.messages.length : 0,
-      userMessageCount: turn.userMessageCount || 0,
-      assistantMessageCount: turn.assistantMessageCount || 0,
-      imageLikeMessageCount: (turn.messages || []).filter((msg) => msg.hasImageLikeContent || msg.nonTextResponseType === 'image').length,
-      warningFlags: turn.warningFlags || [],
-      messageNodeIds: (turn.messages || []).map((msg) => msg.id).filter(Boolean)
-    }));
-
-    const reduction = {
-      approxJsonBytesBefore: baselineShape.approxJsonBytes,
-      approxJsonBytesAfter: liteApproxJsonBytes,
-      approxJsonBytesRemoved: baselineShape.approxJsonBytes != null && liteApproxJsonBytes != null ? baselineShape.approxJsonBytes - liteApproxJsonBytes : null,
-      bytesRatio: bytesRatio == null ? null : Number(bytesRatio.toFixed(4)),
-      bytesReductionPct: bytesRatio == null ? null : Number(((1 - bytesRatio) * 100).toFixed(2)),
-      mappingNodeCountBefore: baselineShape.mappingNodeCount,
-      mappingNodeCountAfter: liteShapeBase.mappingNodeCount,
-      mappingNodeCountRemoved: baselineShape.mappingNodeCount - liteShapeBase.mappingNodeCount,
-      mappingRatio: mappingRatio == null ? null : Number(mappingRatio.toFixed(4)),
-      messageNodeCountBefore: baselineShape.messageNodeCount,
-      messageNodeCountAfter: liteShapeBase.messageNodeCount,
-      messageNodeCountRemoved: baselineShape.messageNodeCount - liteShapeBase.messageNodeCount,
-      messageRatio: messageRatio == null ? null : Number(messageRatio.toFixed(4))
-    };
-
-    const maybeUseful = Boolean(
-      retainedTurns.length > 0 &&
-      Number.isFinite(reduction.bytesReductionPct) &&
-      reduction.bytesReductionPct >= 50 &&
-      liteShapeBase.messageNodeCount > 0
-    );
-
-    return {
-      strategy: 'reparent_latest_path_recent_turns_dry_run',
-      requestedTurnCount: safeTurnCount,
-      totalTurnCount,
-      retainedTurnCount: retainedTurns.length,
-      retainedTurnRange: retainedTurns.length ? {
-        firstTurnNumber: retainedTurns[0].turnIndex + 1,
-        lastTurnNumber: retainedTurns[retainedTurns.length - 1].turnIndex + 1,
-        totalTurnCount
-      } : null,
-      rootNodeId,
-      originalCurrentNode: raw?.current_node || null,
-      simulatedCurrentNode: liteRaw.current_node || null,
-      selectedMessageNodeCount: selectedMessageNodeIds.length,
-      selectedMappingNodeCount: orderedSelectedNodeIds.length,
-      simulatedChainNodeCount: chain.length,
-      retainedTurnSummaries,
-      baselineShape,
-      liteShape: {
-        ...liteShapeBase,
-        approxJsonBytes: liteApproxJsonBytes,
-        mappingStats: liteMappingStats
-      },
-      reduction,
-      experimentalReadiness: {
-        maybeUseful,
-        safeToAutoEnable: false,
-        reason: maybeUseful
-          ? 'Dry Run上は大きな削減が見込めます。新規DOM blockは公式timestamp未取得を前提にdom_first_observed_atを表示し、候補日時の羅列UIは削除しています。'
-          : 'Dry Run上の削減率または保持メッセージ数が不十分です。実ページ改変へ進む前に結果を確認してください。'
-      },
-      warnings: [
-        'dry_run_only_no_page_modification',
-        'simulated_mapping_is_reparented_and_may_not_match_chatgpt_internal_expectations',
-        'response_body_is_not_included_in_this_report'
-      ]
-    };
-  }
-
-  async function runLiteDisplayDryRun(message = {}) {
-    const conversationId = extractConversationIdFromMessageOrUrl(message);
-    const turnCountRaw = Number(message.turnCount || 3);
-    const turnCount = Math.max(1, Math.min(50, Number.isFinite(turnCountRaw) ? Math.floor(turnCountRaw) : 3));
-    const { raw, authDebug } = await fetchChatGPTConversationRaw(conversationId);
-    const normalized = normalizeMessagesWithDebug(raw);
-    const dryRun = buildLiteDisplayDryRunModel(raw, normalized, turnCount);
-    return {
-      ok: true,
-      appVersion: APP_VERSION,
-      probeType: 'lite_display_dry_run',
-      testedAt: nowIso(),
-      note: '実ページの通信・表示は改変していません。現在の会話JSONを直近N turnだけに削る場合の推定サイズ/件数を計算します。本文はこの結果には保存しません。',
-      conversationId,
-      url: window.location.href,
-      title: raw?.title || document.title || null,
-      requestedTurnCount: turnCount,
-      normalizedPath: {
-        selectedPathLength: normalized?.debug?.branch?.selectedPathLength || 0,
-        includedMessageCount: normalized?.messages?.length || 0,
-        turnCount: normalized?.turns?.length || 0,
-        latestLeafNodeId: normalized?.debug?.branch?.latestLeafNodeId || null
-      },
-      dryRun,
-      conclusion: {
-        clientSideLiteModeWorthTrying: Boolean(dryRun.experimentalReadiness?.maybeUseful),
-        serverSideLimitStillNotProven: true,
-        recommendedNextStep: dryRun.experimentalReadiness?.maybeUseful
-          ? '通常ページのBackend JSON rewriteはデフォルトONです。rewrite有効時はスクロール安定化のためDOM pruneとinterval集計を抑制します。新規DOM blockは公式timestamp未取得を前提にdom_first_observed_atを表示します。全履歴が必要な場合はfullLoadOnceで次のconversation responseをそのまま通します。'
-          : 'Dry Run結果の削減率を確認し、効果が薄い場合はRecent View改変を見送ります。'
-      },
-      authDebug
-    };
-  }
-
-
-  async function runLiteDisplayEnable(message = {}) {
+  async function syncLiteDisplayForStartup(message = {}) {
     const conversationId = extractConversationIdFromMessageOrUrl(message);
     const turnCount = normalizeLiteTurnCount(message?.turnCount ?? getConfiguredLiteTurnCount());
     liteTurnCount = turnCount;
@@ -2866,34 +2421,25 @@
       enabled: true,
       conversationId,
       turnCount,
-      replaceExisting: true,
-      resetStorageBeforeSet: true,
       liteShowImages: liteShowImagesEnabled,
-      requestedBy: message?.requestedBy || 'popup_lite_on',
-      commandId: message?.commandId || null
+      toolHistoryCompaction: Boolean(isArcaiaNormalMode() && featureSettings.toolHistoryCompaction),
+      requestedBy: message?.requestedBy || 'feature_settings_startup',
+      commandId: message?.commandId || null,
+      configSource: 'feature_settings_startup_merge'
     };
     const result = await setMainWorldLiteDisplayConfig(payload, 3000);
     const lite = result?.liteDisplay || result?.mainWorldHook?.liteDisplay || result || null;
     if (!lite) {
       throw new Error('Recent View Experimentalのmain-world hookが応答しませんでした。拡張更新後にChatGPTページを再読み込みしてから再実行してください。');
     }
-    return {
-      ok: true,
-      appVersion: APP_VERSION,
-      action: 'lite_display_experimental_enable',
-      appliedAt: nowIso(),
-      note: '新規DOM blockは公式timestamp未取得を前提にdom_first_observed_atを表示します。',
-      frame: { isTopFrame: window.top === window, href: window.location.href },
-      conversationId,
-      requestedTurnCount: turnCount,
-      liteDisplay: lite
-    };
+    return lite;
   }
 
   async function runLiteDisplayDisable(message = {}) {
     const payload = {
       enabled: false,
       userDisabled: true,
+      toolHistoryCompaction: Boolean(isArcaiaNormalMode() && featureSettings.toolHistoryCompaction),
       replaceExisting: true,
       resetStorageBeforeSet: true,
       requestedBy: message?.requestedBy || 'popup_lite_off',
@@ -2987,10 +2533,22 @@
   let messageTimeUiStarted = false;
   let messageTimeApplyQueued = false;
   let messageTimePendingApplyReason = null;
+  let messageTimePendingFullApply = false;
+  const messageTimePendingRoleNodes = new Set();
   let messageTimeRefreshQueued = false;
   let messageTimeRefreshInFlight = false;
   let messageTimePendingRefreshReason = null;
+  let messageTimePendingRefreshApplyAll = false;
+  const messageTimePendingRefreshMessageIds = new Set();
   let messageTimeDomKeyCounter = 0;
+  let turnNumberDelayTimer = null;
+  let turnNumberIdleHandle = null;
+  let turnNumberIdleUsesTimeout = false;
+  let turnNumberVisibilityHandler = null;
+  let turnNumberRequestInFlight = false;
+  let turnNumberRequestToken = 0;
+  const turnNumberPendingMessageIds = new Set();
+  let turnNumberPendingApplyAll = false;
   let messageTimeState = {
     appVersion: APP_VERSION,
     enabled: true,
@@ -3003,6 +2561,10 @@
     lastApplyAt: null,
     lastApplyAtIso: null,
     indexedMessageCount: 0,
+    absoluteTurnIndexLoaded: false,
+    absoluteTurnTotalCount: null,
+    absoluteTurnByMessageId: {},
+    absoluteTurnByNodeId: {},
     appliedBadgeCount: 0,
     missingIdCount: 0,
     missingTimestampCount: 0,
@@ -3022,6 +2584,8 @@
   };
 
   function resetMessageTimeStateForConversation(conversationId = null) {
+    clearScheduledAbsoluteTurnIndex();
+    clearAbsoluteTurnPendingWork();
     for (const badge of document.querySelectorAll(`[${MESSAGE_TIME_BADGE_ATTR}="true"]`)) {
       try { badge.remove(); } catch {}
     }
@@ -3047,6 +2611,10 @@
       lastApplyAt: null,
       lastApplyAtIso: null,
       indexedMessageCount: 0,
+      absoluteTurnIndexLoaded: false,
+      absoluteTurnTotalCount: null,
+      absoluteTurnByMessageId: {},
+      absoluteTurnByNodeId: {},
       appliedBadgeCount: 0,
       missingIdCount: 0,
       missingTimestampCount: 0,
@@ -3102,87 +2670,6 @@
       kind: item.kind || (item.role === 'user' ? 'sent' : 'received')
     };
   }
-  function pickMessageDisplayTimestamp(message, role) {
-    const create = getMessageCreateTimestampCandidate(message);
-    const update = getMessageUpdateTimestampCandidate(message);
-    const metadata = message?.metadata || {};
-    const finish = pickFirstValidTimestamp([
-      { source: 'metadata.finished_at', value: metadata.finished_at },
-      { source: 'metadata.finish_time', value: metadata.finish_time },
-      { source: 'metadata.completed_at', value: metadata.completed_at },
-      { source: 'metadata.complete_time', value: metadata.complete_time },
-      { source: 'metadata.end_time', value: metadata.end_time },
-      { source: 'message.end_time', value: message?.end_time }
-    ]);
-    if (role === 'assistant') {
-      if (finish.iso) return { ...finish, kind: 'received_or_completed' };
-      if (update.iso) return { ...update, kind: 'updated' };
-      if (create.iso) return { ...create, kind: 'created' };
-    }
-    if (create.iso) return { ...create, kind: role === 'user' ? 'sent' : 'created' };
-    if (update.iso) return { ...update, kind: 'updated' };
-    if (finish.iso) return { ...finish, kind: 'received_or_completed' };
-    return { value: null, iso: null, source: null, kind: null };
-  }
-
-  function buildMessageTimestampIndex(raw) {
-    const byMessageId = {};
-    const byNodeId = {};
-    const roleOrder = [];
-    const normalized = normalizeMessagesWithDebug(raw);
-    const messages = Array.isArray(normalized?.messages) ? normalized.messages : [];
-    for (const msg of messages) {
-      const id = msg.message_id || msg.id;
-      if (!id) continue;
-      const iso = msg.role === 'assistant' ? (msg.update_time_iso || msg.create_time_iso) : (msg.create_time_iso || msg.update_time_iso);
-      const source = msg.role === 'assistant' ? (msg.update_time_source || msg.create_time_source) : (msg.create_time_source || msg.update_time_source);
-      const parts = formatJstDateTimeParts(iso);
-      const item = {
-        messageId: id,
-        id: msg.id || null,
-        role: msg.role,
-        iso: iso || null,
-        source: source || null,
-        kind: msg.role === 'user' ? 'sent' : 'received',
-        displayTime: parts?.compact || parts?.time || null,
-        displayDate: parts?.date || null,
-        fullDisplay: parts?.full || null,
-        textPreview: msg.textPreview || null
-      };
-      byMessageId[id] = item;
-      byNodeId[msg.id || id] = item;
-      roleOrder.push(item);
-    }
-
-    // normalizeMessagesWithDebug deliberately filters some internal messages. Add a raw mapping pass so DOM IDs can still resolve.
-    const mapping = raw?.mapping || {};
-    for (const [nodeId, node] of Object.entries(mapping)) {
-      const message = node?.message;
-      if (!message) continue;
-      const role = message?.author?.role || null;
-      if (role !== 'user' && role !== 'assistant') continue;
-      const id = message.id || nodeId;
-      if (byMessageId[id] || byNodeId[nodeId]) continue;
-      const picked = pickMessageDisplayTimestamp(message, role);
-      const parts = formatJstDateTimeParts(picked.iso);
-      const item = {
-        messageId: id,
-        id: nodeId,
-        role,
-        iso: picked.iso,
-        source: picked.source,
-        kind: role === 'user' ? 'sent' : 'received',
-        displayTime: parts?.compact || parts?.time || null,
-        displayDate: parts?.date || null,
-        fullDisplay: parts?.full || null,
-        textPreview: makeTextPreview(extractTextContents(message.content).join('\n\n'), 220)
-      };
-      byMessageId[id] = item;
-      byNodeId[nodeId] = item;
-    }
-    return { byMessageId, byNodeId, roleOrder };
-  }
-
   function getMessageIdFromRoleElement(roleEl) {
     if (!roleEl) return null;
     return roleEl.getAttribute?.('data-message-id')
@@ -3284,8 +2771,10 @@
   }
 
 
-  async function refreshMessageTimestampIndex(reason = 'manual') {
+  async function refreshMessageTimestampIndex(reason = 'manual', options = {}) {
     const conversationId = tryExtractConversationIdFromUrl(window.location.href);
+    const applyAll = Boolean(options?.applyAll);
+    const targetMessageIds = Array.from(new Set(Array.isArray(options?.targetMessageIds) ? options.targetMessageIds.filter(Boolean) : []));
     messageTimeState = {
       ...messageTimeState,
       enabled: true,
@@ -3315,7 +2804,7 @@
           byNodeId: {},
           roleOrder: []
         };
-        scheduleApplyMessageTimestamps(`index_unavailable:${reason}`);
+        if (applyAll) scheduleApplyAllMessageTimestamps(`index_unavailable:${reason}`);
         return messageTimeState;
       }
       messageTimeState = {
@@ -3334,7 +2823,11 @@
         roleOrder: Array.isArray(index.roleOrder) ? index.roleOrder : [],
         source: index.source || 'main_world_existing_conversation_fetch'
       };
-      scheduleApplyMessageTimestamps(`index_refreshed:${reason}`);
+      if (applyAll) {
+        scheduleApplyAllMessageTimestamps(`index_refreshed:${reason}`);
+      } else if (targetMessageIds.length) {
+        scheduleApplyMessageTimestampsForMessageIds(targetMessageIds, `index_refreshed:${reason}`);
+      }
       return messageTimeState;
     } catch (error) {
       messageTimeState = {
@@ -3344,7 +2837,7 @@
         disabledReason: 'message_timestamp_index_refresh_failed',
         lastError: error instanceof Error ? error.message : String(error)
       };
-      scheduleApplyMessageTimestamps(`index_refresh_failed:${reason}`);
+      if (applyAll) scheduleApplyAllMessageTimestamps(`index_refresh_failed:${reason}`);
       return messageTimeState;
     }
   }
@@ -3401,12 +2894,19 @@
     if (wasProvisional && !isProvisional) {
       messageTimeState.replacedProvisionalCount = Number(messageTimeState.replacedProvisionalCount || 0) + 1;
     }
-    const label = displayItem.displayTime;
-    badge.textContent = label;
-    badge.title = `${displayItem.fullDisplay || displayItem.iso || label}\nsource: ${displayItem.source || 'unknown'}\nmatch: ${info.match}${info.id ? `\nmessage_id: ${info.id}` : ''}${info.domKey ? `\ndom_key: ${info.domKey}` : ''}${isProvisional ? '\nprovisional: true' : ''}`;
+    const timeLabel = displayItem.displayTime;
+    const absoluteTurnNumber = isArcaiaFeatureEnabled('turnNumbers') && info.id
+      ? Number(messageTimeState.absoluteTurnByMessageId?.[info.id] || messageTimeState.absoluteTurnByNodeId?.[info.id] || 0)
+      : 0;
+    const hasTurnNumber = Number.isInteger(absoluteTurnNumber) && absoluteTurnNumber > 0;
+    badge.textContent = hasTurnNumber ? `Turn ${absoluteTurnNumber} · ${timeLabel}` : timeLabel;
+    badge.title = `${displayItem.fullDisplay || displayItem.iso || timeLabel}${hasTurnNumber ? `\nTurn ${absoluteTurnNumber}` : ''}\nsource: ${displayItem.source || 'unknown'}\nmatch: ${info.match}${info.id ? `\nmessage_id: ${info.id}` : ''}${info.domKey ? `\ndom_key: ${info.domKey}` : ''}${isProvisional ? '\nprovisional: true' : ''}`;
     badge.dataset.arcaiaMessageId = info.id || info.domKey || displayItem.messageId || '';
     badge.dataset.arcaiaTimestampIso = displayItem.iso || '';
     badge.dataset.arcaiaTimestampSource = displayItem.source || '';
+    if (hasTurnNumber) badge.dataset.arcaiaTurnNumber = String(absoluteTurnNumber);
+    else delete badge.dataset.arcaiaTurnNumber;
+    delete badge.dataset.arcaiaTotalTurnCount;
     badge.setAttribute(MESSAGE_TIME_PROVISIONAL_ATTR, isProvisional ? 'true' : 'false');
     badge.classList?.toggle('arcaia-message-time-provisional', isProvisional);
     container.removeAttribute?.('data-arcaia-message-time-skip-reason');
@@ -3414,24 +2914,27 @@
     return true;
   }
 
-  function shouldDeferAssistantTimestampForGeneration(roleEl, role, latestAssistantRoleEl, generationDetector) {
+  function shouldDeferAssistantTimestampForGeneration(roleEl, role, latestAssistantRoleEl, generationDetector, targetedApply = false) {
     return role === 'assistant'
       && Boolean(generationDetector?.generating)
-      && Boolean(latestAssistantRoleEl)
-      && roleEl === latestAssistantRoleEl;
+      && (targetedApply || (Boolean(latestAssistantRoleEl) && roleEl === latestAssistantRoleEl));
   }
 
-  async function applyMessageTimestampBadges(reason = 'manual') {
+  async function applyMessageTimestampBadges(reason = 'manual', targetRoleNodes = null) {
     const startedAt = Date.now();
-    const roleNodes = getRoleNodesForTimestampBadges();
+    const targetedApply = Array.isArray(targetRoleNodes);
+    const roleNodes = targetedApply
+      ? Array.from(new Set(targetRoleNodes)).filter((el) => el?.isConnected && !el.closest?.(`#${LITE_BAR_ID}`))
+      : getRoleNodesForTimestampBadges();
     const initialDomAwaitingAuthoritativeIndex = isMessageTimeAwaitingAuthoritativeIndex();
     // Do not mark newly added live DOM during apply. Initial-history protection is limited
     // to explicit startup / conversation-change snapshots so new chats can receive provisional timestamps.
     const initialDomMarkedThisApply = 0;
     const generationDetector = isLikelyChatGPTGenerating();
-    const latestUserIndex = roleNodes.reduce((latest, el, index) => el?.getAttribute?.('data-message-author-role') === 'user' ? index : latest, -1);
-    const latestAssistantIndex = roleNodes.reduce((latest, el, index) => el?.getAttribute?.('data-message-author-role') === 'assistant' ? index : latest, -1);
-    const latestAssistantRoleEl = generationDetector.generating && latestAssistantIndex > latestUserIndex
+    const allRoleNodes = targetedApply ? [] : roleNodes;
+    const latestUserIndex = allRoleNodes.reduce((latest, el, index) => el?.getAttribute?.('data-message-author-role') === 'user' ? index : latest, -1);
+    const latestAssistantIndex = allRoleNodes.reduce((latest, el, index) => el?.getAttribute?.('data-message-author-role') === 'assistant' ? index : latest, -1);
+    const latestAssistantRoleEl = !targetedApply && generationDetector.generating && latestAssistantIndex > latestUserIndex
       ? roleNodes[latestAssistantIndex] || null
       : null;
     const roleOrdinal = { user: 0, assistant: 0 };
@@ -3441,17 +2944,21 @@
     let missingIdCount = 0;
     let missingTimestampCount = 0;
     let skippedInitialExistingCount = 0;
+    const timestampEntries = [];
     for (const roleEl of roleNodes) {
       const role = roleEl.getAttribute?.('data-message-author-role');
       if (role !== 'user' && role !== 'assistant') continue;
       const ordinal = roleOrdinal[role] || 0;
       roleOrdinal[role] = ordinal + 1;
-      if (shouldDeferAssistantTimestampForGeneration(roleEl, role, latestAssistantRoleEl, generationDetector)) {
+      if (shouldDeferAssistantTimestampForGeneration(roleEl, role, latestAssistantRoleEl, generationDetector, targetedApply)) {
         deferredAssistantCount += 1;
         if (removeMessageTimeBadge(roleEl, 'assistant_generating_pending_completion')) removedDeferredAssistantBadgeCount += 1;
         continue;
       }
       const info = findTimestampInfoForRoleNode(roleEl, role, ordinal);
+      timestampEntries.push({ roleEl, role, info });
+    }
+    for (const { roleEl, role, info } of timestampEntries) {
       const displayItem = normalizeTimestampIndexItemForDisplay(info.item);
       if (!info.id) missingIdCount += 1;
       if (!displayItem?.displayTime) missingTimestampCount += 1;
@@ -3484,19 +2991,64 @@
     return messageTimeState;
   }
 
-  function scheduleApplyMessageTimestamps(reason = 'mutation') {
+  function flushMessageTimestampApply() {
+    messageTimeApplyQueued = false;
+    if (!messageTimeUiStarted || !isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('messageTimestamps')) return;
+    const applyReason = messageTimePendingApplyReason || 'mutation';
+    const applyAll = messageTimePendingFullApply;
+    const targetRoleNodes = applyAll ? null : Array.from(messageTimePendingRoleNodes);
+    messageTimePendingApplyReason = null;
+    messageTimePendingFullApply = false;
+    messageTimePendingRoleNodes.clear();
+    if (!applyAll && !targetRoleNodes.length) return;
+    applyMessageTimestampBadges(applyReason, targetRoleNodes).catch(() => {});
+  }
+
+  function scheduleApplyAllMessageTimestamps(reason = 'full_apply') {
     if (!isArcaiaExtensionEnabled() || !messageTimeUiStarted || !isArcaiaFeatureEnabled('messageTimestamps')) return messageTimeState;
-    messageTimePendingApplyReason = String(reason || 'mutation');
+    messageTimePendingApplyReason = String(reason || 'full_apply');
+    messageTimePendingFullApply = true;
+    messageTimePendingRoleNodes.clear();
     if (messageTimeApplyQueued) return messageTimeState;
     messageTimeApplyQueued = true;
-    queueMicrotask(() => {
-      messageTimeApplyQueued = false;
-      if (!messageTimeUiStarted || !isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('messageTimestamps')) return;
-      const applyReason = messageTimePendingApplyReason || reason;
-      messageTimePendingApplyReason = null;
-      applyMessageTimestampBadges(applyReason).catch(() => {});
-    });
+    queueMicrotask(flushMessageTimestampApply);
     return messageTimeState;
+  }
+
+  function scheduleApplyMessageTimestampsForNodes(roleNodes, reason = 'targeted_mutation') {
+    if (!isArcaiaExtensionEnabled() || !messageTimeUiStarted || !isArcaiaFeatureEnabled('messageTimestamps')) return messageTimeState;
+    for (const roleEl of roleNodes || []) {
+      if (roleEl?.isConnected && roleEl.matches?.(MESSAGE_TIME_MUTATION_SELECTOR)) messageTimePendingRoleNodes.add(roleEl);
+    }
+    if (!messageTimePendingRoleNodes.size || messageTimePendingFullApply) return messageTimeState;
+    messageTimePendingApplyReason = String(reason || 'targeted_mutation');
+    if (messageTimeApplyQueued) return messageTimeState;
+    messageTimeApplyQueued = true;
+    queueMicrotask(flushMessageTimestampApply);
+    return messageTimeState;
+  }
+
+  function getMessageTimestampRoleNodesByMessageIds(messageIds) {
+    const roleNodes = new Set();
+    for (const messageId of messageIds || []) {
+      const id = String(messageId || '');
+      if (!id) continue;
+      const escapedId = CSS.escape(id);
+      for (const candidate of document.querySelectorAll(`[data-message-id="${escapedId}"]`)) {
+        const roleEl = candidate.matches?.(MESSAGE_TIME_MUTATION_SELECTOR)
+          ? candidate
+          : candidate.closest?.(MESSAGE_TIME_MUTATION_SELECTOR) || candidate.querySelector?.(MESSAGE_TIME_MUTATION_SELECTOR);
+        if (roleEl?.isConnected) roleNodes.add(roleEl);
+      }
+    }
+    return Array.from(roleNodes);
+  }
+
+  function scheduleApplyMessageTimestampsForMessageIds(messageIds, reason = 'targeted_index_refresh') {
+    return scheduleApplyMessageTimestampsForNodes(
+      getMessageTimestampRoleNodesByMessageIds(messageIds),
+      reason
+    );
   }
 
   function flushMessageTimestampIndexRefresh() {
@@ -3504,54 +3056,62 @@
     if (!messageTimeUiStarted || !isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('messageTimestamps')) return;
     if (messageTimeRefreshInFlight) return;
     const refreshReason = messageTimePendingRefreshReason || 'dom_event';
+    const applyAll = messageTimePendingRefreshApplyAll;
+    const targetMessageIds = Array.from(messageTimePendingRefreshMessageIds);
     messageTimePendingRefreshReason = null;
+    messageTimePendingRefreshApplyAll = false;
+    messageTimePendingRefreshMessageIds.clear();
     messageTimeRefreshInFlight = true;
-    refreshMessageTimestampIndex(refreshReason).catch(() => {}).finally(() => {
+    refreshMessageTimestampIndex(refreshReason, { applyAll, targetMessageIds }).catch(() => {}).finally(() => {
       messageTimeRefreshInFlight = false;
-      if (messageTimePendingRefreshReason && !messageTimeRefreshQueued) {
+      if ((messageTimePendingRefreshReason || messageTimePendingRefreshApplyAll || messageTimePendingRefreshMessageIds.size) && !messageTimeRefreshQueued) {
         messageTimeRefreshQueued = true;
         queueMicrotask(flushMessageTimestampIndexRefresh);
       }
     });
   }
 
-  function scheduleRefreshMessageTimestampIndex(reason = 'dom_event') {
+  function scheduleRefreshMessageTimestampIndex(reason = 'dom_event', options = {}) {
     if (!isArcaiaExtensionEnabled() || !messageTimeUiStarted || !isArcaiaFeatureEnabled('messageTimestamps')) return messageTimeState;
     messageTimePendingRefreshReason = String(reason || 'dom_event');
+    if (options?.applyAll) messageTimePendingRefreshApplyAll = true;
+    for (const messageId of Array.isArray(options?.targetMessageIds) ? options.targetMessageIds : []) {
+      if (messageId) messageTimePendingRefreshMessageIds.add(String(messageId));
+    }
     if (messageTimeRefreshQueued || messageTimeRefreshInFlight) return messageTimeState;
     messageTimeRefreshQueued = true;
     queueMicrotask(flushMessageTimestampIndexRefresh);
     return messageTimeState;
   }
 
-  function nodeContainsMessageTimestampDom(node) {
-    if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
-    if (node.matches?.(MESSAGE_TIME_MUTATION_SELECTOR)) return true;
-    return Boolean(node.querySelector?.(MESSAGE_TIME_MUTATION_SELECTOR));
-  }
-
-  function classifyMessageTimestampMutation(mutations) {
-    let sawMessageDom = false;
+  function collectMessageTimestampMutationRoleNodes(mutations) {
+    const roleNodes = new Set();
     let sawTurnCopyButton = false;
     for (const mutation of mutations || []) {
-      if (mutation.type === 'attributes' && nodeContainsMessageTimestampDom(mutation.target)) {
-        sawMessageDom = true;
+      if (mutation.type === 'attributes' && mutation.target?.matches?.(MESSAGE_TIME_MUTATION_SELECTOR)) {
+        roleNodes.add(mutation.target);
       }
       for (const node of Array.from(mutation.addedNodes || [])) {
+        if (!node || node.nodeType !== Node.ELEMENT_NODE) continue;
+        if (node.matches?.(MESSAGE_TIME_MUTATION_SELECTOR)) roleNodes.add(node);
+        for (const roleEl of node.querySelectorAll?.(MESSAGE_TIME_MUTATION_SELECTOR) || []) roleNodes.add(roleEl);
         if (nodeContainsTurnCopyButton(node)) {
           sawTurnCopyButton = true;
-        }
-        if (nodeContainsMessageTimestampDom(node)) {
-          sawMessageDom = true;
+          const assistantRoleEl = node.closest?.('[data-message-author-role="assistant"]')
+            || node.querySelector?.('[data-message-author-role="assistant"]');
+          if (assistantRoleEl) roleNodes.add(assistantRoleEl);
         }
       }
     }
-    return sawTurnCopyButton ? 'assistant_toolbar_ready' : (sawMessageDom ? 'message_dom_mutation' : null);
+    return {
+      reason: sawTurnCopyButton ? 'assistant_toolbar_ready' : 'message_dom_mutation',
+      roleNodes: Array.from(roleNodes)
+    };
   }
 
   function handleMessageTimestampMutations(mutations) {
-    const reason = classifyMessageTimestampMutation(mutations);
-    if (reason) scheduleApplyMessageTimestamps(reason);
+    const { reason, roleNodes } = collectMessageTimestampMutationRoleNodes(mutations);
+    if (roleNodes.length) scheduleApplyMessageTimestampsForNodes(roleNodes, reason);
   }
 
   function startMessageTimestampUi() {
@@ -3561,16 +3121,24 @@
     startConversationDomObserver();
     resetMessageTimeStateForConversation(tryExtractConversationIdFromUrl(window.location.href));
     markInitialMessageTimeRoleNodes(getRoleNodesForTimestampBadges(), 'startup_initial_dom_snapshot');
-    scheduleRefreshMessageTimestampIndex('startup_existing_conversation_fetch_index');
-    scheduleApplyMessageTimestamps('startup_dom_first_observation');
+    scheduleRefreshMessageTimestampIndex('startup_existing_conversation_fetch_index', { applyAll: true });
+    scheduleApplyAllMessageTimestamps('startup_dom_first_observation');
+    if (isArcaiaFeatureEnabled('turnNumbers')) scheduleAbsoluteTurnIndex('startup');
   }
 
   function stopMessageTimestampUi() {
+    clearScheduledAbsoluteTurnIndex();
+    clearAbsoluteTurnPendingWork();
+    clearAbsoluteTurnIndexState();
     messageTimeUiStarted = false;
     messageTimeApplyQueued = false;
     messageTimePendingApplyReason = null;
+    messageTimePendingFullApply = false;
+    messageTimePendingRoleNodes.clear();
     messageTimeRefreshQueued = false;
     messageTimePendingRefreshReason = null;
+    messageTimePendingRefreshApplyAll = false;
+    messageTimePendingRefreshMessageIds.clear();
   }
 
 
@@ -3587,8 +3155,10 @@
   const NATIVE_LITE_TURN_COUNT = 3;
   const MESSAGE_SECTION_SELECTOR = 'section[data-testid^="conversation-turn-"]';
   const LITE_GROUPING_ROLE_SELECTOR = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
-  const PROMPT_TOC_BUTTON_SELECTOR = 'button[aria-label^="Prompt "]';
-  const PROMPT_TOC_HIDE_ROOT_ATTR = 'data-arcaia-prompt-toc-hidden';
+  const LONG_ANSWER_JUMP_BUTTON_ID = 'arcaia-long-answer-jump-button';
+  const LONG_ANSWER_JUMP_STYLE_ID = 'arcaia-long-answer-jump-style';
+  const LONG_ANSWER_JUMP_MIN_VIEWPORT_RATIO = 1.25;
+  const LONG_ANSWER_JUMP_TOP_THRESHOLD_PX = 32;
   const LITE_GROUPING_STRATEGY = 'latest_user_started_turns_hard_prune_v1';
   const LITE_RETAIN_MODE = 'latest_user_started_turns_hard_prune';
   const LEGACY_RESTORED_HISTORY_ID = 'arcaia-lite-restored-history';
@@ -3640,7 +3210,6 @@
     liteGroupingStrategy: LITE_GROUPING_STRATEGY,
     retainedTurnRange: null,
     turnCountSetting: null,
-    promptTocPrune: null,
     lastContentRefresh: null
   };
 
@@ -3682,7 +3251,6 @@
       liteGroupingStrategy: LITE_GROUPING_STRATEGY,
       retainedTurnRange: null,
       turnCountSetting: NATIVE_LITE_TURN_COUNT,
-      promptTocPrune: null,
       lastGenerationDetector: null,
       lastContentRefresh: null
     };
@@ -3735,51 +3303,6 @@
     return directCandidates.length === 1 ? directCandidates[0] : null;
   }
 
-  function getEffectiveLiteTurnCount(conversationId = tryExtractConversationIdFromUrl(window.location.href)) {
-    if (
-      conversationId
-      && recentViewExpansionState?.conversationId === conversationId
-      && Number.isFinite(Number(recentViewExpansionState?.turnCount))
-    ) {
-      return Math.max(
-        getConfiguredLiteTurnCount(),
-        Math.min(RECENT_VIEW_EXPANDED_TURN_COUNT_MAX, Math.floor(Number(recentViewExpansionState.turnCount)))
-      );
-    }
-    return getConfiguredLiteTurnCount();
-  }
-
-  function setRecentViewExpansionState(conversationId, turnCount) {
-    recentViewExpansionState = {
-      conversationId: conversationId || null,
-      turnCount: conversationId
-        ? Math.max(
-          getConfiguredLiteTurnCount(),
-          Math.min(RECENT_VIEW_EXPANDED_TURN_COUNT_MAX, Math.floor(Number(turnCount)))
-        )
-        : null,
-      requestedAt: conversationId ? Date.now() : null
-    };
-    writeRecentViewExpansionToStorage(recentViewExpansionState);
-    return { ...recentViewExpansionState };
-  }
-
-  function clearRecentViewExpansionState() {
-    return setRecentViewExpansionState(null, null);
-  }
-
-  function setPromptTocHiddenActive(active) {
-    try {
-      const root = document.documentElement;
-      if (!root) return false;
-      if (active) root.setAttribute(PROMPT_TOC_HIDE_ROOT_ATTR, 'true');
-      else root.removeAttribute(PROMPT_TOC_HIDE_ROOT_ATTR);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   function installLiteDisplayStyles() {
     if (document.getElementById(LITE_STYLE_ID)) return;
     const style = document.createElement('style');
@@ -3806,9 +3329,6 @@
       }
       #${LITE_BAR_ID}[hidden] { display: none !important; }
       ${MESSAGE_SECTION_SELECTOR}[${ROLLING_HIDE_ATTR}="true"] { display: none !important; }
-      :root[${PROMPT_TOC_HIDE_ROOT_ATTR}="true"] ${PROMPT_TOC_BUTTON_SELECTOR} {
-        display: none !important;
-      }
       .arcaia-message-time-badge {
         display: inline-block !important;
         width: fit-content !important;
@@ -3821,6 +3341,7 @@
         color: CanvasText !important;
         background: color-mix(in srgb, CanvasText 7%, transparent) !important;
         pointer-events: none !important;
+        white-space: nowrap !important;
       }
       .arcaia-message-time-badge.arcaia-message-time-provisional {
         opacity: 0.46 !important;
@@ -4024,56 +3545,44 @@
       || !lite?.enabled
       || !isArcaiaFeatureEnabled('liteView')
       || fullLoadModeState.active
-      || recentViewRefreshState.active
+      || recentViewRefreshActive
       || isHistorySearchNavigationUrl()
     ) return null;
 
     const firstVisibleSection = getFirstVisibleRecentViewSection();
     if (!firstVisibleSection?.parentElement) return null;
-    const targetTurnCount = getEffectiveLiteTurnCount(conversationId);
+    const targetTurnCount = getConfiguredLiteTurnCount();
     const rewriteSummary = getRecentViewRewriteSummary(lite, conversationId);
-    const totalTurnCountRaw = Number(rewriteSummary?.totalTurnCount);
-    const totalTurnCount = Number.isFinite(totalTurnCountRaw) && totalTurnCountRaw > 0
-      ? Math.floor(totalTurnCountRaw)
+    const rewriteTotalTurnCountRaw = Number(rewriteSummary?.totalTurnCount);
+    const rewriteTotalTurnCount = Number.isFinite(rewriteTotalTurnCountRaw) && rewriteTotalTurnCountRaw > 0
+      ? Math.floor(rewriteTotalTurnCountRaw)
       : null;
+    const absoluteTotalTurnCountRaw = messageTimeState.absoluteTurnIndexLoaded
+      && messageTimeState.conversationId === conversationId
+      ? Number(messageTimeState.absoluteTurnTotalCount)
+      : NaN;
+    const countReady = Number.isFinite(absoluteTotalTurnCountRaw) && absoluteTotalTurnCountRaw > 0;
+    const totalTurnCount = countReady ? Math.floor(absoluteTotalTurnCountRaw) : rewriteTotalTurnCount;
     if (totalTurnCount == null) return null;
     const remainingTurnCount = Math.max(0, totalTurnCount - targetTurnCount);
     if (remainingTurnCount === 0) return null;
-    const increment = targetTurnCount < RECENT_VIEW_EXPANDED_TURN_COUNT_MAX
-      ? Math.min(RECENT_VIEW_EXPANSION_STEP, remainingTurnCount)
-      : 0;
-
     const controls = document.createElement('div');
     controls.id = RECENT_VIEW_HISTORY_CONTROLS_ID;
     controls.setAttribute('role', 'navigation');
     controls.setAttribute('aria-label', 'Recent Viewの以前の履歴');
     controls.dataset.conversationId = conversationId;
     controls.dataset.currentTurnCount = String(targetTurnCount);
-    controls.dataset.increment = String(increment);
-    if (totalTurnCount != null) controls.dataset.totalTurnCount = String(totalTurnCount);
+    if (countReady) controls.dataset.totalTurnCount = String(totalTurnCount);
 
     const label = document.createElement('span');
     label.className = 'arcaia-recent-view-history-label';
-    label.textContent = `以前の履歴（残り${remainingTurnCount}件）:`;
+    label.textContent = countReady ? `以前の履歴（残り${remainingTurnCount}件）:` : '以前の履歴:';
     controls.appendChild(label);
-
-    if (increment > 0) {
-      const expandButton = document.createElement('button');
-      expandButton.type = 'button';
-      expandButton.dataset.action = 'expand';
-      expandButton.textContent = `さらに${increment}件表示`;
-      controls.appendChild(expandButton);
-
-      const separator = document.createElement('span');
-      separator.textContent = '・';
-      separator.setAttribute('aria-hidden', 'true');
-      controls.appendChild(separator);
-    }
 
     const fullButton = document.createElement('button');
     fullButton.type = 'button';
     fullButton.dataset.action = 'full';
-    fullButton.textContent = '全部表示';
+    fullButton.textContent = '全文表示';
     controls.appendChild(fullButton);
 
     controls.addEventListener('click', (event) => {
@@ -4086,6 +3595,34 @@
     });
     firstVisibleSection.insertAdjacentElement('beforebegin', controls);
     return controls;
+  }
+
+  function updateRecentViewHistoryAbsoluteCount() {
+    const controls = document.getElementById(RECENT_VIEW_HISTORY_CONTROLS_ID);
+    if (!controls) return false;
+    const conversationId = tryExtractConversationIdFromUrl(window.location.href);
+    if (
+      !conversationId
+      || controls.dataset.conversationId !== conversationId
+      || !messageTimeState.absoluteTurnIndexLoaded
+      || messageTimeState.conversationId !== conversationId
+    ) return false;
+    const totalTurnCountRaw = Number(messageTimeState.absoluteTurnTotalCount);
+    if (!Number.isFinite(totalTurnCountRaw) || totalTurnCountRaw <= 0) return false;
+    const currentTurnCount = Math.max(
+      getConfiguredLiteTurnCount(),
+      Math.floor(Number(controls.dataset.currentTurnCount || getConfiguredLiteTurnCount()))
+    );
+    const totalTurnCount = Math.floor(totalTurnCountRaw);
+    const remainingTurnCount = Math.max(0, totalTurnCount - currentTurnCount);
+    if (remainingTurnCount === 0) {
+      controls.remove();
+      return true;
+    }
+    controls.dataset.totalTurnCount = String(totalTurnCount);
+    const label = controls.querySelector('.arcaia-recent-view-history-label');
+    if (label) label.textContent = `以前の履歴（残り${remainingTurnCount}件）:`;
+    return true;
   }
 
   function updateLiteBar(lite, summary = {}) {
@@ -4106,104 +3643,138 @@
     try { document.documentElement?.removeAttribute?.('data-arcaia-native-snapshot-capture'); } catch {}
   }
 
-  async function loadFullConversationInPlace(reason = 'manual_load_full', options = {}) {
-    return runRecentViewSpaRoundTrip({
-      mode: 'full',
-      reason,
-      disableLite: Boolean(options.disableLite)
-    });
+  function captureRecentViewFullScrollAnchor() {
+    const controls = document.getElementById(RECENT_VIEW_HISTORY_CONTROLS_ID);
+    const firstVisibleSection = getFirstVisibleRecentViewSection();
+    const currentTurnCount = Math.max(
+      getConfiguredLiteTurnCount(),
+      Math.floor(Number(controls?.dataset?.currentTurnCount || getConfiguredLiteTurnCount()))
+    );
+    const totalTurnCountRaw = Number(controls?.dataset?.totalTurnCount);
+    const viewportTop = firstVisibleSection?.getBoundingClientRect?.().top;
+    if (!Number.isFinite(totalTurnCountRaw) || totalTurnCountRaw <= 0 || !Number.isFinite(viewportTop)) return null;
+    return {
+      turnNumber: Math.max(1, Math.floor(totalTurnCountRaw) - currentTurnCount + 1),
+      viewportTop
+    };
   }
 
-  function getRecentViewRoutePath(value = window.location.href) {
-    try { return new URL(String(value || ''), window.location.origin).pathname; }
-    catch { return window.location.pathname || '/'; }
-  }
-
-  function getRecentViewAnchorRoutePath(anchor) {
-    try { return new URL(anchor?.href || anchor?.getAttribute?.('href') || '', window.location.origin).pathname; }
-    catch { return null; }
-  }
-
-  function findRecentViewNativeNewChatControl() {
-    const direct = document.querySelector('[data-testid="create-new-chat-button"]');
-    const directClickable = direct?.closest?.('a, button') || direct;
-    if (directClickable instanceof HTMLElement && directClickable.isConnected) return directClickable;
-    return Array.from(document.querySelectorAll('a[href], button')).find((element) => {
-      if (!(element instanceof HTMLElement) || !element.isConnected || element.closest('main')) return false;
-      const label = `${element.getAttribute('aria-label') || ''} ${element.textContent || ''}`.trim().toLowerCase();
-      if (element instanceof HTMLAnchorElement && getRecentViewAnchorRoutePath(element) === '/') {
-        return /new chat|新しいチャット/.test(label);
+  async function showFullConversationReadOnly(reason = 'manual_show_full', scrollAnchor = null) {
+    const conversationId = tryExtractConversationIdFromUrl(window.location.href);
+    if (!conversationId) throw new Error('conversation_id_not_found');
+    const effectiveScrollAnchor = scrollAnchor || captureRecentViewFullScrollAnchor();
+    const requestSequence = ++recentViewReadOnlyRequestSequence;
+    const renderer = getRecentViewReadOnlyRenderer();
+    const nativeContentRoot = recentViewReadOnlyState?.nativeContentRoot?.isConnected
+      ? recentViewReadOnlyState.nativeContentRoot
+      : findRollingLiteContentRoot(document);
+    if (!nativeContentRoot) throw new Error('recent_view_native_content_root_not_found');
+    const overlay = showRecentViewLoadingOverlay('全履歴を準備中…');
+    recentViewRefreshActive = true;
+    removeRecentViewHistoryControls();
+    try {
+      const result = await requestMainWorldReadOnlyConversationModel({
+        conversationId,
+        requestedTurnCount: 'all'
+      }, 120000);
+      const model = result?.model || null;
+      if (!result?.ok || !model || model.conversationId !== conversationId) {
+        throw new Error(result?.error || 'recent_view_read_only_model_unavailable');
       }
-      return /new chat|新しいチャット/.test(label);
-    }) || null;
-  }
-
-  function isRecentViewConversationLinkForTarget(anchor, targetRoutePath, conversationId) {
-    if (!(anchor instanceof HTMLAnchorElement) || !anchor.isConnected || anchor.closest('main')) return false;
-    const routePath = getRecentViewAnchorRoutePath(anchor);
-    if (!routePath) return false;
-    if (routePath === targetRoutePath) return true;
-    return Boolean(conversationId && routePath.endsWith(`/c/${conversationId}`));
-  }
-
-  function findRecentViewNativeConversationLink(targetRoutePath, conversationId) {
-    return Array.from(document.querySelectorAll('a[href]')).find((anchor) => (
-      isRecentViewConversationLinkForTarget(anchor, targetRoutePath, conversationId)
-    )) || null;
-  }
-
-  function clickRecentViewNativeControl(control, failureCode) {
-    if (!(control instanceof HTMLElement) || !control.isConnected) throw new Error(failureCode);
-    control.click();
-    return true;
-  }
-
-  function waitForRecentViewRefreshCondition(check, label, timeoutMs = 12000) {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      let observer = null;
-      let timer = null;
-      const cleanup = () => {
-        try { observer?.disconnect?.(); } catch {}
-        observer = null;
-        if (timer) clearTimeout(timer);
-        timer = null;
-        window.removeEventListener('message', onSignal);
-        window.removeEventListener('popstate', onSignal);
-        window.removeEventListener('hashchange', onSignal);
-        recentViewRefreshConditionSignals.delete(onSignal);
+      if (
+        requestSequence !== recentViewReadOnlyRequestSequence
+        || tryExtractConversationIdFromUrl(window.location.href) !== conversationId
+        || !nativeContentRoot.isConnected
+      ) {
+        throw new Error('recent_view_read_only_request_stale');
+      }
+      const mountResult = renderer.mount({
+        nativeContentRoot,
+        model,
+        resolveAsset: (resource) => (
+          resource?.isImage && !liteShowImagesEnabled
+            ? null
+            : resolveRecentViewReadOnlyAsset(resource)
+        ),
+        onClose: () => closeRecentViewReadOnlyRenderer('user_return_to_recent_view'),
+        scrollAnchor: effectiveScrollAnchor
+      });
+      recentViewReadOnlyState = {
+        conversationId,
+        nativeContentRoot,
+        visibleTurnCount: model.visibleTurnCount,
+        totalTurnCount: model.totalTurnCount,
+        mode: 'full',
+        reason
       };
-      const finish = (ok, value) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        if (ok) resolve(value);
-        else reject(value);
-      };
-      const evaluate = () => {
-        if (settled) return;
-        try {
-          const value = check();
-          if (value) finish(true, value);
-        } catch (error) {
-          finish(false, error);
+      rollingLiteState = {
+        ...rollingLiteState,
+        lastContentRefresh: {
+          ok: true,
+          appVersion: APP_VERSION,
+          action: 'read_only_custom_dom',
+          strategy: 'existing_conversation_payload_read_only_renderer',
+          reason,
+          mode: 'full',
+          conversationId,
+          requestedTurnCount: 'all',
+          visibleTurnCount: model.visibleTurnCount,
+          totalTurnCount: model.totalTurnCount
         }
       };
-      function onSignal() {
-        queueMicrotask(evaluate);
+      return {
+        ok: true,
+        appVersion: APP_VERSION,
+        action: 'show_full_conversation_read_only',
+        conversationId,
+        model,
+        mountResult
+      };
+    } catch (error) {
+      if (requestSequence === recentViewReadOnlyRequestSequence) {
+        closeRecentViewReadOnlyRenderer('render_failed');
       }
-      const target = document.documentElement;
-      if (target instanceof Element) {
-        observer = new MutationObserver(onSignal);
-        observer.observe(target, { childList: true, subtree: true });
-      }
-      window.addEventListener('message', onSignal);
-      window.addEventListener('popstate', onSignal);
-      window.addEventListener('hashchange', onSignal);
-      recentViewRefreshConditionSignals.add(onSignal);
-      timer = setTimeout(() => finish(false, new Error(`recent_view_spa_refresh_timeout:${label}`)), timeoutMs);
-      evaluate();
+      throw error;
+    } finally {
+      removeRecentViewLoadingOverlay(overlay);
+    }
+  }
+
+  let recentViewReadOnlyState = null;
+  let recentViewReadOnlyRequestSequence = 0;
+
+  function getRecentViewReadOnlyRenderer() {
+    const renderer = window.ArcaiaRecentViewRenderer;
+    if (!renderer || typeof renderer.mount !== 'function' || typeof renderer.cleanup !== 'function') {
+      throw new Error('recent_view_read_only_renderer_not_loaded');
+    }
+    return renderer;
+  }
+
+  function closeRecentViewReadOnlyRenderer(reason = 'manual_close', { restoreRecentView = true } = {}) {
+    recentViewReadOnlyRequestSequence += 1;
+    const wasActive = Boolean(recentViewReadOnlyState || window.ArcaiaRecentViewRenderer?.isActive?.());
+    try { window.ArcaiaRecentViewRenderer?.cleanup?.(reason); } catch {}
+    recentViewReadOnlyState = null;
+    recentViewRefreshActive = false;
+    if (restoreRecentView && wasActive && rollingLiteUiStarted && isArcaiaFeatureEnabled('liteView')) {
+      scheduleRollingLiteApply(`read_only_renderer_closed:${reason}`);
+    }
+    return { ok: true, appVersion: APP_VERSION, action: 'close_recent_view_read_only_renderer', reason };
+  }
+
+  async function resolveRecentViewReadOnlyAsset(resource) {
+    const result = await requestMainWorldReadOnlyRendererAsset({
+      conversationId: resource?.conversationId || null,
+      messageId: resource?.messageId || null,
+      sandboxPath: resource?.sandboxPath || null,
+      assetPointer: resource?.assetPointer || null,
+      fileId: resource?.fileId || null,
+      url: resource?.url || null,
+      mimeType: resource?.mimeType || null,
+      isImage: Boolean(resource?.isImage)
     });
+    return result?.ok && result?.blob ? result : null;
   }
 
   function showRecentViewLoadingOverlay(message = '履歴を読み込み中…') {
@@ -4236,232 +3807,10 @@
     return overlay;
   }
 
-  function updateRecentViewLoadingOverlay(overlay, message) {
-    const label = overlay?.querySelector?.('.arcaia-recent-view-loading-message');
-    if (label) label.textContent = message;
-  }
-
   function removeRecentViewLoadingOverlay(overlay = document.getElementById(RECENT_VIEW_LOADING_OVERLAY_ID)) {
     if (!overlay) return;
     try { window.removeEventListener('resize', overlay.__arcaiaUpdateBounds); } catch {}
     try { overlay.remove(); } catch {}
-  }
-
-  function findRecentViewScrollContainer(section) {
-    let current = section?.parentElement || null;
-    while (current && current !== document.body && current !== document.documentElement) {
-      try {
-        const style = window.getComputedStyle(current);
-        if (/auto|scroll/.test(style.overflowY || '') && current.scrollHeight > current.clientHeight + 4) return current;
-      } catch {}
-      current = current.parentElement;
-    }
-    return document.scrollingElement || document.documentElement;
-  }
-
-  function captureRecentViewScrollAnchor() {
-    const section = getFirstVisibleRecentViewSection();
-    if (!section) return null;
-    return {
-      messageId: getSectionMessageId(section),
-      dataTestId: section.getAttribute('data-testid') || null,
-      viewportTop: section.getBoundingClientRect().top,
-      scrollContainer: findRecentViewScrollContainer(section)
-    };
-  }
-
-  function findRecentViewScrollAnchorSection(anchor) {
-    if (!anchor) return null;
-    return getTopLevelRollingLiteMessageSections(document).find((section) => {
-      if (anchor.messageId && getSectionMessageId(section) === anchor.messageId) return true;
-      return Boolean(anchor.dataTestId && section.getAttribute('data-testid') === anchor.dataTestId);
-    }) || null;
-  }
-
-  async function restoreRecentViewScrollAnchor(anchor) {
-    if (!anchor) return false;
-    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    const section = findRecentViewScrollAnchorSection(anchor);
-    if (!section) return false;
-    const delta = section.getBoundingClientRect().top - Number(anchor.viewportTop || 0);
-    if (!Number.isFinite(delta) || Math.abs(delta) < 1) return true;
-    const scrollContainer = anchor.scrollContainer?.isConnected
-      ? anchor.scrollContainer
-      : findRecentViewScrollContainer(section);
-    if (scrollContainer === document.scrollingElement || scrollContainer === document.documentElement || scrollContainer === document.body) {
-      window.scrollBy(0, delta);
-    } else {
-      scrollContainer.scrollTop += delta;
-    }
-    return true;
-  }
-
-  async function resetRecentViewMainWorldOverride(reason = 'recent_view_override_reset') {
-    return setMainWorldLiteDisplayConfig({
-      turnCount: getConfiguredLiteTurnCount(),
-      clearTurnCountOverride: true,
-      clearFullLoadMode: true,
-      requestedBy: reason
-    }, 3000);
-  }
-
-  async function runRecentViewSpaRoundTrip({ mode, requestedTurnCount = null, reason = 'recent_view_history_action', disableLite = false } = {}) {
-    if (recentViewRefreshState.active) throw new Error('recent_view_spa_refresh_already_active');
-    const conversationId = tryExtractConversationIdFromUrl(window.location.href);
-    if (!conversationId) throw new Error('conversation_id_not_found');
-    if (mode !== 'expand' && mode !== 'full') throw new Error('recent_view_spa_refresh_mode_invalid');
-    const targetRoutePath = getRecentViewRoutePath();
-    const sourceContentRoot = findRollingLiteContentRoot();
-    const sourceConversationLink = findRecentViewNativeConversationLink(targetRoutePath, conversationId);
-    const newChatControl = findRecentViewNativeNewChatControl();
-    if (!newChatControl) throw new Error('recent_view_native_new_chat_control_not_found');
-    const scrollAnchor = captureRecentViewScrollAnchor();
-    const previousExpansionState = { ...recentViewExpansionState };
-    const previousFullLoadModeState = { ...fullLoadModeState };
-    const overlay = showRecentViewLoadingOverlay(mode === 'full' ? '全履歴を読み込み中…' : '以前の履歴を読み込み中…');
-    let mainWorldResult = null;
-
-    recentViewRefreshState = {
-      active: true,
-      conversationId,
-      mode,
-      requestedTurnCount: mode === 'expand' ? requestedTurnCount : null,
-      startedAt: Date.now(),
-      sourceContentRoot,
-      sourceRoutePath: targetRoutePath
-    };
-    removeRecentViewHistoryControls();
-
-    try {
-      clickRecentViewNativeControl(newChatControl, 'recent_view_native_new_chat_control_disconnected');
-      await waitForRecentViewRefreshCondition(() => (
-        !tryExtractConversationIdFromUrl(window.location.href)
-        && !findRollingLiteContentRoot()
-        && observedPageConversationId == null
-        && !pageConversationSyncInFlight
-      ), 'new_chat_ready', 15000);
-
-      if (mode === 'expand') {
-        const targetTurnCount = Math.max(
-          getConfiguredLiteTurnCount(),
-          Math.min(RECENT_VIEW_EXPANDED_TURN_COUNT_MAX, Math.floor(Number(requestedTurnCount)))
-        );
-        if (!Number.isFinite(targetTurnCount)) throw new Error('recent_view_requested_turn_count_invalid');
-        setRecentViewExpansionState(conversationId, targetTurnCount);
-        fullLoadModeState = { active: false, conversationId: null, requestedAt: null, reason: 'recent_view_expand' };
-        writeFullLoadModeToStorage(fullLoadModeState);
-        mainWorldResult = await setMainWorldLiteDisplayConfig({
-          enabled: true,
-          turnCountOverride: targetTurnCount,
-          turnCountOverrideConversationId: conversationId,
-          clearFullLoadMode: true,
-          requestedBy: reason
-        }, 3000);
-      } else {
-        clearRecentViewExpansionState();
-        await resetRecentViewMainWorldOverride('recent_view_full_reset_override');
-        fullLoadModeState = { active: true, conversationId, requestedAt: Date.now(), reason };
-        writeFullLoadModeToStorage(fullLoadModeState);
-        mainWorldResult = await requestMainWorldFullLoadOnce({
-          conversationId,
-          expiresMs: 90000,
-          reason
-        }, 3000);
-      }
-      if (!mainWorldResult) throw new Error('recent_view_main_world_config_no_response');
-
-      updateRecentViewLoadingOverlay(overlay, mode === 'full' ? '全履歴を描画中…' : '以前の履歴を描画中…');
-      const targetLink = sourceConversationLink?.isConnected
-        && isRecentViewConversationLinkForTarget(sourceConversationLink, targetRoutePath, conversationId)
-        ? sourceConversationLink
-        : findRecentViewNativeConversationLink(targetRoutePath, conversationId);
-      if (!targetLink) throw new Error('recent_view_native_conversation_link_not_found');
-      clickRecentViewNativeControl(targetLink, 'recent_view_native_conversation_link_disconnected');
-
-      const reboundContentRoot = await waitForRecentViewRefreshCondition(() => {
-        if (tryExtractConversationIdFromUrl(window.location.href) !== conversationId) return null;
-        if (observedPageConversationId !== conversationId || pageConversationSyncInFlight) return null;
-        const contentRoot = findRollingLiteContentRoot();
-        if (!contentRoot || contentRoot === sourceContentRoot) return null;
-        if (!getTopLevelRollingLiteMessageSections(contentRoot).length) return null;
-        return contentRoot;
-      }, 'conversation_content_root_rebound', 30000);
-
-      clearLiteDisplayMainCache('recent_view_spa_round_trip_complete');
-      refreshConversationDomObserverBindings('recent_view_spa_round_trip_complete');
-      syncHeaderMarkdownButtonUi('recent_view_spa_round_trip_complete');
-      await applyRollingLiteDom('recent_view_spa_round_trip_complete');
-      await restoreRecentViewScrollAnchor(scrollAnchor);
-      const refresh = {
-        ok: true,
-        appVersion: APP_VERSION,
-        action: 'content_refresh',
-        strategy: 'native_new_chat_round_trip',
-        reason,
-        mode,
-        conversationId,
-        requestedTurnCount: mode === 'expand' ? getEffectiveLiteTurnCount(conversationId) : 'all',
-        contentRootReplaced: reboundContentRoot !== sourceContentRoot,
-        disableLite
-      };
-      rollingLiteState = {
-        ...rollingLiteState,
-        lastContentRefresh: refresh,
-        lastSkipReason: mode === 'full' ? 'full_load_mode_active' : rollingLiteState.lastSkipReason
-      };
-      return {
-        ok: true,
-        appVersion: APP_VERSION,
-        action: mode === 'full' ? 'load_full_conversation_in_place' : 'expand_recent_view_in_place',
-        conversationId,
-        reason,
-        mainWorldResult,
-        refresh
-      };
-    } catch (error) {
-      recentViewExpansionState = previousExpansionState;
-      writeRecentViewExpansionToStorage(recentViewExpansionState);
-      fullLoadModeState = previousFullLoadModeState;
-      writeFullLoadModeToStorage(fullLoadModeState);
-      await setMainWorldLiteDisplayConfig({
-        turnCount: getConfiguredLiteTurnCount(),
-        turnCountOverride: previousExpansionState?.turnCount || null,
-        turnCountOverrideConversationId: previousExpansionState?.conversationId || null,
-        clearTurnCountOverride: !previousExpansionState?.conversationId,
-        clearFullLoadMode: true,
-        requestedBy: 'recent_view_spa_round_trip_rollback'
-      }, 3000).catch(() => null);
-      if (tryExtractConversationIdFromUrl(window.location.href) !== conversationId) {
-        const recoveryLink = sourceConversationLink?.isConnected
-          && isRecentViewConversationLinkForTarget(sourceConversationLink, targetRoutePath, conversationId)
-          ? sourceConversationLink
-          : findRecentViewNativeConversationLink(targetRoutePath, conversationId);
-        if (recoveryLink) {
-          try {
-            clickRecentViewNativeControl(recoveryLink, 'recent_view_recovery_conversation_link_disconnected');
-            await waitForRecentViewRefreshCondition(() => (
-              tryExtractConversationIdFromUrl(window.location.href) === conversationId
-              && Boolean(findRollingLiteContentRoot())
-            ), 'rollback_return_to_conversation', 15000);
-          } catch {}
-        }
-      }
-      throw error;
-    } finally {
-      recentViewRefreshState = {
-        active: false,
-        conversationId: null,
-        mode: null,
-        requestedTurnCount: null,
-        startedAt: null,
-        sourceContentRoot: null,
-        sourceRoutePath: null
-      };
-      removeRecentViewLoadingOverlay(overlay);
-      if (tryExtractConversationIdFromUrl(window.location.href) === conversationId) {
-        scheduleRollingLiteApply('recent_view_spa_round_trip_finalized');
-      }
-    }
   }
 
   async function handleRecentViewHistoryControlAction(action, controls) {
@@ -4469,29 +3818,8 @@
     const conversationId = controls.dataset.conversationId || tryExtractConversationIdFromUrl(window.location.href);
     for (const button of controls.querySelectorAll('button')) button.disabled = true;
     try {
-      if (action === 'full') {
-        return await loadFullConversationInPlace('recent_view_history_full', { disableLite: true });
-      }
-      if (action !== 'expand') throw new Error('recent_view_history_action_invalid');
-      const currentTurnCount = Math.max(
-        getConfiguredLiteTurnCount(),
-        Math.floor(Number(controls.dataset.currentTurnCount || getEffectiveLiteTurnCount()))
-      );
-      const increment = Math.max(1, Math.floor(Number(controls.dataset.increment || RECENT_VIEW_EXPANSION_STEP)));
-      const totalTurnCountRaw = Number(controls.dataset.totalTurnCount);
-      const totalTurnCount = Number.isFinite(totalTurnCountRaw) && totalTurnCountRaw > 0
-        ? Math.floor(totalTurnCountRaw)
-        : RECENT_VIEW_EXPANDED_TURN_COUNT_MAX;
-      const requestedTurnCount = Math.min(
-        RECENT_VIEW_EXPANDED_TURN_COUNT_MAX,
-        totalTurnCount,
-        currentTurnCount + increment
-      );
-      return await runRecentViewSpaRoundTrip({
-        mode: 'expand',
-        requestedTurnCount,
-        reason: 'recent_view_history_expand'
-      });
+      if (action !== 'full') throw new Error('recent_view_history_action_invalid');
+      return await showFullConversationReadOnly('recent_view_history_full');
     } catch (error) {
       rollingLiteState.lastError = error instanceof Error ? error.message : String(error);
       showRecentViewHistoryActionFailure(conversationId);
@@ -4540,6 +3868,661 @@
     const node = Array.from(section.querySelectorAll?.('[data-message-id]') || [])
       .find((candidate) => candidate.closest?.(MESSAGE_SECTION_SELECTOR) === section);
     return node?.getAttribute?.('data-message-id') || null;
+  }
+
+  function selectLongAnswerJumpRecord(records, viewportHeight) {
+    const height = Math.max(1, Number(viewportHeight) || 1);
+    const anchorY = Math.max(96, Math.min(height * 0.32, 260));
+    const minimumHeight = height * LONG_ANSWER_JUMP_MIN_VIEWPORT_RATIO;
+    return records.find((record) => (
+      record?.role === 'assistant'
+      && record.rect?.height >= minimumHeight
+      && record.rect.top < LONG_ANSWER_JUMP_TOP_THRESHOLD_PX
+      && record.rect.bottom > anchorY
+    )) || null;
+  }
+
+  function resolveLongAnswerJumpTarget(records, assistantRecord) {
+    const assistantIndex = records.indexOf(assistantRecord);
+    for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+      if (records[index]?.role === 'user') return records[index].section;
+    }
+    return assistantRecord?.section || null;
+  }
+
+  function installLongAnswerJumpStyles() {
+    if (document.getElementById(LONG_ANSWER_JUMP_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = LONG_ANSWER_JUMP_STYLE_ID;
+    style.textContent = `
+      #${LONG_ANSWER_JUMP_BUTTON_ID} {
+        position: fixed !important;
+        z-index: 2147482500 !important;
+        width: 32px !important;
+        height: 32px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        padding: 0 !important;
+        border: 1px solid color-mix(in srgb, CanvasText 16%, transparent) !important;
+        border-radius: 9px !important;
+        background: color-mix(in srgb, Canvas 92%, CanvasText 8%) !important;
+        color: CanvasText !important;
+        opacity: 0.72 !important;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12) !important;
+        cursor: pointer !important;
+        transition: opacity 120ms ease, background 120ms ease !important;
+      }
+      #${LONG_ANSWER_JUMP_BUTTON_ID}:hover,
+      #${LONG_ANSWER_JUMP_BUTTON_ID}:focus-visible {
+        opacity: 1 !important;
+        background: color-mix(in srgb, Canvas 84%, CanvasText 16%) !important;
+      }
+      #${LONG_ANSWER_JUMP_BUTTON_ID}[hidden] { display: none !important; }
+      #${LONG_ANSWER_JUMP_BUTTON_ID} svg { pointer-events: none !important; }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function handleLongAnswerJumpClick(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const target = longAnswerJumpTarget;
+    if (!(target instanceof Element) || !target.isConnected) return;
+    const behavior = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ? 'auto' : 'smooth';
+    target.scrollIntoView({ behavior, block: 'start', inline: 'nearest' });
+    if (longAnswerJumpButton) longAnswerJumpButton.hidden = true;
+    longAnswerJumpTarget = null;
+  }
+
+  function ensureLongAnswerJumpButton() {
+    if (longAnswerJumpButton?.isConnected) return longAnswerJumpButton;
+    installLongAnswerJumpStyles();
+    const button = document.createElement('button');
+    button.id = LONG_ANSWER_JUMP_BUTTON_ID;
+    button.type = 'button';
+    button.hidden = true;
+    button.innerHTML = '<svg width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><path d="M8.25 4.5 3.75 9l4.5 4.5M4 9h7a5 5 0 0 1 5 5v1.5" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    button.addEventListener('click', handleLongAnswerJumpClick);
+    installArcaiaTooltip(button, 'Arcaia: このターンの質問へ');
+    (document.body || document.documentElement).appendChild(button);
+    longAnswerJumpButton = button;
+    return button;
+  }
+
+  function updateLongAnswerJumpUi() {
+    longAnswerJumpAnimationFrame = 0;
+    if (!longAnswerJumpUiStarted || !isArcaiaExtensionEnabled() || document.getElementById('arcaia-recent-view-read-only-root')) {
+      if (longAnswerJumpButton) longAnswerJumpButton.hidden = true;
+      longAnswerJumpTarget = null;
+      return;
+    }
+    const records = getTopLevelRollingLiteMessageSections().map((section) => {
+      const roleNode = getSectionOwnedRoleNodes(section)[0] || null;
+      return {
+        section,
+        roleNode,
+        role: roleNode?.getAttribute?.('data-message-author-role') || null,
+        rect: section.getBoundingClientRect()
+      };
+    });
+    const active = selectLongAnswerJumpRecord(records, window.innerHeight);
+    if (!active) {
+      if (longAnswerJumpButton) longAnswerJumpButton.hidden = true;
+      longAnswerJumpTarget = null;
+      return;
+    }
+    const target = resolveLongAnswerJumpTarget(records, active);
+    const button = ensureLongAnswerJumpButton();
+    const placementNode = active.roleNode?.querySelector?.('.markdown') || active.roleNode || active.section;
+    const placementRect = placementNode.getBoundingClientRect();
+    const left = Math.min(window.innerWidth - 44, Math.max(12, placementRect.right + 12));
+    const top = Math.min(window.innerHeight - 48, Math.max(84, window.innerHeight * 0.28));
+    const assistantOnly = target === active.section;
+    const label = assistantOnly ? 'この回答の先頭へ' : 'このターンの質問へ';
+    button.style.left = `${Math.round(left)}px`;
+    button.style.top = `${Math.round(top)}px`;
+    button.setAttribute('aria-label', label);
+    setArcaiaTooltipText(button, `Arcaia: ${label}`);
+    longAnswerJumpTarget = target;
+    button.hidden = false;
+  }
+
+  function scheduleLongAnswerJumpUpdate() {
+    if (!longAnswerJumpUiStarted || longAnswerJumpAnimationFrame) return;
+    longAnswerJumpAnimationFrame = requestAnimationFrame(updateLongAnswerJumpUi);
+  }
+
+  function startLongAnswerJumpUi() {
+    if (!isArcaiaNormalMode() || window.top !== window || longAnswerJumpUiStarted) return;
+    longAnswerJumpUiStarted = true;
+    document.addEventListener('scroll', scheduleLongAnswerJumpUpdate, { capture: true, passive: true });
+    window.addEventListener('resize', scheduleLongAnswerJumpUpdate);
+    startConversationDomObserver();
+    scheduleLongAnswerJumpUpdate();
+  }
+
+  function stopLongAnswerJumpUi() {
+    longAnswerJumpUiStarted = false;
+    document.removeEventListener('scroll', scheduleLongAnswerJumpUpdate, true);
+    window.removeEventListener('resize', scheduleLongAnswerJumpUpdate);
+    if (longAnswerJumpAnimationFrame) cancelAnimationFrame(longAnswerJumpAnimationFrame);
+    longAnswerJumpAnimationFrame = 0;
+    longAnswerJumpTarget = null;
+    longAnswerJumpButton?.remove?.();
+    longAnswerJumpButton = null;
+    document.getElementById(LONG_ANSWER_JUMP_STYLE_ID)?.remove?.();
+  }
+
+  const TOOL_HISTORY_GROUP_SELECTOR = String.raw`span.group\/tool-message`;
+  const TOOL_HISTORY_SUMMARY_ATTR = 'data-arcaia-tool-history-summary';
+  const TOOL_HISTORY_SUMMARY_TEXT_ATTR = 'data-arcaia-tool-history-summary-text';
+  const TOOL_HISTORY_PAYLOAD_SUMMARY_ATTR = 'data-arcaia-tool-history-payload-summary';
+  const TOOL_HISTORY_PAYLOAD_SUMMARY_TEXT_ATTR = 'data-arcaia-tool-history-payload-summary-text';
+  const TOOL_HISTORY_PAYLOAD_TOOL_COUNT_ATTR = 'data-arcaia-tool-history-payload-tool-count';
+  const TOOL_HISTORY_SOFT_HIDDEN_ATTR = 'data-arcaia-tool-history-soft-hidden';
+  const TOOL_HISTORY_ORIGINAL_DISPLAY_ATTR = 'data-arcaia-tool-history-original-display';
+  const TOOL_HISTORY_HIDE_STYLE_ID = 'arcaia-tool-history-hide-style';
+  const TOOL_HISTORY_INITIAL_HYDRATION_GRACE_MS = 20000;
+  const TOOL_HISTORY_HARD_PRUNE_QUIET_MS = 6000;
+  const TOOL_HISTORY_IDLE_BATCH_SIZE = 1;
+  const TOOL_HISTORY_IDLE_BATCH_GAP_MS = 500;
+  let toolHistoryHardPruneTimer = null;
+  let toolHistoryHydrationTimer = null;
+  let toolHistoryHydrationReady = false;
+  let toolHistoryHydrationBlockedUntil = Date.now() + TOOL_HISTORY_INITIAL_HYDRATION_GRACE_MS;
+  const getToolHistoryNavigationKey = () => tryExtractConversationIdFromUrl(location.href) || `${location.origin}${location.pathname}`;
+  let toolHistoryHydrationNavigationKey = getToolHistoryNavigationKey();
+  let toolHistoryIdleHandle = null;
+  let toolHistoryIdleHandleKind = null;
+  let toolHistoryIdleGapTimer = null;
+  const toolHistoryIdleQueue = [];
+  const toolHistoryIdleQueuedKeys = new Set();
+  let toolHistoryPayloadSummaryIndex = null;
+
+  function installToolHistoryHideStyle() {
+    if (document.getElementById(TOOL_HISTORY_HIDE_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = TOOL_HISTORY_HIDE_STYLE_ID;
+    style.textContent = `
+      ${TOOL_HISTORY_GROUP_SELECTOR} { display: none !important; }
+      ${TOOL_HISTORY_GROUP_SELECTOR}[${TOOL_HISTORY_SUMMARY_ATTR}="true"] {
+        display: block !important;
+        color: var(--text-secondary, currentColor);
+        font-size: 0.875rem;
+        margin-block: 0.375rem;
+      }
+      ${TOOL_HISTORY_GROUP_SELECTOR}[${TOOL_HISTORY_SUMMARY_ATTR}="true"] > * {
+        display: none !important;
+      }
+      ${TOOL_HISTORY_GROUP_SELECTOR}[${TOOL_HISTORY_SUMMARY_ATTR}="true"]::before {
+        content: attr(${TOOL_HISTORY_SUMMARY_TEXT_ATTR});
+      }
+      [data-message-author-role="assistant"][${TOOL_HISTORY_PAYLOAD_SUMMARY_ATTR}="true"]::before {
+        content: attr(${TOOL_HISTORY_PAYLOAD_SUMMARY_TEXT_ATTR});
+        display: block;
+        color: var(--text-secondary, currentColor);
+        font-size: 0.875rem;
+        line-height: 1.25rem;
+        margin-block: 0.25rem 0.375rem;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function clearToolHistoryPayloadSummaryAttributes(root = document) {
+    const queryRoot = root?.querySelectorAll ? root : document;
+    const nodes = [];
+    if (root instanceof Element && root.hasAttribute?.(TOOL_HISTORY_PAYLOAD_SUMMARY_ATTR)) nodes.push(root);
+    for (const node of Array.from(queryRoot.querySelectorAll?.(`[${TOOL_HISTORY_PAYLOAD_SUMMARY_ATTR}="true"]`) || [])) nodes.push(node);
+    for (const node of nodes) {
+      node.removeAttribute?.(TOOL_HISTORY_PAYLOAD_SUMMARY_ATTR);
+      node.removeAttribute?.(TOOL_HISTORY_PAYLOAD_SUMMARY_TEXT_ATTR);
+      node.removeAttribute?.(TOOL_HISTORY_PAYLOAD_TOOL_COUNT_ATTR);
+    }
+  }
+
+  function mergeToolHistoryPayloadSummaryIndex(previous, next) {
+    if (!next || typeof next !== 'object') return previous || null;
+    if (
+      !previous
+      || typeof previous !== 'object'
+      || !previous.conversationId
+      || previous.conversationId !== next.conversationId
+    ) return next;
+    const byAssistantMessageId = {
+      ...(previous.byAssistantMessageId || {}),
+      ...(next.byAssistantMessageId || {})
+    };
+    return {
+      ...previous,
+      ...next,
+      byAssistantMessageId,
+      summarizedTurnCount: Object.keys(byAssistantMessageId).length,
+      totalToolInvocations: Object.values(byAssistantMessageId)
+        .reduce((sum, entry) => sum + Math.max(0, Math.floor(Number(entry?.toolCount || 0))), 0)
+    };
+  }
+
+  function applyToolHistoryPayloadSummaryIndex(index = toolHistoryPayloadSummaryIndex, reason = 'apply') {
+    if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) {
+      toolHistoryPayloadSummaryIndex = null;
+      clearToolHistoryPayloadSummaryAttributes(document);
+      return { applied: 0, reason: 'feature_disabled' };
+    }
+    if (index && typeof index === 'object') {
+      toolHistoryPayloadSummaryIndex = mergeToolHistoryPayloadSummaryIndex(toolHistoryPayloadSummaryIndex, index);
+    }
+    const activeIndex = toolHistoryPayloadSummaryIndex;
+    const currentConversationId = tryExtractConversationIdFromUrl(window.location.href);
+    if (!activeIndex || !currentConversationId || activeIndex.conversationId !== currentConversationId) {
+      clearToolHistoryPayloadSummaryAttributes(document);
+      return { applied: 0, reason: 'index_unavailable_or_mismatch' };
+    }
+    installToolHistoryHideStyle();
+    const byAssistantMessageId = activeIndex.byAssistantMessageId && typeof activeIndex.byAssistantMessageId === 'object'
+      ? activeIndex.byAssistantMessageId
+      : {};
+    let applied = 0;
+    for (const node of Array.from(document.querySelectorAll('[data-message-author-role="assistant"][data-message-id]'))) {
+      const messageId = String(node.getAttribute?.('data-message-id') || '').trim();
+      const entry = byAssistantMessageId[messageId] || null;
+      const count = Math.max(0, Math.floor(Number(entry?.toolCount || 0)));
+      const section = node.closest?.(MESSAGE_SECTION_SELECTOR) || null;
+      const nativeToolHistoryPresent = Boolean(
+        section?.querySelector?.(TOOL_HISTORY_GROUP_SELECTOR)
+        || section?.querySelector?.(`[${TOOL_HISTORY_SUMMARY_ATTR}="true"]`)
+      );
+      if (count > 0 && !nativeToolHistoryPresent) {
+        node.setAttribute(TOOL_HISTORY_PAYLOAD_SUMMARY_ATTR, 'true');
+        node.setAttribute(TOOL_HISTORY_PAYLOAD_TOOL_COUNT_ATTR, String(count));
+        node.setAttribute(TOOL_HISTORY_PAYLOAD_SUMMARY_TEXT_ATTR, `ツール使用 × ${count}`);
+        applied += 1;
+      } else {
+        node.removeAttribute(TOOL_HISTORY_PAYLOAD_SUMMARY_ATTR);
+        node.removeAttribute(TOOL_HISTORY_PAYLOAD_TOOL_COUNT_ATTR);
+        node.removeAttribute(TOOL_HISTORY_PAYLOAD_SUMMARY_TEXT_ATTR);
+      }
+    }
+    return { applied, reason };
+  }
+
+  function clearToolHistoryHydrationTimer() {
+    if (toolHistoryHydrationTimer !== null) clearTimeout(toolHistoryHydrationTimer);
+    toolHistoryHydrationTimer = null;
+  }
+
+  function releaseToolHistoryHydrationGuard(reason = 'hydration_release') {
+    clearToolHistoryHydrationTimer();
+    if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) return;
+    toolHistoryHydrationReady = true;
+    queueToolHistorySectionSweep(document, 'summary', reason);
+    scheduleToolHistoryHardPrune(reason);
+  }
+
+  function scheduleToolHistoryHydrationRelease(reason = 'hydration_wait') {
+    clearToolHistoryHydrationTimer();
+    if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) return;
+    installToolHistoryHideStyle();
+    const delayMs = Math.max(0, toolHistoryHydrationBlockedUntil - Date.now());
+    if (delayMs <= 0) {
+      releaseToolHistoryHydrationGuard(reason);
+      return;
+    }
+    toolHistoryHydrationTimer = setTimeout(
+      () => releaseToolHistoryHydrationGuard(reason),
+      delayMs
+    );
+  }
+
+  function resetToolHistoryHydrationGuard(reason = 'navigation') {
+    const nextNavigationKey = getToolHistoryNavigationKey();
+    if (nextNavigationKey === toolHistoryHydrationNavigationKey) {
+      if (isArcaiaExtensionEnabled() && isArcaiaFeatureEnabled('toolHistoryCompaction')) {
+        installToolHistoryHideStyle();
+        if (!toolHistoryHydrationReady && toolHistoryHydrationTimer === null) {
+          scheduleToolHistoryHydrationRelease(reason);
+        }
+      }
+      return;
+    }
+    toolHistoryHydrationNavigationKey = nextNavigationKey;
+    clearToolHistoryHydrationTimer();
+    clearToolHistoryHardPruneTimer();
+    clearToolHistoryIdleQueue();
+    toolHistoryHydrationReady = false;
+    toolHistoryHydrationBlockedUntil = Date.now() + TOOL_HISTORY_INITIAL_HYDRATION_GRACE_MS;
+    if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) return;
+    installToolHistoryHideStyle();
+    scheduleToolHistoryHydrationRelease(reason);
+  }
+
+  function resolveToolHistoryCompactionMode(generating, isLatestAssistant, softOnly = false) {
+    return softOnly || generating ? 'soft' : 'hard';
+  }
+
+  function getToolHistoryAssistantSections(root = document) {
+    const queryRoot = root?.querySelectorAll ? root : document;
+    const sections = [];
+    if (root instanceof Element && root.matches?.(MESSAGE_SECTION_SELECTOR)) sections.push(root);
+    for (const section of Array.from(queryRoot.querySelectorAll?.(MESSAGE_SECTION_SELECTOR) || [])) sections.push(section);
+    return sections.filter((section, index, list) => {
+      if (!section?.isConnected || list.indexOf(section) !== index) return false;
+      if (section.querySelector?.('[data-message-author-role="user"]')) return false;
+      return Boolean(
+        section.querySelector?.('[data-message-author-role="assistant"]')
+        || section.querySelector?.(TOOL_HISTORY_GROUP_SELECTOR)
+        || section.querySelector?.(`[${TOOL_HISTORY_SUMMARY_ATTR}="true"]`)
+      );
+    });
+  }
+
+  function classListContainsAll(element, tokens) {
+    if (!(element instanceof Element)) return false;
+    return tokens.every((token) => element.classList?.contains?.(token));
+  }
+
+  function findToolHistoryDetailWrapper(button, section) {
+    if (!(button instanceof Element) || !(section instanceof Element)) return null;
+    const row = button.parentElement;
+    if (!classListContainsAll(row, [
+      'group',
+      'text-token-text-tertiary',
+      'relative',
+      'flex',
+      'items-start',
+      'text-start',
+      'text-base',
+      'leading-6',
+      'select-none'
+    ])) return null;
+    let candidate = row;
+    while (candidate && candidate !== section) {
+      const parent = candidate.parentElement;
+      if (classListContainsAll(parent, ['flex', 'flex-col', 'gap-4'])) return candidate;
+      candidate = parent;
+    }
+    return null;
+  }
+
+  function collectToolHistoryDetailWrappers(section) {
+    const wrappers = new Set();
+    for (const button of Array.from(section?.querySelectorAll?.('button.absolute.inset-0[aria-label]') || [])) {
+      if (!String(button.getAttribute?.('aria-label') || '').trim()) continue;
+      const wrapper = findToolHistoryDetailWrapper(button, section);
+      if (wrapper) wrappers.add(wrapper);
+    }
+    return Array.from(wrappers);
+  }
+
+  function ensureToolHistorySummary(section, requestedCount, anchor) {
+    let summary = section.querySelector?.(`[${TOOL_HISTORY_SUMMARY_ATTR}="true"]`) || null;
+    if (!summary) {
+      summary = anchor?.matches?.(TOOL_HISTORY_GROUP_SELECTOR)
+        ? anchor
+        : section.querySelector?.(TOOL_HISTORY_GROUP_SELECTOR) || null;
+      if (!summary) return null;
+      summary.setAttribute(TOOL_HISTORY_SUMMARY_ATTR, 'true');
+    }
+    const previousCount = Number(summary.dataset.toolCount || 0);
+    const count = Math.max(previousCount, Number(requestedCount) || 0);
+    summary.dataset.toolCount = String(count);
+    summary.setAttribute(TOOL_HISTORY_SUMMARY_TEXT_ATTR, `ツール使用 × ${count}`);
+    summary.setAttribute('aria-label', `Arcaia: ツール使用 ${count}回`);
+    return summary;
+  }
+
+  function softHideToolHistoryCandidate(candidate) {
+    if (!(candidate instanceof HTMLElement) || !candidate.isConnected) return false;
+    if (!candidate.hasAttribute(TOOL_HISTORY_ORIGINAL_DISPLAY_ATTR)) {
+      candidate.setAttribute(TOOL_HISTORY_ORIGINAL_DISPLAY_ATTR, candidate.style.display || '');
+    }
+    candidate.setAttribute(TOOL_HISTORY_SOFT_HIDDEN_ATTR, 'true');
+    candidate.style.display = 'none';
+    return true;
+  }
+
+  function hardPruneToolHistoryCandidate(candidate) {
+    // ChatGPT owns this DOM through React. Physically detaching a historical
+    // tool node leaves React's virtual tree out of sync and can make the next
+    // tool-enabled send fall into the page-level "Content failed to load"
+    // error boundary. Keep the node connected and apply the same reversible
+    // soft-hide markers instead.
+    return softHideToolHistoryCandidate(candidate);
+  }
+
+  function compactToolHistorySection(section, generating, latestAssistantSection, softOnly = false, maxCandidates = Number.POSITIVE_INFINITY) {
+    if (!(section instanceof Element) || !section.isConnected) return { compacted: false, count: 0, needsHardPrune: false, remainingCandidates: 0 };
+    const toolGroups = Array.from(section.querySelectorAll?.(TOOL_HISTORY_GROUP_SELECTOR) || [])
+      .filter((candidate) => candidate?.isConnected);
+    const existingSummary = section.querySelector?.(`[${TOOL_HISTORY_SUMMARY_ATTR}="true"]`) || null;
+    if (!toolGroups.length && !existingSummary) return { compacted: false, count: 0, needsHardPrune: false, remainingCandidates: 0 };
+    const previousCount = Number(existingSummary?.dataset?.toolCount || 0);
+    const count = Math.max(previousCount, toolGroups.length);
+    if (count <= 0) return { compacted: false, count: 0, needsHardPrune: false, remainingCandidates: 0 };
+    const detailWrappers = collectToolHistoryDetailWrappers(section);
+    const candidates = [...detailWrappers, ...toolGroups].filter((candidate, index, list) => list.indexOf(candidate) === index);
+    const summary = ensureToolHistorySummary(section, count, toolGroups[0] || detailWrappers[0] || null);
+    const mode = resolveToolHistoryCompactionMode(generating, section === latestAssistantSection, softOnly);
+    const prunableCandidates = candidates.filter((candidate) => candidate !== summary && !candidate.contains?.(summary));
+    const candidateLimit = Number.isFinite(maxCandidates) ? Math.max(0, Math.floor(maxCandidates)) : prunableCandidates.length;
+    const selectedCandidates = prunableCandidates.slice(0, candidateLimit);
+    let changed = 0;
+    for (const candidate of selectedCandidates) {
+      if (mode === 'soft') {
+        if (softHideToolHistoryCandidate(candidate)) changed += 1;
+      } else if (hardPruneToolHistoryCandidate(candidate)) {
+        changed += 1;
+      }
+    }
+    return {
+      compacted: changed > 0,
+      count,
+      mode,
+      changed,
+      needsHardPrune: mode === 'soft' && prunableCandidates.length > 0,
+      remainingCandidates: Math.max(0, prunableCandidates.length - selectedCandidates.length)
+    };
+  }
+
+  function compactToolHistory(root = document, reason = 'manual', softOnly = false) {
+    if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) {
+      return { compacted: false, reason: 'feature_disabled', needsHardPrune: false };
+    }
+    const sections = getToolHistoryAssistantSections(root);
+    const latestAssistantSection = getToolHistoryAssistantSections(document).pop() || null;
+    const generating = Boolean(isLikelyChatGPTGenerating()?.generating);
+    let changed = 0;
+    let toolCount = 0;
+    let needsHardPrune = false;
+    for (const section of sections) {
+      const result = compactToolHistorySection(section, generating, latestAssistantSection, softOnly);
+      changed += Number(result.changed || 0);
+      toolCount += Number(result.count || 0);
+      needsHardPrune = needsHardPrune || Boolean(result.needsHardPrune);
+    }
+    return { compacted: changed > 0, changed, toolCount, reason, needsHardPrune };
+  }
+
+  function getToolHistoryIdleQueueKey(section, mode) {
+    if (!(section instanceof Element)) return null;
+    const stableId = section.getAttribute?.('data-testid') || getSectionMessageId(section) || null;
+    return stableId ? `${mode}:${stableId}` : null;
+  }
+
+  function cancelToolHistoryIdleQueueHandle() {
+    if (toolHistoryIdleGapTimer !== null) {
+      clearTimeout(toolHistoryIdleGapTimer);
+      toolHistoryIdleGapTimer = null;
+    }
+    if (toolHistoryIdleHandle !== null) {
+      if (toolHistoryIdleHandleKind === 'idle' && typeof window.cancelIdleCallback === 'function') {
+        window.cancelIdleCallback(toolHistoryIdleHandle);
+      } else if (toolHistoryIdleHandleKind === 'raf') {
+        cancelAnimationFrame(toolHistoryIdleHandle);
+      }
+    }
+    toolHistoryIdleHandle = null;
+    toolHistoryIdleHandleKind = null;
+  }
+
+  function clearToolHistoryIdleQueue() {
+    cancelToolHistoryIdleQueueHandle();
+    toolHistoryIdleQueue.length = 0;
+    toolHistoryIdleQueuedKeys.clear();
+  }
+
+  function scheduleToolHistoryIdleQueue() {
+    if (toolHistoryIdleHandle !== null || toolHistoryIdleGapTimer !== null || toolHistoryIdleQueue.length === 0) return;
+    toolHistoryIdleGapTimer = setTimeout(() => {
+      toolHistoryIdleGapTimer = null;
+      if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction') || toolHistoryIdleQueue.length === 0) return;
+      if (typeof window.requestIdleCallback === 'function') {
+        toolHistoryIdleHandleKind = 'idle';
+        toolHistoryIdleHandle = window.requestIdleCallback(drainToolHistoryIdleQueue, { timeout: 1000 });
+        return;
+      }
+      toolHistoryIdleHandleKind = 'raf';
+      toolHistoryIdleHandle = requestAnimationFrame(() => drainToolHistoryIdleQueue({
+        didTimeout: false,
+        timeRemaining: () => 8
+      }));
+    }, TOOL_HISTORY_IDLE_BATCH_GAP_MS);
+  }
+
+  function queueToolHistorySectionWork(section, mode = 'summary', reason = 'queued') {
+    if (!(section instanceof Element) || !section.isConnected) return false;
+    if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) return false;
+    const key = getToolHistoryIdleQueueKey(section, mode);
+    if (key && toolHistoryIdleQueuedKeys.has(key)) return false;
+    if (key) toolHistoryIdleQueuedKeys.add(key);
+    toolHistoryIdleQueue.push({ section, mode, reason, key });
+    scheduleToolHistoryIdleQueue();
+    return true;
+  }
+
+  function queueToolHistorySectionSweep(root = document, mode = 'summary', reason = 'sweep') {
+    if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) return 0;
+    const sections = getToolHistoryAssistantSections(root);
+    let queued = 0;
+    for (const section of sections) {
+      if (queueToolHistorySectionWork(section, mode, reason)) queued += 1;
+    }
+    return queued;
+  }
+
+  function drainToolHistoryIdleQueue() {
+    toolHistoryIdleHandle = null;
+    toolHistoryIdleHandleKind = null;
+    if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) {
+      clearToolHistoryIdleQueue();
+      return;
+    }
+    const work = toolHistoryIdleQueue.shift() || null;
+    if (!work) return;
+    if (work.key) toolHistoryIdleQueuedKeys.delete(work.key);
+    const section = work.section;
+    if (!(section instanceof Element) || !section.isConnected) {
+      scheduleToolHistoryIdleQueue();
+      return;
+    }
+    const assistantSections = getToolHistoryAssistantSections(document);
+    const latestAssistantSection = assistantSections[assistantSections.length - 1] || null;
+    const generating = Boolean(isLikelyChatGPTGenerating()?.generating);
+    if (work.mode === 'hard' && generating) {
+      scheduleToolHistoryHardPrune(`generation_active:${work.reason}`);
+      scheduleToolHistoryIdleQueue();
+      return;
+    }
+    if (work.mode === 'hard') {
+      if (section === latestAssistantSection) {
+        scheduleToolHistoryIdleQueue();
+        return;
+      } else {
+        const result = compactToolHistorySection(
+          section,
+          generating,
+          latestAssistantSection,
+          false,
+          TOOL_HISTORY_IDLE_BATCH_SIZE
+        );
+        if (result.remainingCandidates > 0) {
+          queueToolHistorySectionWork(section, 'hard', work.reason);
+        }
+      }
+    } else {
+      const result = compactToolHistorySection(section, generating, latestAssistantSection, true, 0);
+      if (result.needsHardPrune) scheduleToolHistoryHardPrune(work.reason);
+    }
+    scheduleToolHistoryIdleQueue();
+  }
+
+  function clearToolHistoryHardPruneTimer() {
+    if (toolHistoryHardPruneTimer !== null) clearTimeout(toolHistoryHardPruneTimer);
+    toolHistoryHardPruneTimer = null;
+  }
+
+  function scheduleToolHistoryHardPrune(reason = 'tool_dom_quiet') {
+    if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) return;
+    clearToolHistoryHardPruneTimer();
+    toolHistoryHardPruneTimer = setTimeout(() => {
+      toolHistoryHardPruneTimer = null;
+      if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) return;
+      if (Boolean(isLikelyChatGPTGenerating()?.generating)) {
+        scheduleToolHistoryHardPrune(`generation_active:${reason}`);
+        return;
+      }
+      queueToolHistorySectionSweep(document, 'hard', `hard_prune:${reason}`);
+    }, TOOL_HISTORY_HARD_PRUNE_QUIET_MS);
+  }
+
+  function restoreSoftHiddenToolHistoryCandidate(candidate) {
+    if (!(candidate instanceof HTMLElement)) return false;
+    const originalDisplay = candidate.getAttribute(TOOL_HISTORY_ORIGINAL_DISPLAY_ATTR);
+    if (originalDisplay) candidate.style.display = originalDisplay;
+    else candidate.style.removeProperty('display');
+    candidate.removeAttribute(TOOL_HISTORY_SOFT_HIDDEN_ATTR);
+    candidate.removeAttribute(TOOL_HISTORY_ORIGINAL_DISPLAY_ATTR);
+    return true;
+  }
+
+  function cleanupToolHistoryCompactionArtifacts() {
+    clearToolHistoryHydrationTimer();
+    clearToolHistoryHardPruneTimer();
+    clearToolHistoryIdleQueue();
+    toolHistoryHydrationReady = false;
+    toolHistoryPayloadSummaryIndex = null;
+    clearToolHistoryPayloadSummaryAttributes(document);
+    document.getElementById(TOOL_HISTORY_HIDE_STYLE_ID)?.remove?.();
+    for (const candidate of Array.from(document.querySelectorAll(`[${TOOL_HISTORY_SOFT_HIDDEN_ATTR}="true"]`))) {
+      restoreSoftHiddenToolHistoryCandidate(candidate);
+    }
+    for (const summary of Array.from(document.querySelectorAll(`[${TOOL_HISTORY_SUMMARY_ATTR}="true"]`))) {
+      summary.removeAttribute(TOOL_HISTORY_SUMMARY_ATTR);
+      summary.removeAttribute(TOOL_HISTORY_SUMMARY_TEXT_ATTR);
+      summary.removeAttribute('aria-label');
+      delete summary.dataset.toolCount;
+    }
+  }
+
+  function scheduleToolHistoryCompactionForMutations(mutations) {
+    if (!isArcaiaExtensionEnabled() || !isArcaiaFeatureEnabled('toolHistoryCompaction')) return;
+    if (!toolHistoryHydrationReady) return;
+    const sections = new Set();
+    for (const mutation of mutations || []) {
+      const nodes = [mutation?.target, ...(mutation?.addedNodes || [])];
+      for (const node of nodes) {
+        const element = node instanceof Element ? node : node?.parentElement;
+        if (!element) continue;
+        const section = element.matches?.(MESSAGE_SECTION_SELECTOR) ? element : element.closest?.(MESSAGE_SECTION_SELECTOR);
+        if (section?.querySelector?.('[data-message-author-role="assistant"]')) sections.add(section);
+      }
+    }
+    if (!sections.size) return;
+    for (const section of sections) {
+      queueToolHistorySectionWork(section, 'summary', 'conversation_mutation');
+    }
+    scheduleToolHistoryHardPrune('conversation_mutation');
   }
 
   function collectMessageSectionModel(root = document) {
@@ -4904,6 +4887,7 @@
   const ASSISTANT_LOADING_STREAM_ROOT_SELECTOR = '[data-scroll-root]';
   const ASSISTANT_LOADING_STREAM_ACTIVE_ATTR = 'data-stream-active';
   const ASSISTANT_STREAMING_RESPONSE_STATUS_SELECTOR = '[data-streaming-response-status]';
+  const ASSISTANT_IMAGE_GENERATION_LOADING_SELECTOR = '[data-testid="image-gen-loading-state"]';
 
   function hasLatestAssistantStreamingResponseStatus(root = document) {
     const queryRoot = root?.querySelectorAll ? root : document;
@@ -4914,6 +4898,17 @@
 
   function shouldPreserveAssistantGenerationForStreamingResponseStatus(generationActive, detector) {
     return Boolean(generationActive && detector?.streamingResponseStatusPresent);
+  }
+
+  function hasLatestAssistantImageGenerationLoadingState(root = document) {
+    const queryRoot = root?.querySelectorAll ? root : document;
+    const assistantTurns = Array.from(queryRoot.querySelectorAll('section[data-turn="assistant"]'));
+    const latestAssistantTurn = assistantTurns.at(-1) || null;
+    return Boolean(latestAssistantTurn?.querySelector?.(ASSISTANT_IMAGE_GENERATION_LOADING_SELECTOR));
+  }
+
+  function shouldPreserveAssistantGenerationForImageGeneration(generationActive, detector) {
+    return Boolean(generationActive && detector?.imageGenerationLoadingPresent);
   }
 
   function getAssistantLoadingStreamRoot(root = document) {
@@ -4936,6 +4931,10 @@
       streamRoot?.isConnected
       && hasLatestAssistantStreamingResponseStatus(streamRoot)
     );
+    const imageGenerationLoadingPresent = Boolean(
+      streamRoot?.isConnected
+      && hasLatestAssistantImageGenerationLoadingState(streamRoot)
+    );
     return {
       selector: ASSISTANT_LOADING_STREAM_ROOT_SELECTOR,
       activeAttribute: ASSISTANT_LOADING_STREAM_ACTIVE_ATTR,
@@ -4943,6 +4942,7 @@
       streamRootConnected: Boolean(streamRoot?.isConnected),
       generating,
       streamingResponseStatusPresent,
+      imageGenerationLoadingPresent,
       tag: String(streamRoot?.tagName || '').toLowerCase() || null,
       className: typeof streamRoot?.className === 'string'
         ? streamRoot.className
@@ -4965,6 +4965,7 @@
       detectorDetailsOmittedReason: 'stream_root_attribute_with_latest_assistant_response_status_guard',
       streamState,
       streamingResponseStatusPresent: streamState.streamingResponseStatusPresent,
+      imageGenerationLoadingPresent: streamState.imageGenerationLoadingPresent,
       candidates
     };
   }
@@ -4993,14 +4994,98 @@
   const ASSISTANT_COMPLETION_SOUND_PRESETS = Object.freeze({
     classic_chime: Object.freeze({
       id: 'classic_chime',
-      label: 'Classic chime',
-      kind: 'offscreen_html_audio_synth',
+      label: '通知音1',
+      kind: 'offscreen_html_audio_asset',
       volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
       routedBy: 'background_offscreen_audio'
     }),
     soft_chime: Object.freeze({
       id: 'soft_chime',
-      label: 'Soft chime',
+      label: '通知音2',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_03: Object.freeze({
+      id: 'notification_sound_03',
+      label: '通知音3',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_04: Object.freeze({
+      id: 'notification_sound_04',
+      label: '通知音4',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_05: Object.freeze({
+      id: 'notification_sound_05',
+      label: '通知音5',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_06: Object.freeze({
+      id: 'notification_sound_06',
+      label: '通知音6',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_07: Object.freeze({
+      id: 'notification_sound_07',
+      label: '通知音7',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_08: Object.freeze({
+      id: 'notification_sound_08',
+      label: '通知音8',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_09: Object.freeze({
+      id: 'notification_sound_09',
+      label: '通知音9',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_10: Object.freeze({
+      id: 'notification_sound_10',
+      label: '通知音10',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_11: Object.freeze({
+      id: 'notification_sound_11',
+      label: '通知音11',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_12: Object.freeze({
+      id: 'notification_sound_12',
+      label: '通知音12',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_13: Object.freeze({
+      id: 'notification_sound_13',
+      label: '通知音13',
+      kind: 'offscreen_html_audio_asset',
+      volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
+      routedBy: 'background_offscreen_audio'
+    }),
+    notification_sound_14: Object.freeze({
+      id: 'notification_sound_14',
+      label: '通知音14',
       kind: 'offscreen_html_audio_asset',
       volume: DEFAULT_ASSISTANT_COMPLETION_SOUND_VOLUME,
       routedBy: 'background_offscreen_audio'
@@ -5184,8 +5269,9 @@
 
   function setAssistantActivityTitlePrefix(prefix) {
     const normalizedPrefix = String(prefix || '');
-    const currentBase = stripAssistantActivityTitlePrefix(document.title || '');
-    const baseTitle = assistantActivityOriginalTitle || currentBase;
+    const currentTitle = String(document.title || '');
+    const currentBase = stripAssistantActivityTitlePrefix(currentTitle);
+    const baseTitle = currentTitle === currentBase ? currentBase : (assistantActivityOriginalTitle || currentBase);
     assistantActivityOriginalTitle = baseTitle;
     assistantActivityTitlePrefix = normalizedPrefix;
     try { document.title = normalizedPrefix ? `${normalizedPrefix}${baseTitle}` : baseTitle; } catch {}
@@ -5264,13 +5350,6 @@
     }
     const title = clearAssistantActivityTitlePrefix();
     return { active: false, state: 'normal', reason, ...title };
-  }
-
-  function clearCompletedInactiveTitleIfVisible(reason = 'visible') {
-    if (!isAssistantActivityPageActive()) return false;
-    assistantCompletedInactiveTitlePending = false;
-    syncAssistantActivityTitle(reason);
-    return true;
   }
 
   function clearAssistantGenerationIdentity() {
@@ -5519,7 +5598,7 @@
     const preserveGeneration = shouldPreserveAssistantGenerationForStreamingResponseStatus(
       assistantGenerationActive,
       detector
-    );
+    ) || shouldPreserveAssistantGenerationForImageGeneration(assistantGenerationActive, detector);
     const state = applyAssistantLoadingFaviconState(Boolean(detector?.generating || preserveGeneration), reason);
     return {
       ok: true,
@@ -5683,583 +5762,6 @@
   }
 
 
-  function isElementActuallyVisible(el) {
-    try {
-      if (!el || !el.isConnected) return false;
-      if (el.closest?.(`#${LITE_BAR_ID}`)) return false;
-      const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
-      if (style && (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)) return false;
-      const rect = el.getBoundingClientRect?.();
-      if (rect && rect.width === 0 && rect.height === 0) return false;
-      return true;
-    } catch {
-      return Boolean(el?.isConnected);
-    }
-  }
-
-  function getRoleNodeCountsForLite(root = document) {
-    const queryRoot = root?.querySelectorAll ? root : document;
-    const all = Array.from(queryRoot.querySelectorAll('[data-message-author-role]'))
-      .filter((el) => el && el.isConnected && !el.closest?.(`#${LITE_BAR_ID}`));
-    const user = all.filter((el) => el.getAttribute('data-message-author-role') === 'user');
-    const assistant = all.filter((el) => el.getAttribute('data-message-author-role') === 'assistant');
-    const visible = all.filter(isElementActuallyVisible);
-    return {
-      all: all.length,
-      user: user.length,
-      assistant: assistant.length,
-      visibleAll: visible.length,
-      visibleUser: visible.filter((el) => el.getAttribute('data-message-author-role') === 'user').length,
-      visibleAssistant: visible.filter((el) => el.getAttribute('data-message-author-role') === 'assistant').length
-    };
-  }
-
-  function summarizeLiteContainerForLog(container) {
-    if (!container) return null;
-    let rect = null;
-    try {
-      const r = container.getBoundingClientRect?.();
-      if (r) rect = { top: Math.round(r.top), height: Math.round(r.height), width: Math.round(r.width) };
-    } catch {}
-    const roleNodes = Array.from(container.querySelectorAll?.('[data-message-author-role]') || []);
-    return {
-      tag: String(container.tagName || '').toLowerCase(),
-      className: typeof container.className === 'string' ? container.className.split(/\s+/).filter(Boolean).slice(0, 10).join(' ') : '',
-      dataTestId: container.getAttribute?.('data-testid') || null,
-      messageId: container.getAttribute?.('data-message-id') || container.querySelector?.('[data-message-id]')?.getAttribute?.('data-message-id') || null,
-      roleNodes: roleNodes.slice(0, 6).map((node) => ({
-        role: node.getAttribute('data-message-author-role'),
-        textLength: (node.textContent || '').length,
-        dataMessageId: node.getAttribute?.('data-message-id') || node.querySelector?.('[data-message-id]')?.getAttribute?.('data-message-id') || null
-      })),
-      textLength: (container.textContent || '').length,
-      isConnected: Boolean(container.isConnected),
-      rect
-    };
-  }
-
-  function summarizeLiteTurnForLog(turn, oneBasedIndex) {
-    const containers = Array.from(turn?.containers || []);
-    const roleSummary = [];
-    for (const container of containers) {
-      for (const node of Array.from(container.querySelectorAll?.('[data-message-author-role]') || [])) {
-        roleSummary.push({ role: node.getAttribute('data-message-author-role'), textLength: (node.textContent || '').length });
-      }
-    }
-    return {
-      turnNumber: oneBasedIndex,
-      containerCount: containers.length,
-      hasUser: Boolean(turn?.hasUser),
-      hasAssistant: Boolean(turn?.hasAssistant),
-      roleSummary: roleSummary.slice(0, 8),
-      textLength: containers.reduce((sum, el) => sum + ((el.textContent || '').length), 0),
-      firstContainer: summarizeLiteContainerForLog(containers[0])
-    };
-  }
-
-
-  function getContentDiagnostics() {
-    const diagnostics = window.ArcaiaContentDiagnostics;
-    if (!diagnostics || typeof diagnostics.simpleDiagnosticHash !== 'function') {
-      throw new Error('Arcaia content diagnostics helper is not loaded.');
-    }
-    return diagnostics;
-  }
-
-  function simpleDiagnosticHash(text) {
-    return getContentDiagnostics().simpleDiagnosticHash(text);
-  }
-
-  function getElementRectForDiagnostics(el) {
-    try {
-      const rect = el?.getBoundingClientRect?.();
-      return getContentDiagnostics().normalizeRectForDiagnostics(rect);
-    } catch {
-      return null;
-    }
-  }
-
-  function getElementVisibilityDiagnostics(el) {
-    try {
-      const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
-      const rect = getElementRectForDiagnostics(el);
-      const ariaHiddenAncestor = Boolean(el?.closest?.('[aria-hidden="true"]'));
-      const hiddenByRolling = el?.getAttribute?.(ROLLING_HIDE_ATTR) === 'true' || Boolean(el?.closest?.(`[${ROLLING_HIDE_ATTR}="true"]`));
-      const display = style?.display || el?.style?.display || '';
-      const visibility = style?.visibility || '';
-      const opacity = style?.opacity || '';
-      const rectNonZero = Boolean(rect && rect.width > 0 && rect.height > 0);
-      return {
-        isConnected: Boolean(el?.isConnected),
-        hiddenByRolling,
-        display,
-        visibility,
-        opacity,
-        ariaHiddenAncestor,
-        rectNonZero,
-        visible: Boolean(el?.isConnected) && !hiddenByRolling && display !== 'none' && visibility !== 'hidden' && Number(opacity || 1) !== 0 && !ariaHiddenAncestor && rectNonZero,
-        rect
-      };
-    } catch (error) {
-      return { visible: Boolean(el?.isConnected), error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-  function getElementDiagnosticFingerprint(el) {
-    if (!el) return null;
-    const attrs = {};
-    for (const name of ['id', 'role', 'aria-label', 'data-testid', 'data-message-author-role', 'data-message-id', 'data-section-id', 'data-turn-id']) {
-      const value = el.getAttribute?.(name);
-      if (value) attrs[name] = String(value).slice(0, 220);
-    }
-    return {
-      tag: String(el.tagName || '').toLowerCase(),
-      attrs,
-      className: typeof el.className === 'string' ? el.className.split(/\s+/).filter(Boolean).slice(0, 14).join(' ') : '',
-      textLength: (el.textContent || '').length,
-      textHash: simpleDiagnosticHash(el.textContent || ''),
-      visibility: getElementVisibilityDiagnostics(el)
-    };
-  }
-
-  function getElementParentChainDiagnostics(el, maxDepth = 8) {
-    const chain = [];
-    let node = el;
-    for (let depth = 0; node && depth < maxDepth; depth += 1) {
-      chain.push(getElementDiagnosticFingerprint(node));
-      node = node.parentElement;
-    }
-    return chain;
-  }
-
-  function getComputedLayoutSummary(el) {
-    try {
-      const style = window.getComputedStyle?.(el) || null;
-      const rect = getElementRectForDiagnostics(el);
-      const clientRects = Array.from(el?.getClientRects?.() || []);
-      const firstClientRect = clientRects[0] ? {
-        top: Math.round(clientRects[0].top),
-        left: Math.round(clientRects[0].left),
-        width: Math.round(clientRects[0].width),
-        height: Math.round(clientRects[0].height),
-        bottom: Math.round(clientRects[0].bottom),
-        right: Math.round(clientRects[0].right)
-      } : null;
-      return {
-        inlineDisplay: el?.style?.display || '',
-        computedDisplay: style?.display || '',
-        visibility: style?.visibility || '',
-        opacity: style?.opacity || '',
-        position: style?.position || '',
-        contentVisibility: style?.contentVisibility || '',
-        contain: style?.contain || '',
-        overflow: style?.overflow || '',
-        overflowY: style?.overflowY || '',
-        transform: style?.transform && style.transform !== 'none' ? String(style.transform).slice(0, 220) : '',
-        pointerEvents: style?.pointerEvents || '',
-        rect,
-        clientRectCount: clientRects.length,
-        firstClientRect,
-        offsetHeight: Number(el?.offsetHeight || 0),
-        offsetWidth: Number(el?.offsetWidth || 0),
-        clientHeight: Number(el?.clientHeight || 0),
-        clientWidth: Number(el?.clientWidth || 0),
-        scrollHeight: Number(el?.scrollHeight || 0),
-        scrollWidth: Number(el?.scrollWidth || 0),
-        scrollTop: Number(el?.scrollTop || 0),
-        scrollLeft: Number(el?.scrollLeft || 0),
-        maxScrollTop: Math.max(0, Number(el?.scrollHeight || 0) - Number(el?.clientHeight || 0)),
-        verticalOverflowPx: Math.max(0, Number(el?.scrollHeight || 0) - Number(el?.clientHeight || 0))
-      };
-    } catch (error) {
-      return { error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-  function isRuntimeLayoutVisible(el) {
-    const layout = getComputedLayoutSummary(el);
-    const rect = layout?.rect;
-    return Boolean(el?.isConnected)
-      && el?.getAttribute?.(ROLLING_HIDE_ATTR) !== 'true'
-      && layout.computedDisplay !== 'none'
-      && layout.visibility !== 'hidden'
-      && Number(layout.opacity || 1) !== 0
-      && Boolean(rect && rect.width > 0 && rect.height > 0);
-  }
-
-  function summarizeAncestorLayoutChain(el, maxDepth = 7) {
-    const out = [];
-    let node = el;
-    for (let depth = 0; node && depth < maxDepth; depth += 1) {
-      const layout = getComputedLayoutSummary(node);
-      out.push({
-        depth,
-        tag: String(node.tagName || '').toLowerCase(),
-        id: node.id || '',
-        dataTestId: node.getAttribute?.('data-testid') || null,
-        role: node.getAttribute?.('role') || null,
-        className: typeof node.className === 'string' ? node.className.split(/\s+/).filter(Boolean).slice(0, 10).join(' ') : '',
-        layout: {
-          computedDisplay: layout.computedDisplay,
-          inlineDisplay: layout.inlineDisplay,
-          visibility: layout.visibility,
-          position: layout.position,
-          overflowY: layout.overflowY,
-          contentVisibility: layout.contentVisibility,
-          contain: layout.contain,
-          rect: layout.rect,
-          offsetHeight: layout.offsetHeight,
-          clientHeight: layout.clientHeight,
-          scrollHeight: layout.scrollHeight
-        }
-      });
-      node = node.parentElement;
-    }
-    return out;
-  }
-
-  function summarizeSectionRuntimeLayout(record) {
-    const section = record?.section;
-    if (!section) return null;
-    const layout = getComputedLayoutSummary(section);
-    const hiddenByAttr = section.getAttribute?.(ROLLING_HIDE_ATTR) === 'true';
-    const runtimeVisible = isRuntimeLayoutVisible(section);
-    const rect = layout?.rect;
-    const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
-    const intersectsViewport = Boolean(rect && rect.height > 0 && rect.width > 0 && rect.bottom >= 0 && rect.top <= viewportHeight);
-    let elementFromCenter = null;
-    try {
-      if (rect && rect.width > 0 && rect.height > 0) {
-        const x = Math.max(0, Math.min((window.innerWidth || 1) - 1, Math.round(rect.left + rect.width / 2)));
-        const y = Math.max(0, Math.min((window.innerHeight || 1) - 1, Math.round(rect.top + Math.min(rect.height / 2, 24))));
-        const hit = document.elementFromPoint?.(x, y);
-        elementFromCenter = hit ? {
-          tag: String(hit.tagName || '').toLowerCase(),
-          dataTestId: hit.getAttribute?.('data-testid') || null,
-          role: hit.getAttribute?.('data-message-author-role') || hit.getAttribute?.('role') || null,
-          withinSection: Boolean(hit === section || section.contains?.(hit))
-        } : null;
-      }
-    } catch {}
-    return {
-      domIndex: record.domIndex,
-      groupIndex: record.groupIndex ?? null,
-      role: record.role,
-      dataTestId: record.dataTestId || null,
-      messageId: record.messageId || null,
-      retained: Boolean(record.retained),
-      hiddenPlanned: Boolean(record.hiddenPlanned),
-      hiddenByArcaiaAttr: hiddenByAttr,
-      runtimeVisible,
-      intersectsViewport,
-      layout,
-      elementFromCenter,
-      ancestorLayoutChain: summarizeAncestorLayoutChain(section, 5),
-      textLength: (section.textContent || '').length,
-      textHash: simpleDiagnosticHash(section.textContent || '')
-    };
-  }
-
-  function collectScrollContainerDiagnostics(anchor = null) {
-    const candidates = [];
-    const seen = new Set();
-    const summarizeLiteDescendants = (el) => {
-      try {
-        const sections = Array.from(el?.querySelectorAll?.(MESSAGE_SECTION_SELECTOR) || []);
-        const hiddenSections = sections.filter((section) => section.getAttribute?.(ROLLING_HIDE_ATTR) === 'true' || getComputedLayoutSummary(section).computedDisplay === 'none');
-        const visibleSections = sections.filter((section) => isRuntimeLayoutVisible(section));
-        return {
-          sectionDescendantCount: sections.length,
-          hiddenSectionDescendantCount: hiddenSections.length,
-          visibleSectionDescendantCount: visibleSections.length,
-          hiddenSectionLayoutLeakCount: hiddenSections.filter((section) => {
-            const layout = getComputedLayoutSummary(section);
-            return layout.computedDisplay !== 'none' || Number(layout.offsetHeight || 0) > 0 || Number(layout.clientRectCount || 0) > 0;
-          }).length
-        };
-      } catch (error) {
-        return { error: error instanceof Error ? error.message : String(error) };
-      }
-    };
-    const add = (el, reason) => {
-      if (!el || seen.has(el)) return;
-      seen.add(el);
-      const layout = getComputedLayoutSummary(el);
-      const scrollish = Number(layout.scrollHeight || 0) > Number(layout.clientHeight || 0) + 8
-        || ['auto', 'scroll'].includes(String(layout.overflowY || '').toLowerCase());
-      candidates.push({
-        reason,
-        tag: String(el.tagName || '').toLowerCase(),
-        id: el.id || '',
-        dataTestId: el.getAttribute?.('data-testid') || null,
-        role: el.getAttribute?.('role') || null,
-        className: typeof el.className === 'string' ? el.className.split(/\s+/).filter(Boolean).slice(0, 14).join(' ') : '',
-        scrollish,
-        scrollBurdenScore: Number(layout.verticalOverflowPx || 0) + Math.max(0, Number(layout.scrollWidth || 0) - Number(layout.clientWidth || 0)),
-        liteDescendants: summarizeLiteDescendants(el),
-        layout: {
-          computedDisplay: layout.computedDisplay,
-          position: layout.position,
-          overflowY: layout.overflowY,
-          contentVisibility: layout.contentVisibility,
-          contain: layout.contain,
-          rect: layout.rect,
-          offsetHeight: layout.offsetHeight,
-          clientHeight: layout.clientHeight,
-          scrollHeight: layout.scrollHeight,
-          scrollTop: layout.scrollTop,
-          maxScrollTop: layout.maxScrollTop,
-          verticalOverflowPx: layout.verticalOverflowPx,
-          clientWidth: layout.clientWidth,
-          scrollWidth: layout.scrollWidth
-        }
-      });
-    };
-    add(document.documentElement, 'documentElement');
-    add(document.body, 'body');
-    for (const selector of ['main', '[role="main"]', 'div[class*="thread"]', 'div[class*="scroll"]']) {
-      try {
-        for (const el of Array.from(document.querySelectorAll(selector)).slice(0, 8)) add(el, `selector:${selector}`);
-      } catch {}
-    }
-    let node = anchor;
-    for (let depth = 0; node && depth < 10; depth += 1) {
-      add(node, `anchorAncestor:${depth}`);
-      node = node.parentElement;
-    }
-    return candidates.filter((item) => item.scrollish || ['documentElement', 'body'].includes(item.reason)).slice(0, 24);
-  }
-
-  function collectLiteRuntimeLayoutDiagnostics(plan = null) {
-    try {
-      const records = plan?.model?.physicalRecords || collectMessageSectionModel(document).physicalRecords || [];
-      const hiddenRecords = records.filter((record) => record.section?.getAttribute?.(ROLLING_HIDE_ATTR) === 'true');
-      const retainedRecords = records.filter((record) => record.section?.getAttribute?.(ROLLING_HIDE_ATTR) !== 'true');
-      const runtimeVisibleRecords = records.filter((record) => isRuntimeLayoutVisible(record.section));
-      const computedDisplayNoneRecords = records.filter((record) => getComputedLayoutSummary(record.section).computedDisplay === 'none');
-      const hiddenButLayoutRecords = hiddenRecords.filter((record) => {
-        const layout = getComputedLayoutSummary(record.section);
-        return layout.computedDisplay !== 'none' || Number(layout.offsetHeight || 0) > 0 || Number(layout.clientRectCount || 0) > 0;
-      });
-      const retainedButInvisibleRecords = retainedRecords.filter((record) => !isRuntimeLayoutVisible(record.section));
-      const anchor = (runtimeVisibleRecords.at?.(-1) || retainedRecords.at?.(-1) || records.at?.(-1))?.section || null;
-      const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
-      const documentLayout = {
-        scrollY: Math.round(window.scrollY || 0),
-        innerWidth: window.innerWidth || 0,
-        innerHeight: viewportHeight,
-        body: getComputedLayoutSummary(document.body),
-        documentElement: getComputedLayoutSummary(document.documentElement)
-      };
-      return {
-        summary: {
-          totalSectionCount: records.length,
-          arcaiaHiddenAttrCount: hiddenRecords.length,
-          retainedAttrCount: retainedRecords.length,
-          runtimeVisibleSectionCount: runtimeVisibleRecords.length,
-          computedDisplayNoneCount: computedDisplayNoneRecords.length,
-          hiddenButStillHasLayoutCount: hiddenButLayoutRecords.length,
-          retainedButRuntimeInvisibleCount: retainedButInvisibleRecords.length,
-          viewportIntersectingSectionCount: records.filter((record) => {
-            const rect = getComputedLayoutSummary(record.section)?.rect;
-            return Boolean(rect && rect.width > 0 && rect.height > 0 && rect.bottom >= 0 && rect.top <= viewportHeight);
-          }).length
-        },
-        documentLayout,
-        scrollContainers: collectScrollContainerDiagnostics(anchor),
-        runtimeVisibleSamples: runtimeVisibleRecords.slice(-12).map(summarizeSectionRuntimeLayout),
-        hiddenButStillHasLayoutSamples: hiddenButLayoutRecords.slice(0, 6).concat(hiddenButLayoutRecords.length > 12 ? hiddenButLayoutRecords.slice(-6) : hiddenButLayoutRecords.slice(6)).map(summarizeSectionRuntimeLayout),
-        retainedButRuntimeInvisibleSamples: retainedButInvisibleRecords.slice(-12).map(summarizeSectionRuntimeLayout),
-        firstSectionSamples: records.slice(0, 6).map(summarizeSectionRuntimeLayout),
-        lastSectionSamples: records.slice(-12).map(summarizeSectionRuntimeLayout)
-      };
-    } catch (error) {
-      return { error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-  function getElementDocumentOrderIndex(el, selector = '[data-message-author-role]') {
-    try {
-      const nodes = Array.from(document.querySelectorAll(selector));
-      return nodes.indexOf(el);
-    } catch {
-      return -1;
-    }
-  }
-
-  function summarizeRoleNodeForTurnDiagnostics(roleNode, index) {
-    const role = roleNode?.getAttribute?.('data-message-author-role') || null;
-    const container = getLiteMessageContainer(roleNode);
-    const article = roleNode?.closest?.('article') || null;
-    const turnContainer = roleNode?.closest?.('[data-testid^="conversation-turn-"]') || article || container;
-    const messageIdNode = roleNode?.closest?.('[data-message-id]') || roleNode?.querySelector?.('[data-message-id]') || container?.querySelector?.('[data-message-id]') || null;
-    const text = roleNode?.textContent || '';
-    const containerText = container?.textContent || '';
-    return {
-      sequenceIndex: index,
-      documentOrderIndex: getElementDocumentOrderIndex(roleNode),
-      role,
-      dataMessageId: messageIdNode?.getAttribute?.('data-message-id') || roleNode?.getAttribute?.('data-message-id') || null,
-      roleNode: getElementDiagnosticFingerprint(roleNode),
-      roleNodeParentChain: getElementParentChainDiagnostics(roleNode, 7),
-      container: summarizeLiteContainerForLog(container),
-      containerFingerprint: getElementDiagnosticFingerprint(container),
-      turnContainerFingerprint: getElementDiagnosticFingerprint(turnContainer),
-      articleFingerprint: getElementDiagnosticFingerprint(article),
-      textLength: text.length,
-      textHash: simpleDiagnosticHash(text),
-      containerTextLength: containerText.length,
-      containerTextHash: simpleDiagnosticHash(containerText),
-      hasEditableDescendant: Boolean(roleNode?.querySelector?.('[contenteditable="true"], textarea, input')),
-      hiddenByRolling: Boolean(container?.getAttribute?.(ROLLING_HIDE_ATTR) === 'true' || roleNode?.closest?.(`[${ROLLING_HIDE_ATTR}="true"]`)),
-      preview: makeTextPreview(text, 80)
-    };
-  }
-
-  function collectRoleNodeSequenceDiagnostics(root = document, limit = 80) {
-    const queryRoot = root?.querySelectorAll ? root : document;
-    const roleNodes = Array.from(queryRoot.querySelectorAll('[data-message-author-role="user"], [data-message-author-role="assistant"]'))
-      .filter((el) => el && el.isConnected && !el.closest?.(`#${LITE_BAR_ID}`));
-    const entries = roleNodes.map((node, index) => summarizeRoleNodeForTurnDiagnostics(node, index));
-    return {
-      totalRoleNodeCount: entries.length,
-      userRoleNodeCount: entries.filter((e) => e.role === 'user').length,
-      assistantRoleNodeCount: entries.filter((e) => e.role === 'assistant').length,
-      firstEntries: entries.slice(0, 12),
-      recentEntries: entries.slice(-limit)
-    };
-  }
-
-  function getTurnBoundarySummaryFromRoleEntries(entries = [], turns = []) {
-    const anomalies = [];
-    const consecutiveSameRole = [];
-    for (let i = 1; i < entries.length; i += 1) {
-      if (entries[i]?.role && entries[i]?.role === entries[i - 1]?.role) {
-        const item = { index: i, role: entries[i].role, previousIndex: i - 1 };
-        consecutiveSameRole.push(item);
-        anomalies.push({ type: `consecutive_${entries[i].role}_roles`, ...item });
-      }
-    }
-    const assistantBeforeFirstUser = entries.findIndex((e) => e.role === 'assistant') !== -1
-      && entries.findIndex((e) => e.role === 'assistant') < entries.findIndex((e) => e.role === 'user');
-    if (assistantBeforeFirstUser) anomalies.push({ type: 'assistant_before_first_user' });
-
-    const userOnlyTurns = [];
-    const assistantOnlyTurns = [];
-    const multiContainerTurns = [];
-    turns.forEach((turn, index) => {
-      const turnNumber = index + 1;
-      if (turn?.hasUser && !turn?.hasAssistant) userOnlyTurns.push(turnNumber);
-      if (!turn?.hasUser && turn?.hasAssistant) assistantOnlyTurns.push(turnNumber);
-      if ((turn?.containers || []).length > 2) multiContainerTurns.push({ turnNumber, containerCount: turn.containers.length });
-    });
-    if (userOnlyTurns.length) anomalies.push({ type: 'user_only_turns', turnNumbers: userOnlyTurns.slice(-12), count: userOnlyTurns.length });
-    if (assistantOnlyTurns.length) anomalies.push({ type: 'assistant_only_turns', turnNumbers: assistantOnlyTurns.slice(-12), count: assistantOnlyTurns.length });
-    if (multiContainerTurns.length) anomalies.push({ type: 'multi_container_turns', samples: multiContainerTurns.slice(-12), count: multiContainerTurns.length });
-
-    const duplicateContainerIndexes = [];
-    const seen = new Map();
-    entries.forEach((entry, index) => {
-      const key = entry?.container?.messageId || entry?.containerFingerprint?.textHash || `${entry?.containerFingerprint?.tag}:${entry?.containerFingerprint?.attrs?.['data-testid'] || ''}:${entry?.containerFingerprint?.textLength || 0}`;
-      if (!key) return;
-      if (seen.has(key)) duplicateContainerIndexes.push({ firstIndex: seen.get(key), index, role: entry.role, key: String(key).slice(0, 120) });
-      else seen.set(key, index);
-    });
-    if (duplicateContainerIndexes.length) anomalies.push({ type: 'duplicate_container_role_entries', samples: duplicateContainerIndexes.slice(-12), count: duplicateContainerIndexes.length });
-
-    return {
-      roleNodeCount: entries.length,
-      turnCount: turns.length,
-      userRoleNodeCount: entries.filter((e) => e.role === 'user').length,
-      assistantRoleNodeCount: entries.filter((e) => e.role === 'assistant').length,
-      consecutiveSameRoleCount: consecutiveSameRole.length,
-      consecutiveSameRoleSamples: consecutiveSameRole.slice(-12),
-      userOnlyTurnCount: userOnlyTurns.length,
-      userOnlyTurnNumbers: userOnlyTurns.slice(-12),
-      assistantOnlyTurnCount: assistantOnlyTurns.length,
-      assistantOnlyTurnNumbers: assistantOnlyTurns.slice(-12),
-      multiContainerTurnCount: multiContainerTurns.length,
-      assistantBeforeFirstUser,
-      anomalyCount: anomalies.length,
-      anomalies: anomalies.slice(-20)
-    };
-  }
-
-  function collectTurnBoundaryDiagnostics(allTurns = null) {
-    const turns = Array.isArray(allTurns) ? allTurns : buildDomTurnsFromConversation();
-    const sequence = collectRoleNodeSequenceDiagnostics(document, 80);
-    const entries = sequence.recentEntries || [];
-    const fullRoleNodes = Array.from(document.querySelectorAll('[data-message-author-role="user"], [data-message-author-role="assistant"]'))
-      .filter((el) => el && el.isConnected && !el.closest?.(`#${LITE_BAR_ID}`));
-    const fullEntriesForSummary = fullRoleNodes.map((node, index) => summarizeRoleNodeForTurnDiagnostics(node, index));
-    const summary = getTurnBoundarySummaryFromRoleEntries(fullEntriesForSummary, turns);
-    return {
-      appVersion: APP_VERSION,
-      collectedAtIso: nowIso(),
-      note: 'HTML全文ではなく、turn判定に必要なDOM要素の属性・親チェーン・順序・表示状態・短いtext hash/previewを記録します。AI回答中のフォローアップ送信でturn境界が崩れる場合は consecutive_* / user_only_turns / duplicate_container_role_entries を確認してください。',
-      summary,
-      roleSequence: sequence,
-      currentTurnGrouping: turns.slice(-20).map((turn, index) => summarizeLiteTurnForLog(turn, Math.max(1, turns.length - Math.min(20, turns.length) + index + 1))),
-      groupingAlgorithm: {
-        strategy: LITE_GROUPING_STRATEGY,
-        description: `${MESSAGE_SECTION_SELECTOR} のuser-started groupは診断専用です。通常Liteの保持判定はDOM順の直近3 user-started turnで行います。`,
-        knownRisk: 'ChatGPTの仮想化でmessage section自体が一時的にDOMから外れる場合は検出件数が変動しますが、毎回現在DOMへreconcileします。'
-      }
-    };
-  }
-
-  function getTurnBoundarySummaryForSnapshot() {
-    try {
-      const turns = buildDomTurnsFromConversation();
-      const roleNodes = Array.from(document.querySelectorAll('[data-message-author-role="user"], [data-message-author-role="assistant"]'))
-        .filter((el) => el && el.isConnected && !el.closest?.(`#${LITE_BAR_ID}`));
-      const entries = roleNodes.map((node, index) => summarizeRoleNodeForTurnDiagnostics(node, index));
-      return getTurnBoundarySummaryFromRoleEntries(entries, turns);
-    } catch (error) {
-      return { error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-  function getLitePruneDiagnosticSnapshot(label = 'snapshot') {
-    const generationDetector = isLikelyChatGPTGenerating();
-    const plan = buildLiteGroupingPlan(document, getEffectiveLiteTurnCount(), generationDetector.generating);
-    const turns = plan.groups.map((group) => ({
-      containers: group.records.map((record) => record.section),
-      hasUser: group.hasUser,
-      hasAssistant: group.hasAssistant,
-      kind: group.kind
-    }));
-    const visibleTurns = getVisibleDomTurnsFromConversation();
-    const grouping = getLiteGroupingDiagnostics(plan);
-    return {
-      label,
-      at: Date.now(),
-      atIso: nowIso(),
-      documentReadyState: document.readyState,
-      mainExists: Boolean(document.querySelector('main')),
-      turnCount: turns.length,
-      visibleTurnCount: visibleTurns.length,
-      ...grouping,
-      roleNodeCounts: getRoleNodeCountsForLite(),
-      turnBoundarySummary: getTurnBoundarySummaryForSnapshot(),
-      selectorCounts: {
-        conversationRoles: document.querySelectorAll('[data-message-author-role]').length,
-        userRoles: document.querySelectorAll('[data-message-author-role="user"]').length,
-        assistantRoles: document.querySelectorAll('[data-message-author-role="assistant"]').length,
-        sections: document.querySelectorAll('section').length,
-        main: document.querySelectorAll('main').length,
-        pre: document.querySelectorAll('pre').length,
-        code: document.querySelectorAll('pre code').length
-      },
-      scroll: {
-        y: Math.round(window.scrollY || 0),
-        bodyScrollHeight: document.body?.scrollHeight || 0,
-        documentScrollHeight: document.documentElement?.scrollHeight || 0
-      },
-      lastTurns: turns.slice(-8).map((turn, idx) => summarizeLiteTurnForLog(turn, Math.max(1, turns.length - Math.min(8, turns.length) + idx + 1)))
-    };
-  }
-
   function isHistorySearchNavigationUrl(value = window.location.href) {
     try {
       const url = new URL(String(value || ''), window.location.origin);
@@ -6275,7 +5777,6 @@
     try {
       const currentConversationId = tryExtractConversationIdFromUrl(window.location.href);
       if (!currentConversationId) {
-        setPromptTocHiddenActive(false);
         unhideRollingLiteContainers();
         clearObsoleteRestoredHistoryElements();
         const bar = document.getElementById(LITE_BAR_ID);
@@ -6299,7 +5800,6 @@
       }
 
       if (isHistorySearchNavigationUrl()) {
-        setPromptTocHiddenActive(false);
         unhideRollingLiteContainers();
         clearObsoleteRestoredHistoryElements();
         const bar = document.getElementById(LITE_BAR_ID);
@@ -6323,7 +5823,6 @@
       rollingLiteState.enabled = Boolean(lite?.enabled);
       rollingLiteState.conversationId = currentConversationId;
       if (!lite?.enabled) {
-        setPromptTocHiddenActive(false);
         unhideRollingLiteContainers();
         clearObsoleteRestoredHistoryElements();
         const bar = document.getElementById(LITE_BAR_ID);
@@ -6341,7 +5840,6 @@
         writeFullLoadModeToStorage(fullLoadModeState);
       }
       if (fullLoadModeState.active && fullLoadModeState.conversationId === currentConversationId) {
-        setPromptTocHiddenActive(false);
         unhideRollingLiteContainers();
         const fullPlan = buildLiteGroupingPlan(document, NATIVE_LITE_TURN_COUNT, false);
         const turns = fullPlan.groups.map((group) => ({
@@ -6399,7 +5897,7 @@
       }
 
       const generationDetector = isLikelyChatGPTGenerating();
-      const turnCount = getEffectiveLiteTurnCount(currentConversationId);
+      const turnCount = getConfiguredLiteTurnCount();
       const plan = buildLiteGroupingPlan(document, turnCount, generationDetector.generating);
       const turns = plan.groups.map((group) => ({
         containers: group.records.map((record) => record.section),
@@ -6408,7 +5906,6 @@
         kind: group.kind
       }));
       if (shouldNoopLiteForShortConversation(plan, turnCount)) {
-        setPromptTocHiddenActive(false);
         unhideRollingLiteContainers();
         clearObsoleteRestoredHistoryElements();
         const groupingDiagnostics = getLiteGroupingDiagnostics(plan);
@@ -6447,7 +5944,6 @@
         return rollingLiteState;
       }
 
-      setPromptTocHiddenActive(true);
       updateLiteBar(lite);
 
       if (lite?.backendRewriteEnabled) {
@@ -6494,7 +5990,6 @@
       }
 
       const reconcileResult = reconcileRollingLiteSections(plan);
-      const promptTocPruneResult = { action: 'css_hide_all_prompt_toc_markers' };
       const groupingDiagnostics = getLiteGroupingDiagnostics(plan, reconcileResult);
       const newlyHiddenContainerCount = reconcileResult.newlyHiddenSectionCount;
       const removedContainerCount = reconcileResult.removedSectionCount || 0;
@@ -6534,7 +6029,6 @@
           reachedTarget,
           pruneMode: 'css_hide',
           retainedTurnRange,
-          promptTocPrune: promptTocPruneResult,
           ...groupingDiagnostics,
           elapsedMs: Date.now() - applyStartedAt
         },
@@ -6551,8 +6045,7 @@
         beforeDetectedTurnCount: turns.length,
         retainedTurnCount: groupingDiagnostics.retainedSectionCount,
         retainedTurnRange,
-        turnCountSetting: turnCount,
-        promptTocPrune: promptTocPruneResult
+        turnCountSetting: turnCount
       };
       updateLiteBar(lite, rollingLiteState);
       return rollingLiteState;
@@ -6675,6 +6168,11 @@
   function handleConversationDomMutations(mutations) {
     if (!conversationDomObserverStarted || !isArcaiaExtensionEnabled()) return;
     handleConversationDependentDomSignal('conversation_dom_mutation');
+    if (longAnswerJumpUiStarted) scheduleLongAnswerJumpUpdate();
+    if (isArcaiaFeatureEnabled('toolHistoryCompaction')) {
+      scheduleToolHistoryCompactionForMutations(mutations);
+      if (toolHistoryPayloadSummaryIndex) applyToolHistoryPayloadSummaryIndex(toolHistoryPayloadSummaryIndex, 'conversation_dom_mutation');
+    }
     if (codeBlockCollapserUiStarted && isArcaiaFeatureEnabled('blockCollapser')) {
       const roots = collectBlockCollapserMutationRoots(mutations);
       if (roots.size > 0) {
@@ -6691,12 +6189,25 @@
 
   function reconcileConversationDomFeatures(root, reason = 'content_root_ready') {
     if (!(root instanceof Element) || !isArcaiaExtensionEnabled()) return;
+    if (longAnswerJumpUiStarted) scheduleLongAnswerJumpUpdate();
+    if (isArcaiaFeatureEnabled('toolHistoryCompaction')) {
+      installToolHistoryHideStyle();
+      if (toolHistoryPayloadSummaryIndex) applyToolHistoryPayloadSummaryIndex(toolHistoryPayloadSummaryIndex, reason);
+      if (toolHistoryHydrationReady) {
+        queueToolHistorySectionSweep(root, 'summary', reason);
+        scheduleToolHistoryHardPrune(reason);
+      }
+    }
     if (codeBlockCollapserUiStarted && isArcaiaFeatureEnabled('blockCollapser')) scanCodeBlocksForCollapse(root);
     if (turnExportUiStarted && isArcaiaFeatureEnabled('turnMarkdownButtons')) {
       installTurnExportButtons(root);
       installTurnExportInteractionTriggers(root);
     }
-    if (messageTimeUiStarted && isArcaiaFeatureEnabled('messageTimestamps')) scheduleApplyMessageTimestamps(reason);
+    if (messageTimeUiStarted
+      && isArcaiaFeatureEnabled('messageTimestamps')
+      && String(reason || '').startsWith('content_root_rebound:')) {
+      scheduleApplyAllMessageTimestamps(reason);
+    }
     if (rollingLiteUiStarted) scheduleRollingLiteApply(reason);
   }
 
@@ -6779,8 +6290,14 @@
   let pageConversationPendingDomSync = null;
   let pageConversationPendingDomObserver = null;
   let pageConversationPendingDomObserverTarget = null;
+  let pageConversationPendingDomObserverTimer = null;
+  const PAGE_CONVERSATION_PENDING_DOM_TIMEOUT_MS = 30000;
 
   function disconnectPageConversationPendingDomObserver() {
+    if (pageConversationPendingDomObserverTimer) {
+      clearTimeout(pageConversationPendingDomObserverTimer);
+      pageConversationPendingDomObserverTimer = null;
+    }
     try { pageConversationPendingDomObserver?.disconnect?.(); } catch {}
     pageConversationPendingDomObserver = null;
     pageConversationPendingDomObserverTarget = null;
@@ -6791,12 +6308,14 @@
     const modelTrigger = composer?.querySelector?.('button[aria-haspopup="menu"]') || null;
     const shareButton = findNativeShareButton();
     const header = shareButton?.closest?.('header') || document.querySelector('header');
+    const contentRoot = findRollingLiteContentRoot();
     return {
       composer: composer instanceof Element ? composer : null,
       modelTrigger: modelTrigger instanceof Element ? modelTrigger : null,
       header: header instanceof Element ? header : null,
       shareButton: shareButton instanceof Element ? shareButton : null,
-      actionsContainer: shareButton?.parentElement instanceof Element ? shareButton.parentElement : null
+      actionsContainer: shareButton?.parentElement instanceof Element ? shareButton.parentElement : null,
+      contentRoot: contentRoot instanceof Element ? contentRoot : null
     };
   }
 
@@ -6806,7 +6325,8 @@
       && left.modelTrigger === right.modelTrigger
       && left.header === right.header
       && left.shareButton === right.shareButton
-      && left.actionsContainer === right.actionsContainer;
+      && left.actionsContainer === right.actionsContainer
+      && left.contentRoot === right.contentRoot;
   }
 
   function isConversationDependentDomIdentityReady(identity) {
@@ -6821,6 +6341,33 @@
     return modelReady && headerReady;
   }
 
+  function isConversationDependentContentRootRequired() {
+    return [
+      'blockCollapser',
+      'toolHistoryCompaction',
+      'turnMarkdownButtons',
+      'messageTimestamps',
+      'liteView'
+    ].some((featureKey) => isArcaiaFeatureEnabled(featureKey));
+  }
+
+  function isConversationToNewChatComposerReady(identity, pending) {
+    return Boolean(
+      pending?.newChatTransitionFromConversation
+      && identity?.composer?.isConnected
+      && identity.composer !== pending.baselineIdentity?.composer
+    );
+  }
+
+  function isConversationDependentDomSyncComplete(identity) {
+    const pending = getCurrentConversationDependentDomSyncPending();
+    if (pending?.newChatTransitionFromConversation) {
+      return isConversationToNewChatComposerReady(identity, pending);
+    }
+    if (!isConversationDependentDomIdentityReady(identity)) return false;
+    return !isConversationDependentContentRootRequired() || Boolean(identity?.contentRoot?.isConnected);
+  }
+
   function getCurrentConversationDependentDomSyncPending() {
     const pending = pageConversationPendingDomSync;
     if (!pending) return null;
@@ -6833,7 +6380,7 @@
 
   function nodeContainsConversationDependentDomRoot(node) {
     if (!(node instanceof Element)) return false;
-    const selector = 'header, form[data-type="unified-composer"]';
+    const selector = `header, form[data-type="unified-composer"], ${MESSAGE_SECTION_SELECTOR}`;
     if (node.matches?.(selector)) return true;
     return Boolean(node.querySelector?.(selector));
   }
@@ -6851,7 +6398,8 @@
   function ensurePageConversationPendingDomObserver() {
     const pending = getCurrentConversationDependentDomSyncPending();
     if (
-      !pending?.conversationId
+      !pending
+      || (!pending.conversationId && !pending.newChatTransitionFromConversation)
       || !pageConversationMonitorStarted
       || !isArcaiaExtensionEnabled()
     ) {
@@ -6877,6 +6425,10 @@
       noteConversationDependentDomSyncSignal('pending_conversation_dom_mutation');
     });
     pageConversationPendingDomObserver.observe(target, { childList: true, subtree: true });
+    pageConversationPendingDomObserverTimer = setTimeout(() => {
+      if (getCurrentConversationDependentDomSyncPending()) pageConversationPendingDomSync = null;
+      disconnectPageConversationPendingDomObserver();
+    }, PAGE_CONVERSATION_PENDING_DOM_TIMEOUT_MS);
     return true;
   }
 
@@ -6889,13 +6441,16 @@
       ensurePageConversationPendingDomObserver();
       return current;
     }
+    disconnectPageConversationPendingDomObserver();
     pageConversationPendingDomSync = {
       pageUrl,
       conversationId,
       reason,
+      newChatTransitionFromConversation: Boolean(!conversationId && observedPageConversationId),
       baselineIdentity: getConversationDependentDomIdentity(),
       lastSignaledIdentity: null,
-      domSignalReceived: false
+      domSignalReceived: false,
+      mainWorldSynced: false
     };
     ensurePageConversationPendingDomObserver();
     return pageConversationPendingDomSync;
@@ -6905,7 +6460,10 @@
     const pending = getCurrentConversationDependentDomSyncPending();
     if (!pending) return false;
     const identity = getConversationDependentDomIdentity();
-    if (!isConversationDependentDomIdentityReady(identity)) return false;
+    if (
+      !isConversationToNewChatComposerReady(identity, pending)
+      && !isConversationDependentDomIdentityReady(identity)
+    ) return false;
     if (sameConversationDependentDomIdentity(identity, pending.baselineIdentity)) return false;
     if (sameConversationDependentDomIdentity(identity, pending.lastSignaledIdentity)) return false;
     pending.lastSignaledIdentity = identity;
@@ -6952,20 +6510,6 @@
     const previousConversationId = observedPageConversationId;
     const conversationChanged = previousConversationId !== nextConversationId;
     const urlChanged = observedPageUrl !== nextUrl;
-    const controlledRecentViewRoundTrip = Boolean(
-      recentViewRefreshState.active
-      && recentViewRefreshState.conversationId
-      && (
-        previousConversationId === recentViewRefreshState.conversationId
-        || nextConversationId === recentViewRefreshState.conversationId
-      )
-    );
-    const leavingExpandedConversation = Boolean(
-      conversationChanged
-      && previousConversationId
-      && previousConversationId === recentViewExpansionState?.conversationId
-      && !controlledRecentViewRoundTrip
-    );
     const pendingDomSync = getCurrentConversationDependentDomSyncPending();
     if (!conversationChanged && !urlChanged && !pendingDomSync?.domSignalReceived) return;
 
@@ -6983,14 +6527,14 @@
     pageConversationSyncInFlight = true;
     try {
       if (conversationChanged) {
+        closeRecentViewReadOnlyRenderer('conversation_changed', { restoreRecentView: false });
+        toolHistoryPayloadSummaryIndex = null;
+        clearToolHistoryPayloadSummaryAttributes(document);
         unhideRollingLiteContainers();
         clearObsoleteRestoredHistoryElements();
         removeRecentViewHistoryControls();
-        if (!controlledRecentViewRoundTrip) {
-          fullLoadModeState = { active: false, conversationId: null, requestedAt: null, reason: 'conversation_changed' };
-          writeFullLoadModeToStorage(fullLoadModeState);
-        }
-        if (leavingExpandedConversation) clearRecentViewExpansionState();
+        fullLoadModeState = { active: false, conversationId: null, requestedAt: null, reason: 'conversation_changed' };
+        writeFullLoadModeToStorage(fullLoadModeState);
         if (messageTimeUiStarted) {
           resetMessageTimeStateForConversation(nextConversationId);
           markInitialMessageTimeRoleNodes(getRoleNodesForTimestampBadges(), 'conversation_changed_initial_dom_snapshot');
@@ -6998,14 +6542,17 @@
         resetRollingLiteStateForConversation(nextConversationId);
       }
 
-      const mainWorldSync = await syncMainWorldConversation(1800, reason).catch((error) => ({
-        ok: false,
-        error: error instanceof Error ? error.message : String(error)
-      }));
-      if (leavingExpandedConversation) {
-        await resetRecentViewMainWorldOverride('conversation_changed_clear_recent_view_expansion').catch(() => null);
-      }
+      const shouldSyncMainWorld = conversationChanged || urlChanged || !pendingDomSync?.mainWorldSynced;
+      const mainWorldSync = shouldSyncMainWorld
+        ? await syncMainWorldConversation(1800, reason).catch((error) => ({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        }))
+        : null;
+      const currentPendingDomSync = getCurrentConversationDependentDomSyncPending();
+      if (currentPendingDomSync && mainWorldSync?.ok === true) currentPendingDomSync.mainWorldSynced = true;
       const cachedConversationModelConfig = mainWorldSync?.conversationModelConfig || null;
+      const cachedToolHistorySummaryIndex = mainWorldSync?.toolHistorySummaryIndex || null;
       const currentConversationIdAfterSync = tryExtractConversationIdFromUrl(window.location.href);
       if (
         nextConversationId
@@ -7019,6 +6566,14 @@
           );
         } catch {}
       }
+      if (
+        isArcaiaFeatureEnabled('toolHistoryCompaction')
+        && nextConversationId
+        && currentConversationIdAfterSync === nextConversationId
+        && cachedToolHistorySummaryIndex?.conversationId === nextConversationId
+      ) {
+        applyToolHistoryPayloadSummaryIndex(cachedToolHistorySummaryIndex, 'main_world_conversation_cache_sync');
+      }
       try {
         window.__ARCAIA_MODEL_SELECTOR_UI__?.scan?.('conversation_state_sync_complete');
       } catch {}
@@ -7030,9 +6585,13 @@
       }
       refreshConversationDomObserverBindings(conversationChanged ? 'conversation_changed' : 'url_changed');
       syncHeaderMarkdownButtonUi(conversationChanged ? 'conversation_changed' : 'url_changed');
+      refreshFilePreviewCopyObserverBinding(conversationChanged ? 'conversation_changed' : 'url_changed');
       if (nextConversationId) {
-        scheduleApplyMessageTimestamps('conversation_changed_dom_first_observation');
-        scheduleRefreshMessageTimestampIndex('conversation_changed_existing_fetch_index');
+        scheduleApplyAllMessageTimestamps('conversation_changed_dom_first_observation');
+        scheduleRefreshMessageTimestampIndex('conversation_changed_existing_fetch_index', { applyAll: true });
+        if (isArcaiaFeatureEnabled('turnNumbers')) {
+          scheduleAbsoluteTurnIndex('conversation_changed', { refresh: true, cancelInFlight: true });
+        }
         scheduleRollingLiteApply('conversation_changed');
       } else {
         const bar = document.getElementById(LITE_BAR_ID);
@@ -7042,14 +6601,13 @@
       const completedPendingDomSync = getCurrentConversationDependentDomSyncPending();
       if (
         completedPendingDomSync?.domSignalReceived
-        && isConversationDependentDomIdentityReady(getConversationDependentDomIdentity())
+        && isConversationDependentDomSyncComplete(getConversationDependentDomIdentity())
       ) {
         pageConversationPendingDomSync = null;
         disconnectPageConversationPendingDomObserver();
       }
     } finally {
       pageConversationSyncInFlight = false;
-      signalRecentViewRefreshConditions();
       const pendingReason = pageConversationPendingSyncReason;
       pageConversationPendingSyncReason = null;
       if (
@@ -7065,6 +6623,7 @@
   function startPageConversationMonitor() {
     if (!isArcaiaExtensionEnabled() || pageConversationMonitorStarted || window.top !== window) return;
     pageConversationMonitorStarted = true;
+    markConversationDependentDomSyncPending('monitor_started');
     scheduleConversationDependentStateSync('monitor_started');
   }
 
@@ -7081,9 +6640,6 @@
   function startRollingLiteUi() {
     if (!isArcaiaExtensionEnabled()) return;
     installLiteDisplayStyles();
-    if (!(fullLoadModeState.active && fullLoadModeState.conversationId === tryExtractConversationIdFromUrl(window.location.href))) {
-      setPromptTocHiddenActive(true);
-    }
     rollingLiteUiStarted = true;
     startConversationDomObserver();
     refreshConversationDomObserverBindings('rolling_lite_startup');
@@ -7093,10 +6649,11 @@
 
   function stopRollingLiteUi() {
     rollingLiteUiStarted = false;
+    recentViewRefreshActive = false;
     rollingLiteApplyQueued = false;
     rollingLitePendingApplyReason = null;
     rollingLiteRolelessSectionState = new WeakMap();
-    setPromptTocHiddenActive(false);
+    closeRecentViewReadOnlyRenderer('rolling_lite_stopped', { restoreRecentView: false });
     removeRecentViewHistoryControls();
     removeRecentViewLoadingOverlay();
     removeRecentViewFailureNotice();
@@ -7564,11 +7121,6 @@
     return editButton.parentElement instanceof HTMLElement ? editButton.parentElement : outerBlock;
   }
 
-  function hasWritingEditButton(headerChrome) {
-    const buttons = Array.from(headerChrome.querySelectorAll('button'));
-    return buttons.some(isWritingEditButton);
-  }
-
   function processWritingBlockForCollapse(outerBlock) {
     if (!isArcaiaExtensionEnabled()) return;
     if (!(outerBlock instanceof HTMLElement)) return;
@@ -7741,41 +7293,6 @@
     } catch {}
   }
 
-  function countElementsInsideRoot(elements, root) {
-    if (!(root instanceof Node)) return 0;
-    return elements.filter((el) => el instanceof Node && (el === root || root.contains(el))).length;
-  }
-
-  function getBlockCollapserRootRelationshipDiagnostics(writingBlocks, codeOuters, codeViewers) {
-    const observerRoot = conversationDomObservedContentRoot instanceof HTMLElement ? conversationDomObservedContentRoot : null;
-    const currentRoot = document.querySelector('main') || document.body || document.documentElement;
-    const currentRootElement = currentRoot instanceof HTMLElement ? currentRoot : null;
-    const writingInsideObserver = countElementsInsideRoot(writingBlocks, observerRoot);
-    const codeInsideObserver = countElementsInsideRoot(codeOuters, observerRoot);
-    const codeViewerInsideObserver = countElementsInsideRoot(codeViewers, observerRoot);
-    const writingInsideCurrent = countElementsInsideRoot(writingBlocks, currentRootElement);
-    const codeInsideCurrent = countElementsInsideRoot(codeOuters, currentRootElement);
-    const codeViewerInsideCurrent = countElementsInsideRoot(codeViewers, currentRootElement);
-
-    return {
-      observerRootConnected: Boolean(observerRoot?.isConnected),
-      currentRootFound: Boolean(currentRootElement),
-      currentRootTagName: currentRootElement?.tagName?.toLowerCase?.() || null,
-      observerRootIsCurrentRoot: Boolean(observerRoot && currentRootElement && observerRoot === currentRootElement),
-      observerRootContainsCurrentRoot: Boolean(observerRoot && currentRootElement && observerRoot !== currentRootElement && observerRoot.contains(currentRootElement)),
-      currentRootContainsObserverRoot: Boolean(observerRoot && currentRootElement && observerRoot !== currentRootElement && currentRootElement.contains(observerRoot)),
-      writingBlockInsideObserverRootCount: writingInsideObserver,
-      writingBlockOutsideObserverRootCount: writingBlocks.length - writingInsideObserver,
-      codeOuterInsideObserverRootCount: codeInsideObserver,
-      codeOuterOutsideObserverRootCount: codeOuters.length - codeInsideObserver,
-      codeViewerInsideObserverRootCount: codeViewerInsideObserver,
-      codeViewerOutsideObserverRootCount: codeViewers.length - codeViewerInsideObserver,
-      writingBlockInsideCurrentRootCount: writingInsideCurrent,
-      codeOuterInsideCurrentRootCount: codeInsideCurrent,
-      codeViewerInsideCurrentRootCount: codeViewerInsideCurrent
-    };
-  }
-
   function startCodeBlockCollapserUi() {
     if (!isArcaiaExtensionEnabled()) return;
     codeBlockCollapserUiStarted = true;
@@ -7838,10 +7355,12 @@
     }
   ]);
   const PINNED_SORT_CONVERSATION_SELECTOR = 'a[data-sidebar-item="true"][href*="/c/"]';
+  const PINNED_SORT_PROJECT_BUTTON_SELECTOR = '[role="button"][data-sidebar-item="true"]';
   const PINNED_SORT_SECTION_SELECTOR = '.group\\/sidebar-expando-section';
   const PINNED_SORT_OBSERVER_ROOT_SELECTOR = '#stage-slideover-sidebar, nav[aria-label="チャット履歴"], nav[aria-label="Chat history"]';
   const PINNED_SORT_STATE_VERSION = 2;
   let pinnedSortState = loadPinnedSortState();
+  let pinnedSortProjectSidebarIndex = null;
   let pinnedFavoriteState = loadPinnedFavoriteState();
   let pinnedSortObserver = null;
   let pinnedSortObserverRoot = null;
@@ -7934,10 +7453,6 @@
     return id ? normalizePinnedFavoriteIconId(pinnedFavoriteState.icons?.[id]) : null;
   }
 
-  function isPinnedFavoriteId(id) {
-    return Boolean(getPinnedFavoriteIconId(id));
-  }
-
   function setPinnedFavoriteIconId(id, iconId) {
     if (!id) return;
     const icons = { ...(pinnedFavoriteState.icons || {}) };
@@ -7945,10 +7460,6 @@
     if (normalized) icons[id] = normalized;
     else delete icons[id];
     savePinnedFavoriteState({ icons });
-  }
-
-  function setPinnedFavoriteId(id, active) {
-    setPinnedFavoriteIconId(id, active ? PINNED_FAVORITE_DEFAULT_ICON_ID : null);
   }
 
   function injectPinnedSortStyles() {
@@ -8127,6 +7638,23 @@
     return li instanceof HTMLElement ? li : anchor;
   }
 
+  function isPinnedSortProjectItem(item) {
+    return item instanceof HTMLElement && Boolean(item.querySelector('[class~="group/project-unfurl-row"]'));
+  }
+
+  function getPinnedSortProjectTitle(item) {
+    const button = item?.querySelector?.(PINNED_SORT_PROJECT_BUTTON_SELECTOR);
+    if (!(button instanceof HTMLElement)) return '';
+    return normalizePinnedSortText(button.querySelector('span[dir="auto"]')?.textContent || button.querySelector('.truncate')?.textContent || button.textContent || '');
+  }
+
+  function getPinnedSortProjectIdForTitle(title) {
+    const normalized = normalizePinnedSortText(title);
+    if (!normalized) return null;
+    const matches = (pinnedSortProjectSidebarIndex?.projects || []).filter((project) => normalizePinnedSortText(project?.name) === normalized && String(project?.id || '').startsWith('g-p-'));
+    return matches.length === 1 ? matches[0].id : null;
+  }
+
   function collectPinnedSortRows(pinnedSection) {
     const rows = [];
     const seen = new Set();
@@ -8162,6 +7690,27 @@
     return rows;
   }
 
+  function collectPinnedSortProjectRows(nav) {
+    const rows = [];
+    const seen = new Set();
+    for (const item of Array.from(nav?.querySelectorAll?.('li') || [])) {
+      if (!(item instanceof HTMLElement) || !isPinnedSortProjectItem(item)) continue;
+      const title = getPinnedSortProjectTitle(item);
+      const id = getPinnedSortProjectIdForTitle(title);
+      const list = item.parentElement;
+      const dragHandle = item.querySelector(PINNED_SORT_PROJECT_BUTTON_SELECTOR);
+      if (!id || seen.has(id) || !(list instanceof HTMLElement) || !(dragHandle instanceof HTMLElement)) continue;
+      seen.add(id);
+      rows.push({ id, anchor: null, dragHandle, item, title, href: '', scopeKey: 'project-folders', scopeType: 'project-folder', projectId: id, list });
+    }
+    return rows;
+  }
+
+  function collectPinnedSortAllRows(pinnedSection, nav = getPinnedSortNav()) {
+    const chats = collectPinnedSortRows(pinnedSection);
+    return [...chats, ...collectPinnedSortProjectRows(nav)];
+  }
+
   function collectPinnedSortScopes(rows) {
     const scopes = [];
     for (const row of rows || []) {
@@ -8180,14 +7729,6 @@
       scope.rows.push(row);
     }
     return scopes;
-  }
-
-  function findPinnedSortListFromRows(rows, pinnedSection) {
-    for (const row of rows || []) {
-      const parent = row.item?.parentElement;
-      if (parent instanceof HTMLElement && pinnedSection?.contains?.(parent)) return parent;
-    }
-    return null;
   }
 
   function getPinnedSortSavedOrder(scope) {
@@ -8276,15 +7817,15 @@
     return true;
   }
 
-  function applyPinnedSortSavedOrder(pinnedSection) {
-    const rows = collectPinnedSortRows(pinnedSection);
+  function applyPinnedSortSavedOrder(pinnedSection, nav = getPinnedSortNav()) {
+    const rows = collectPinnedSortAllRows(pinnedSection, nav);
     for (const scope of collectPinnedSortScopes(rows)) {
       const changed = applyPinnedSortScopeSavedOrder(scope);
       if (!changed) {
         pinnedSortLastAppliedOrderByScope.set(scope.key, scope.rows.map((row) => row.id));
       }
     }
-    return collectPinnedSortRows(pinnedSection);
+    return collectPinnedSortAllRows(pinnedSection, nav);
   }
 
   function saveCurrentPinnedSortOrder(scope) {
@@ -8317,10 +7858,6 @@
       changed = true;
     }
     if (changed || (pinnedSortState.legacyOrder || []).length) savePinnedSortState({ orders });
-  }
-
-  function escapePinnedFavoriteHtml(value) {
-    return String(value ?? '').replace(/[&<>"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[char] || char));
   }
 
   function pinnedFavoriteIconHtml(iconId) {
@@ -8497,7 +8034,8 @@
 
   function clearPinnedSortDropIndicators(root = document) {
     getPinnedSortDropMarker()?.remove();
-    for (const target of root.querySelectorAll('.arcaia-pinned-sort-drop-active')) {
+    const indicatorRoot = root?.querySelectorAll ? root : document;
+    for (const target of indicatorRoot.querySelectorAll('.arcaia-pinned-sort-drop-active')) {
       target.classList.remove('arcaia-pinned-sort-drop-active');
     }
   }
@@ -8560,7 +8098,10 @@
   }
 
   function findPinnedSortRowById(pinnedSection, chatId, scopeKey) {
-    return collectPinnedSortRows(pinnedSection).find((row) => row.id === chatId && row.scopeKey === scopeKey) || null;
+    const rows = scopeKey === 'project-folders'
+      ? collectPinnedSortProjectRows(getPinnedSortNav())
+      : collectPinnedSortRows(pinnedSection);
+    return rows.find((row) => row.id === chatId && row.scopeKey === scopeKey) || null;
   }
 
   function shouldIgnorePinnedSortDragStartTarget(target) {
@@ -8606,8 +8147,8 @@
   }
 
   function bindPinnedSortAnchor(row) {
-    const anchor = row.anchor;
-    if (!(anchor instanceof HTMLAnchorElement)) return;
+    const anchor = row.dragHandle || row.anchor;
+    if (!(anchor instanceof HTMLElement)) return;
     anchor.__arcaiaPinnedSortRow = row;
     if (!anchor.__arcaiaPinnedSortOriginalDraggable) {
       anchor.__arcaiaPinnedSortOriginalDraggable = {
@@ -8626,19 +8167,23 @@
         event.preventDefault();
         return;
       }
-      const id = extractPinnedSortConversationId(anchor.href);
+      const id = latestRow.scopeType === 'project-folder'
+        ? latestRow.id
+        : extractPinnedSortConversationId(anchor.href);
       if (!id) return;
       const dragRow = {
         ...latestRow,
         id,
-        title: cleanPinnedSortTitle(
-          anchor.querySelector('span[dir="auto"]')?.textContent
-            || anchor.querySelector('.truncate')?.getAttribute('title')
-            || anchor.getAttribute('aria-label')
-            || anchor.textContent
-            || id
-        ),
-        href: anchor.getAttribute('href') || `/c/${id}`
+        title: latestRow.scopeType === 'project-folder'
+          ? latestRow.title
+          : cleanPinnedSortTitle(
+            anchor.querySelector('span[dir="auto"]')?.textContent
+              || anchor.querySelector('.truncate')?.getAttribute('title')
+              || anchor.getAttribute('aria-label')
+              || anchor.textContent
+              || id
+          ),
+        href: latestRow.scopeType === 'project-folder' ? '' : (anchor.getAttribute('href') || `/c/${id}`)
       };
       document.body?.classList?.add?.('arcaia-pinned-sort-dragging');
       setPinnedSortDragPayload(event, dragRow);
@@ -8778,9 +8323,23 @@
     list.setAttribute(PINNED_SORT_LIST_BOUND_ATTR, 'true');
   }
 
-  function bindPinnedSortRows(pinnedSection) {
-    const rows = collectPinnedSortRows(pinnedSection);
+  function unbindPinnedSortList(list) {
+    if (!(list instanceof HTMLElement)) return;
+    const handlers = list.__arcaiaPinnedSortHandlers;
+    if (handlers?.dragoverHandler) list.removeEventListener('dragover', handlers.dragoverHandler);
+    if (handlers?.dragleaveHandler) list.removeEventListener('dragleave', handlers.dragleaveHandler);
+    if (handlers?.dropHandler) list.removeEventListener('drop', handlers.dropHandler);
+    delete list.__arcaiaPinnedSortHandlers;
+    delete list.__arcaiaPinnedSortScope;
+    list.removeAttribute(PINNED_SORT_LIST_BOUND_ATTR);
+    list.classList.remove('arcaia-pinned-sort-drop-active');
+  }
+
+  function bindPinnedSortRows(pinnedSection, nav = getPinnedSortNav()) {
+    const rows = collectPinnedSortAllRows(pinnedSection, nav);
     const scopes = collectPinnedSortScopes(rows);
+    const scopeCountByList = new Map();
+    for (const scope of scopes) scopeCountByList.set(scope.list, (scopeCountByList.get(scope.list) || 0) + 1);
     for (const scope of scopes) {
       for (const row of scope.rows) {
         if (isArcaiaFeatureEnabled('pinnedIcons')) bindPinnedFavoriteIcon(row);
@@ -8789,7 +8348,8 @@
           bindPinnedSortItem(row, scope, pinnedSection);
         }
       }
-      if (isArcaiaFeatureEnabled('pinnedSort')) bindPinnedSortList(scope, pinnedSection);
+      if (isArcaiaFeatureEnabled('pinnedSort') && scopeCountByList.get(scope.list) === 1) bindPinnedSortList(scope, pinnedSection);
+      else if (scopeCountByList.get(scope.list) > 1) unbindPinnedSortList(scope.list);
     }
   }
 
@@ -8830,6 +8390,14 @@
     return Array.from(node.querySelectorAll(PINNED_SORT_SECTION_SELECTOR)).some(isPinnedSortSectionElement);
   }
 
+  function mutationNodeContainsPinnedSortProjectItem(node) {
+    if (!(node instanceof Element)) return false;
+    const items=[];
+    if (node.matches?.('li')) items.push(node);
+    for (const item of node.querySelectorAll?.('li') || []) items.push(item);
+    return items.some((item) => isPinnedSortProjectItem(item));
+  }
+
   function mutationNodeContainsPinnedSortConversationAnchor(node) {
     if (!(node instanceof Element)) return false;
     return node.matches(PINNED_SORT_CONVERSATION_SELECTOR)
@@ -8850,6 +8418,7 @@
       if (mutation.type !== 'childList') continue;
       const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
       if (changedNodes.some(mutationNodeContainsPinnedSortSection)) return true;
+      if (changedNodes.some(mutationNodeContainsPinnedSortProjectItem)) return true;
       const pinnedSection = getPinnedSortMutationSection(mutation.target);
       if (!(pinnedSection instanceof HTMLElement)) continue;
       if (changedNodes.some(mutationNodeContainsPinnedSortConversationAnchor)) return true;
@@ -8889,15 +8458,16 @@
     const nav = getPinnedSortNav();
     if (!(nav instanceof HTMLElement)) return;
     const pinnedSection = findPinnedSortSection(nav);
-    if (!(pinnedSection instanceof HTMLElement)) {
-      releasePinnedSortGate(`no_pinned_section:${reason}`);
+    const projectRows = collectPinnedSortProjectRows(nav);
+    if (!(pinnedSection instanceof HTMLElement) && !projectRows.length) {
+      releasePinnedSortGate(`no_sortable_sidebar_rows:${reason}`);
       return;
     }
-    const rowsBeforeApply = collectPinnedSortRows(pinnedSection);
+    const rowsBeforeApply = collectPinnedSortAllRows(pinnedSection, nav);
     const rows = isArcaiaFeatureEnabled('pinnedSort')
-      ? applyPinnedSortSavedOrder(pinnedSection)
+      ? applyPinnedSortSavedOrder(pinnedSection, nav)
       : rowsBeforeApply;
-    bindPinnedSortRows(pinnedSection);
+    bindPinnedSortRows(pinnedSection, nav);
     if (isArcaiaFeatureEnabled('pinnedSort')) ensurePinnedSortScopeOrders(rows);
     releasePinnedSortGate(`pinned_sort_applied:${reason}`);
   }
@@ -8905,6 +8475,7 @@
   function startPinnedSortUi() {
     if (!isArcaiaExtensionEnabled()) return;
     injectPinnedSortStyles();
+    void refreshPinnedSortProjectSidebarIndex('startup');
     scanPinnedSortUi('startup');
     if (!pinnedSortStartupBurstScheduled) {
       pinnedSortStartupBurstScheduled = true;
@@ -8993,6 +8564,113 @@
       list.removeAttribute(PINNED_SORT_LIST_BOUND_ATTR);
     }
     releasePinnedSortGate(`pinned_sort_stopped:${reason}`);
+  }
+
+  const ARCAIA_NATIVE_TOOLTIP_ID = 'arcaia-native-tooltip';
+  const ARCAIA_TOOLTIP_TEXT_ATTR = 'data-arcaia-tooltip-text';
+  const ARCAIA_TOOLTIP_DELAY_MS = 200;
+  const ARCAIA_TOOLTIP_GAP_PX = 8;
+  const ARCAIA_TOOLTIP_VIEWPORT_MARGIN_PX = 8;
+  const arcaiaTooltipButtons = new WeakSet();
+  let arcaiaTooltipOpenTimer = null;
+  let arcaiaTooltipTrigger = null;
+
+  function getArcaiaTooltipPosition(triggerRect, tooltipRect, viewportWidth, viewportHeight) {
+    const topSpace = triggerRect.top - ARCAIA_TOOLTIP_VIEWPORT_MARGIN_PX;
+    const side = topSpace >= tooltipRect.height + ARCAIA_TOOLTIP_GAP_PX ? 'top' : 'bottom';
+    const unclampedTop = side === 'top'
+      ? triggerRect.top - ARCAIA_TOOLTIP_GAP_PX - tooltipRect.height
+      : triggerRect.bottom + ARCAIA_TOOLTIP_GAP_PX;
+    const maxLeft = Math.max(
+      ARCAIA_TOOLTIP_VIEWPORT_MARGIN_PX,
+      viewportWidth - ARCAIA_TOOLTIP_VIEWPORT_MARGIN_PX - tooltipRect.width
+    );
+    const maxTop = Math.max(
+      ARCAIA_TOOLTIP_VIEWPORT_MARGIN_PX,
+      viewportHeight - ARCAIA_TOOLTIP_VIEWPORT_MARGIN_PX - tooltipRect.height
+    );
+    return {
+      side,
+      left: Math.round(Math.min(
+        Math.max(triggerRect.left + triggerRect.width / 2 - tooltipRect.width / 2, ARCAIA_TOOLTIP_VIEWPORT_MARGIN_PX),
+        maxLeft
+      )),
+      top: Math.round(Math.min(Math.max(unclampedTop, ARCAIA_TOOLTIP_VIEWPORT_MARGIN_PX), maxTop))
+    };
+  }
+
+  function positionArcaiaTooltip(button, tooltip) {
+    if (!(button instanceof Element) || !(tooltip instanceof Element)) return;
+    const position = getArcaiaTooltipPosition(
+      button.getBoundingClientRect(),
+      tooltip.getBoundingClientRect(),
+      window.innerWidth,
+      window.innerHeight
+    );
+    tooltip.dataset.side = position.side;
+    tooltip.style.left = `${position.left}px`;
+    tooltip.style.top = `${position.top}px`;
+  }
+
+  function clearArcaiaTooltipOpenTimer() {
+    if (arcaiaTooltipOpenTimer) clearTimeout(arcaiaTooltipOpenTimer);
+    arcaiaTooltipOpenTimer = null;
+  }
+
+  function hideArcaiaTooltip() {
+    clearArcaiaTooltipOpenTimer();
+    arcaiaTooltipTrigger?.removeAttribute?.('aria-describedby');
+    arcaiaTooltipTrigger = null;
+    document.getElementById(ARCAIA_NATIVE_TOOLTIP_ID)?.remove?.();
+  }
+
+  function showArcaiaTooltip(button) {
+    if (!(button instanceof Element) || !button.isConnected) return;
+    const text = String(button.getAttribute(ARCAIA_TOOLTIP_TEXT_ATTR) || '').trim();
+    if (!text) return;
+    hideArcaiaTooltip();
+    const tooltip = document.createElement('div');
+    tooltip.id = ARCAIA_NATIVE_TOOLTIP_ID;
+    tooltip.setAttribute('role', 'tooltip');
+    tooltip.setAttribute('data-state', 'delayed-open');
+    tooltip.setAttribute('data-align', 'center');
+    tooltip.className = 'pointer-events-none fixed z-50 transition-opacity select-none px-2 py-1 rounded-lg overflow-hidden dark:border-token-border-tooltip dark:border dark bg-token-bg-tooltip max-w-xs';
+    tooltip.textContent = text;
+    document.body.appendChild(tooltip);
+    arcaiaTooltipTrigger = button;
+    button.setAttribute('aria-describedby', ARCAIA_NATIVE_TOOLTIP_ID);
+    positionArcaiaTooltip(button, tooltip);
+  }
+
+  function scheduleArcaiaTooltip(button) {
+    hideArcaiaTooltip();
+    arcaiaTooltipOpenTimer = setTimeout(() => {
+      arcaiaTooltipOpenTimer = null;
+      if (button?.isConnected && (button.matches(':hover') || document.activeElement === button)) {
+        showArcaiaTooltip(button);
+      }
+    }, ARCAIA_TOOLTIP_DELAY_MS);
+  }
+
+  function setArcaiaTooltipText(button, text) {
+    if (!(button instanceof Element)) return;
+    button.setAttribute(ARCAIA_TOOLTIP_TEXT_ATTR, String(text || ''));
+    if (arcaiaTooltipTrigger !== button) return;
+    const tooltip = document.getElementById(ARCAIA_NATIVE_TOOLTIP_ID);
+    if (!tooltip?.isConnected) return;
+    tooltip.textContent = String(text || '');
+    positionArcaiaTooltip(button, tooltip);
+  }
+
+  function installArcaiaTooltip(button, text) {
+    if (!(button instanceof Element)) return;
+    setArcaiaTooltipText(button, text);
+    if (arcaiaTooltipButtons.has(button)) return;
+    arcaiaTooltipButtons.add(button);
+    button.addEventListener('pointerenter', () => scheduleArcaiaTooltip(button));
+    button.addEventListener('pointerleave', hideArcaiaTooltip);
+    button.addEventListener('focus', () => scheduleArcaiaTooltip(button));
+    button.addEventListener('blur', hideArcaiaTooltip);
   }
 
   const TURN_EXPORT_BUTTON_ATTR = 'data-arcaia-turn-export-button';
@@ -9206,9 +8884,9 @@
     const button = event.currentTarget;
     if (!button || button.disabled) return;
 
-    const originalTitle = button.title;
+    const originalTooltip = button.getAttribute(ARCAIA_TOOLTIP_TEXT_ATTR) || 'Arcaia: このTurnをMarkdown保存';
     button.disabled = true;
-    button.title = 'Arcaia: 保存中...';
+    setArcaiaTooltipText(button, 'Arcaia: 保存中...');
 
     try {
       const copyButton = button.__arcaiaCopyButton || button.previousElementSibling || button.parentElement;
@@ -9229,12 +8907,12 @@
       );
       const filename = `${makeSingleTurnExportName(result, turn)}.md`;
       downloadText(filename, markdown, 'text/markdown;charset=utf-8');
-      button.title = `Arcaia: Turn ${turn.turnIndex + 1}/${result.turnCount || result.turns?.length || 1} を保存しました`;
-      setTimeout(() => { if (button.isConnected) button.title = originalTitle; }, 1800);
+      setArcaiaTooltipText(button, `Arcaia: Turn ${turn.turnIndex + 1}/${result.turnCount || result.turns?.length || 1} を保存しました`);
+      setTimeout(() => { if (button.isConnected) setArcaiaTooltipText(button, originalTooltip); }, 1800);
     } catch (error) {
       console.warn('[Arcaia] single turn export failed', error);
-      button.title = `Arcaia: 保存失敗 - ${error instanceof Error ? error.message : String(error)}`;
-      setTimeout(() => { if (button.isConnected) button.title = originalTitle; }, 2600);
+      setArcaiaTooltipText(button, `Arcaia: 保存失敗 - ${error instanceof Error ? error.message : String(error)}`);
+      setTimeout(() => { if (button.isConnected) setArcaiaTooltipText(button, originalTooltip); }, 2600);
     } finally {
       button.disabled = false;
     }
@@ -9246,7 +8924,7 @@
     button.className = 'arcaia-turn-export-button text-token-text-secondary hover:bg-token-surface-hover rounded-lg';
     button.setAttribute(TURN_EXPORT_BUTTON_ATTR, 'true');
     button.setAttribute('aria-label', 'ArcaiaでこのTurnをMarkdown保存');
-    button.title = 'Arcaia: このTurnをMarkdown保存';
+    installArcaiaTooltip(button, 'Arcaia: このTurnをMarkdown保存');
     button.innerHTML = turnExportIconHtml();
     button.__arcaiaCopyButton = copyButton;
     button.addEventListener('click', handleSingleTurnExportClick, true);
@@ -9355,7 +9033,10 @@
     const addedCopyButtons = getAddedTurnCopyButtonsFromMutations(mutations);
     if (addedCopyButtons.length) {
       installTurnExportButtons(conversationDomObservedContentRoot, addedCopyButtons);
-      scheduleApplyMessageTimestamps('assistant_toolbar_ready');
+      const assistantRoleNodes = addedCopyButtons
+        .map((button) => button.closest?.('[data-message-author-role="assistant"]'))
+        .filter(Boolean);
+      scheduleApplyMessageTimestampsForNodes(assistantRoleNodes, 'assistant_toolbar_ready');
     }
     const addedStreamErrorRetryButtons = getAddedChatGPTStreamErrorRetryButtonsFromMutations(mutations);
     for (const retryButton of addedStreamErrorRetryButtons) {
@@ -9378,6 +9059,7 @@
 
   function stopTurnExportUi() {
     turnExportUiStarted = false;
+    hideArcaiaTooltip();
     if (turnExportInteractionHandler && turnExportInteractionRoot) {
       turnExportInteractionRoot.removeEventListener('pointerover', turnExportInteractionHandler, true);
       turnExportInteractionRoot.removeEventListener('focusin', turnExportInteractionHandler, true);
@@ -9391,12 +9073,13 @@
   }
 
   const HEADER_MARKDOWN_BUTTON_ID = 'arcaia-header-markdown-button';
-  const HEADER_MARKDOWN_CONTENT_VERSION = 'download-icon-v1';
+  const HEADER_MARKDOWN_CONTENT_VERSION = 'lucide-file-down-v5';
+  const HEADER_MARKDOWN_TOOLTIP = 'Arcaia: このチャットの全ログをMarkdownでダウンロード';
   let headerMarkdownObserver = null;
   let headerMarkdownObserverTarget = null;
   let headerMarkdownObserverSubtree = false;
 
-  function createHeaderMarkdownDownloadIcon() {
+  function createHeaderMarkdownFileDownIcon() {
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('width', '20');
     svg.setAttribute('height', '20');
@@ -9409,9 +9092,20 @@
     svg.setAttribute('aria-hidden', 'true');
     svg.classList.add('icon');
 
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    path.setAttribute('d', 'M12 3v12m0 0 4-4m-4 4-4-4M5 21h14a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2');
-    svg.appendChild(path);
+    // Lucide `file-down` icon, distributed under the ISC License.
+    const documentPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    documentPath.setAttribute('d', 'M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z');
+
+    const foldPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    foldPath.setAttribute('d', 'M14 2v5a1 1 0 0 0 1 1h5');
+
+    const arrowStemPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    arrowStemPath.setAttribute('d', 'M12 18v-6');
+
+    const arrowHeadPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    arrowHeadPath.setAttribute('d', 'm9 15 3 3 3-3');
+
+    svg.append(documentPath, foldPath, arrowStemPath, arrowHeadPath);
     return svg;
   }
 
@@ -9419,7 +9113,7 @@
     button.replaceChildren();
     const wrapper = document.createElement('div');
     wrapper.className = shareButton?.firstElementChild?.className || 'flex w-full items-center justify-center';
-    wrapper.appendChild(createHeaderMarkdownDownloadIcon());
+    wrapper.appendChild(createHeaderMarkdownFileDownIcon());
     button.appendChild(wrapper);
     button.dataset.arcaiaContentVersion = HEADER_MARKDOWN_CONTENT_VERSION;
   }
@@ -9439,11 +9133,39 @@
     }) || null;
   }
 
+  function resolveHeaderMarkdownPlacement(shareButton) {
+    if (!(shareButton instanceof Element)) return null;
+    const header = shareButton.closest?.('header');
+    if (!(header instanceof Element)) return null;
+
+    const layoutCandidates = [];
+    let current = shareButton.parentElement;
+    while (current instanceof Element && current !== header) {
+      const display = getComputedStyle(current).display;
+      if (['flex', 'inline-flex', 'grid', 'inline-grid'].includes(display)) {
+        let shareActionRoot = shareButton;
+        while (shareActionRoot.parentElement && shareActionRoot.parentElement !== current) {
+          shareActionRoot = shareActionRoot.parentElement;
+        }
+        if (shareActionRoot.parentElement === current) {
+          layoutCandidates.push({ container: current, shareActionRoot });
+        }
+      }
+      current = current.parentElement;
+    }
+
+    return layoutCandidates.find((candidate) => candidate.shareActionRoot !== shareButton)
+      || layoutCandidates[0]
+      || (shareButton.parentElement instanceof Element
+        ? { container: shareButton.parentElement, shareActionRoot: shareButton }
+        : null);
+  }
+
   function findHeaderMarkdownObserverBinding() {
     const shareButton = findNativeShareButton();
-    const actionsContainer = shareButton?.parentElement;
-    if (actionsContainer instanceof Element) {
-      return { target: actionsContainer, subtree: false };
+    const placement = resolveHeaderMarkdownPlacement(shareButton);
+    if (placement?.container instanceof Element) {
+      return { target: placement.container, subtree: true };
     }
     const existing = document.getElementById(HEADER_MARKDOWN_BUTTON_ID);
     const existingActionsContainer = existing?.parentElement;
@@ -9458,18 +9180,22 @@
   }
 
   function ensureHeaderMarkdownButton() {
-    if (!isArcaiaNormalMode() || window.top !== window) return null;
+    if (!isArcaiaNormalMode() || window.top !== window || document.readyState !== 'complete') return null;
     const shareButton = findNativeShareButton();
-    const parent = shareButton?.parentElement;
-    if (!shareButton || !parent) return null;
+    const placement = resolveHeaderMarkdownPlacement(shareButton);
+    const parent = placement?.container;
+    const shareActionRoot = placement?.shareActionRoot;
+    if (!shareButton || !parent || !shareActionRoot) return null;
     const existing = document.getElementById(HEADER_MARKDOWN_BUTTON_ID);
     if (existing?.isConnected) {
       existing.className = shareButton.className;
+      existing.removeAttribute('title');
+      installArcaiaTooltip(existing, HEADER_MARKDOWN_TOOLTIP);
       if (existing.dataset.arcaiaContentVersion !== HEADER_MARKDOWN_CONTENT_VERSION) {
         renderHeaderMarkdownButtonContent(existing, shareButton);
       }
-      if (existing.parentElement !== parent || existing.nextElementSibling !== shareButton) {
-        parent.insertBefore(existing, shareButton);
+      if (existing.parentElement !== parent || existing.nextElementSibling !== shareActionRoot) {
+        parent.insertBefore(existing, shareActionRoot);
       }
       return existing;
     }
@@ -9477,9 +9203,9 @@
     button.id = HEADER_MARKDOWN_BUTTON_ID;
     button.type = 'button';
     button.className = shareButton.className;
-    button.title = 'Arcaia: このチャットの全ログをMarkdownでダウンロード';
     button.setAttribute('aria-label', '全ログをMarkdownでダウンロード');
     button.setAttribute('data-testid', 'arcaia-header-markdown-button');
+    installArcaiaTooltip(button, HEADER_MARKDOWN_TOOLTIP);
     renderHeaderMarkdownButtonContent(button, shareButton);
     button.addEventListener('click', async (event) => {
       event.preventDefault();
@@ -9491,7 +9217,7 @@
         button.disabled = false;
       }
     }, true);
-    parent.insertBefore(button, shareButton);
+    parent.insertBefore(button, shareActionRoot);
     return button;
   }
 
@@ -9535,15 +9261,274 @@
 
   function startHeaderMarkdownButtonUi() {
     if (!isArcaiaNormalMode() || window.top !== window) return;
+    if (document.readyState !== 'complete') {
+      window.addEventListener('load', handleHeaderMarkdownWindowLoad, { once: true });
+    }
     syncHeaderMarkdownButtonUi('startup_after_settings_sync');
   }
 
+  function handleHeaderMarkdownWindowLoad() {
+    requestAnimationFrame(() => syncHeaderMarkdownButtonUi('window_load_after_hydration'));
+  }
+
   function stopHeaderMarkdownButtonUi() {
+    window.removeEventListener('load', handleHeaderMarkdownWindowLoad);
     try { headerMarkdownObserver?.disconnect?.(); } catch {}
     headerMarkdownObserver = null;
     headerMarkdownObserverTarget = null;
     headerMarkdownObserverSubtree = false;
     try { document.getElementById(HEADER_MARKDOWN_BUTTON_ID)?.remove?.(); } catch {}
+  }
+
+  const FILE_PREVIEW_STAGE_SELECTOR = '[data-testid="stage-thread-flyout"]';
+  const FILE_PREVIEW_PANEL_SELECTOR = 'section[data-testid="screen-threadFlyOut"]';
+  const FILE_PREVIEW_COPY_BUTTON_ATTR = 'data-arcaia-file-preview-copy-button';
+  const FILE_PREVIEW_COPY_RESET_MS = 2000;
+  const FILE_PREVIEW_OPEN_TIMEOUT_MS = 3000;
+  const FILE_PREVIEW_MARKDOWN_EXTENSIONS = new Set(['md', 'markdown', 'mdx']);
+  let filePreviewCopyUiStarted = false;
+  let filePreviewStageObserver = null;
+  let filePreviewStageObserverTarget = null;
+  let filePreviewBootstrapObserver = null;
+  let filePreviewBootstrapTimer = null;
+  let filePreviewCopyResetTimer = null;
+
+  function createFilePreviewCopyIcon() {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('width', '20');
+    svg.setAttribute('height', '20');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '2');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('aria-hidden', 'true');
+    const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    rect.setAttribute('width', '14');
+    rect.setAttribute('height', '14');
+    rect.setAttribute('x', '8');
+    rect.setAttribute('y', '8');
+    rect.setAttribute('rx', '2');
+    rect.setAttribute('ry', '2');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', 'M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2');
+    svg.append(rect, path);
+    return svg;
+  }
+
+  function createFilePreviewCheckIcon() {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('width', '20');
+    svg.setAttribute('height', '20');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '2');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', 'M20 6 9 17l-5-5');
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function renderFilePreviewCopyButtonState(button, copied = false) {
+    if (!(button instanceof Element)) return;
+    button.replaceChildren(copied ? createFilePreviewCheckIcon() : createFilePreviewCopyIcon());
+    button.setAttribute('aria-label', copied ? 'コピーしました' : 'プレビュー内容をコピー');
+    button.dataset.arcaiaCopied = copied ? 'true' : 'false';
+    setArcaiaTooltipText(button, copied ? 'コピーしました' : 'コピー');
+  }
+
+  function showFilePreviewCopySuccess(button) {
+    if (filePreviewCopyResetTimer) clearTimeout(filePreviewCopyResetTimer);
+    renderFilePreviewCopyButtonState(button, true);
+    filePreviewCopyResetTimer = setTimeout(() => {
+      filePreviewCopyResetTimer = null;
+      if (button?.isConnected) renderFilePreviewCopyButtonState(button, false);
+    }, FILE_PREVIEW_COPY_RESET_MS);
+  }
+
+  function getFilePreviewFilenameExtension(panel) {
+    if (!(panel instanceof Element)) return '';
+    const panelRect = panel.getBoundingClientRect();
+    const walker = document.createTreeWalker(panel, NodeFilter.SHOW_TEXT);
+    let current = walker.nextNode();
+    while (current) {
+      const text = String(current.nodeValue || '').trim();
+      const parent = current.parentElement;
+      if (text && text.length <= 180 && parent instanceof Element && !parent.closest('.ProseMirror')) {
+        const rect = parent.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0 && rect.top < panelRect.top + 48) {
+          const match = text.match(/\.([a-z0-9][a-z0-9_-]{0,15})$/i);
+          if (match?.[1]) return match[1].toLowerCase();
+        }
+      }
+      current = walker.nextNode();
+    }
+    return '';
+  }
+
+  function getFilePreviewEditor(panel) {
+    if (!(panel instanceof Element)) return null;
+    return panel.querySelector('.ProseMirror, textarea, pre, code');
+  }
+
+  function isFilePreviewCodeLike(editor, extension) {
+    if (!(editor instanceof Element)) return false;
+    if (extension && !FILE_PREVIEW_MARKDOWN_EXTENSIONS.has(extension)) return true;
+    if (editor.matches('textarea, pre, code')) return true;
+    if (!editor.classList.contains('markdown')) return true;
+    const children = Array.from(editor.children || []).filter((child) => String(child.textContent || '').trim());
+    return children.length > 0 && children.every((child) => {
+      if (child.matches('pre, code')) return true;
+      return child.children.length === 1 && child.firstElementChild?.matches?.('pre, code');
+    });
+  }
+
+  function getFilePreviewCopyPayload(panel) {
+    const editor = getFilePreviewEditor(panel);
+    if (!(editor instanceof Element)) return null;
+    const extension = getFilePreviewFilenameExtension(panel);
+    const codeLike = isFilePreviewCodeLike(editor, extension);
+    const text = codeLike
+      ? getContentMarkdown().extractFilePreviewRawText(editor)
+      : getContentMarkdown().serializeFilePreviewMarkdown(editor);
+    if (!text) return null;
+    return { text, format: codeLike ? (extension || 'text') : 'markdown' };
+  }
+
+  async function writeFilePreviewClipboardText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {}
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand('copy');
+    textarea.remove();
+    return copied;
+  }
+
+  function findVisibleFilePreviewPanel() {
+    return Array.from(document.querySelectorAll(FILE_PREVIEW_PANEL_SELECTOR)).find((panel) => (
+      panel instanceof Element
+      && panel.getClientRects().length > 0
+      && panel.querySelector('button[data-testid="close-button"]')
+    )) || null;
+  }
+
+  function ensureFilePreviewCopyButton() {
+    if (!filePreviewCopyUiStarted || !isArcaiaNormalMode()) return null;
+    const panel = findVisibleFilePreviewPanel();
+    const existing = document.querySelector(`[${FILE_PREVIEW_COPY_BUTTON_ATTR}="true"]`);
+    if (!(panel instanceof Element) || !getFilePreviewEditor(panel)) {
+      existing?.remove?.();
+      return null;
+    }
+    const closeButton = panel.querySelector('button[data-testid="close-button"]');
+    const toolbar = closeButton?.parentElement;
+    if (!(toolbar instanceof Element)) return null;
+    const nativeButton = Array.from(toolbar.querySelectorAll(':scope > button')).find((button) => (
+      button !== closeButton && button.getAttribute(FILE_PREVIEW_COPY_BUTTON_ATTR) !== 'true'
+    )) || closeButton;
+    if (existing?.isConnected) {
+      existing.className = nativeButton.className;
+      installArcaiaTooltip(existing, existing.dataset.arcaiaCopied === 'true' ? 'コピーしました' : 'コピー');
+      if (existing.parentElement !== toolbar || existing.nextElementSibling !== nativeButton) toolbar.insertBefore(existing, nativeButton);
+      return existing;
+    }
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = nativeButton.className;
+    button.setAttribute(FILE_PREVIEW_COPY_BUTTON_ATTR, 'true');
+    renderFilePreviewCopyButtonState(button, false);
+    installArcaiaTooltip(button, 'コピー');
+    button.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const payload = getFilePreviewCopyPayload(panel);
+      if (!payload) return;
+      button.disabled = true;
+      try {
+        const copied = await writeFilePreviewClipboardText(payload.text);
+        if (copied) showFilePreviewCopySuccess(button);
+      } finally {
+        button.disabled = false;
+      }
+    }, true);
+    toolbar.insertBefore(button, nativeButton);
+    return button;
+  }
+
+  function disconnectFilePreviewBootstrapObserver() {
+    if (filePreviewBootstrapTimer) clearTimeout(filePreviewBootstrapTimer);
+    filePreviewBootstrapTimer = null;
+    try { filePreviewBootstrapObserver?.disconnect?.(); } catch {}
+    filePreviewBootstrapObserver = null;
+  }
+
+  function ensureFilePreviewBootstrapObserver() {
+    if (!filePreviewCopyUiStarted || filePreviewBootstrapObserver || document.querySelector(FILE_PREVIEW_STAGE_SELECTOR)) return;
+    const target = document.documentElement;
+    if (!(target instanceof Element)) return;
+    filePreviewBootstrapObserver = new MutationObserver(() => {
+      if (!document.querySelector(FILE_PREVIEW_STAGE_SELECTOR)) return;
+      disconnectFilePreviewBootstrapObserver();
+      refreshFilePreviewCopyObserverBinding('stage_added');
+    });
+    filePreviewBootstrapObserver.observe(target, { childList: true, subtree: true });
+    filePreviewBootstrapTimer = setTimeout(disconnectFilePreviewBootstrapObserver, FILE_PREVIEW_OPEN_TIMEOUT_MS);
+  }
+
+  function handleFilePreviewPotentialOpenClick(event) {
+    if (!filePreviewCopyUiStarted || document.querySelector(FILE_PREVIEW_STAGE_SELECTOR)) return;
+    const target = event.target instanceof Element ? event.target.closest('button, a, [role="button"]') : null;
+    if (target) ensureFilePreviewBootstrapObserver();
+  }
+
+  function refreshFilePreviewCopyObserverBinding(reason = 'refresh') {
+    if (!filePreviewCopyUiStarted || !isArcaiaNormalMode()) return false;
+    const stage = document.querySelector(FILE_PREVIEW_STAGE_SELECTOR);
+    if (stage !== filePreviewStageObserverTarget) {
+      try { filePreviewStageObserver?.disconnect?.(); } catch {}
+      filePreviewStageObserver = null;
+      filePreviewStageObserverTarget = stage instanceof Element ? stage : null;
+      if (filePreviewStageObserverTarget) {
+        disconnectFilePreviewBootstrapObserver();
+        filePreviewStageObserver = new MutationObserver(ensureFilePreviewCopyButton);
+        filePreviewStageObserver.observe(filePreviewStageObserverTarget, { childList: true, subtree: true });
+      }
+    }
+    ensureFilePreviewCopyButton();
+    return Boolean(filePreviewStageObserverTarget);
+  }
+
+  function startFilePreviewCopyUi() {
+    if (!isArcaiaNormalMode() || window.top !== window) return;
+    if (!filePreviewCopyUiStarted) document.addEventListener('click', handleFilePreviewPotentialOpenClick, true);
+    filePreviewCopyUiStarted = true;
+    refreshFilePreviewCopyObserverBinding('startup');
+  }
+
+  function stopFilePreviewCopyUi() {
+    filePreviewCopyUiStarted = false;
+    if (filePreviewCopyResetTimer) clearTimeout(filePreviewCopyResetTimer);
+    filePreviewCopyResetTimer = null;
+    hideArcaiaTooltip();
+    document.removeEventListener('click', handleFilePreviewPotentialOpenClick, true);
+    disconnectFilePreviewBootstrapObserver();
+    try { filePreviewStageObserver?.disconnect?.(); } catch {}
+    filePreviewStageObserver = null;
+    filePreviewStageObserverTarget = null;
+    for (const button of document.querySelectorAll(`[${FILE_PREVIEW_COPY_BUTTON_ATTR}="true"]`)) button.remove();
   }
 
   function startArcaiaPageUi() {
@@ -9556,10 +9541,16 @@
     if (window.top !== window) return;
     if (isArcaiaFeatureEnabled('ctrlEnterSend')) startCtrlEnterSendUi();
     if (isArcaiaFeatureEnabled('modelDecoration')) {
+      try { window.__ARCAIA_MODEL_SELECTOR_UI__?.setVisualStyle?.(featureSettings.modelDecorationStyle); } catch {}
       try { window.__ARCAIA_MODEL_SELECTOR_UI__?.start?.(); } catch {}
     }
     if (isArcaiaFeatureEnabled('blockCollapser')) startCodeBlockCollapserUi();
+    if (isArcaiaFeatureEnabled('toolHistoryCompaction')) {
+      installToolHistoryHideStyle();
+      scheduleToolHistoryHydrationRelease('startup');
+    }
     startPageConversationMonitor();
+    startLongAnswerJumpUi();
     if (isArcaiaFeatureEnabled('loadingTitle') || isArcaiaFeatureEnabled('completionSound') || isArcaiaFeatureEnabled('liteView')) {
       startAssistantLoadingFaviconMonitor();
     }
@@ -9571,10 +9562,11 @@
     }
     if (isArcaiaFeatureEnabled('turnMarkdownButtons')) startTurnExportUi();
     if (isArcaiaFeatureEnabled('headerMarkdownButton')) startHeaderMarkdownButtonUi();
+    startFilePreviewCopyUi();
     if (isArcaiaFeatureEnabled('messageTimestamps')) startMessageTimestampUi();
     if (isArcaiaFeatureEnabled('liteView')) {
       startRollingLiteUi();
-      void runLiteDisplayEnable({
+      void syncLiteDisplayForStartup({
         requestedBy: 'feature_settings_startup',
         liteShowImages: featureSettings.liteImages,
         commandId: 'feature_settings_startup'
@@ -9673,110 +9665,6 @@
   }
 
 
-  function summarizeSelectorForDiagnostics(selector, root = document) {
-    try {
-      const nodes = Array.from(root.querySelectorAll(selector));
-      return {
-        selector,
-        count: nodes.length,
-        samples: nodes.slice(0, 5).map((node) => ({
-          tag: String(node.tagName || '').toLowerCase(),
-          id: node.id || '',
-          className: typeof node.className === 'string' ? node.className.split(/\s+/).filter(Boolean).slice(0, 12).join(' ') : '',
-          role: node.getAttribute?.('role') || null,
-          dataMessageAuthorRole: node.getAttribute?.('data-message-author-role') || null,
-          dataTestId: node.getAttribute?.('data-testid') || null,
-          textLength: (node.textContent || '').length
-        }))
-      };
-    } catch (error) {
-      return { selector, count: null, error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-
-  function getIframeDiagnosticsForBundle() {
-    const legacyIframe = document.getElementById(LEGACY_NATIVE_SNAPSHOT_IFRAME_ID);
-    return {
-      exists: Boolean(legacyIframe),
-      legacyOnly: true,
-      note: 'v0.1.60では独自復元ビュー/Native Snapshot iframeは廃止済みです。残骸があれば起動時に削除します。'
-    };
-  }
-
-  function getDomDiagnosticsForBundle() {
-    const generationDetector = isLikelyChatGPTGenerating();
-    const groupingPlan = buildLiteGroupingPlan(document, getEffectiveLiteTurnCount(), generationDetector.generating);
-    const groupingDiagnostics = getLiteGroupingDiagnostics(groupingPlan);
-    const allTurns = groupingPlan.groups.map((group) => ({
-      containers: group.records.map((record) => record.section),
-      hasUser: group.hasUser,
-      hasAssistant: group.hasAssistant,
-      kind: group.kind
-    }));
-    const visibleTurns = getVisibleDomTurnsFromConversation();
-    const hiddenByRolling = Array.from(document.querySelectorAll(`[${ROLLING_HIDE_ATTR}="true"]`));
-    const conversationId = tryExtractConversationIdFromUrl(window.location.href);
-    const selectors = [
-      '[data-message-author-role]',
-      '[data-message-author-role="user"]',
-      '[data-message-author-role="assistant"]',
-      MESSAGE_SECTION_SELECTOR,
-      'article',
-      'main',
-      'pre',
-      'pre code',
-      `[${ROLLING_HIDE_ATTR}="true"]`,
-    ].map((selector) => summarizeSelectorForDiagnostics(selector));
-    return {
-      readyState: document.readyState,
-      title: document.title,
-      urlRedacted: redactSnapshotUrl(window.location.href),
-      conversationId,
-      isTopFrame: window.top === window,
-      viewport: {
-        innerWidth: window.innerWidth,
-        innerHeight: window.innerHeight,
-        devicePixelRatio: window.devicePixelRatio || 1,
-        scrollY: Math.round(window.scrollY || 0),
-        bodyScrollHeight: document.body?.scrollHeight || 0,
-        documentScrollHeight: document.documentElement?.scrollHeight || 0
-      },
-      allTurnCount: allTurns.length,
-      visibleTurnCount: visibleTurns.length,
-      hiddenByRollingCount: hiddenByRolling.length,
-      generationDetector,
-      ...groupingDiagnostics,
-      liteGrouping: groupingDiagnostics,
-      roleNodeCounts: getRoleNodeCountsForLite(),
-      turnBoundaryDiagnostics: collectTurnBoundaryDiagnostics(allTurns),
-      litePruneState: {
-        rollingDetectedTurnCount: rollingLiteState.detectedTurnCount ?? null,
-        rollingVisibleTurnCount: rollingLiteState.visibleTurnCount ?? null,
-        rollingRetainedTurnCount: rollingLiteState.retainedTurnCount ?? null,
-        rollingHiddenContainerCount: rollingLiteState.hiddenContainerCount ?? null,
-        rollingRemovedContainerCount: rollingLiteState.removedContainerCount ?? 0,
-        pruneMode: rollingLiteState.pruneMode || null,
-        rollingLastSkipReason: rollingLiteState.lastSkipReason || null,
-        diagnosticTurnMismatch: typeof rollingLiteState.visibleTurnCount === 'number' ? visibleTurns.length !== rollingLiteState.visibleTurnCount : null
-      },
-      turnSamples: allTurns.slice(-8).map((turn, index) => ({
-        sampleIndexFromEnd: allTurns.length - Math.min(8, allTurns.length) + index + 1,
-        role: turn.role || null,
-        textLength: (turn.text || '').length,
-        containerCount: turn.containers?.length || 0,
-        firstContainer: turn.containers?.[0] ? {
-          tag: String(turn.containers[0].tagName || '').toLowerCase(),
-          className: typeof turn.containers[0].className === 'string' ? turn.containers[0].className.split(/\s+/).filter(Boolean).slice(0, 14).join(' ') : '',
-          hiddenByRolling: turn.containers[0].getAttribute?.(ROLLING_HIDE_ATTR) === 'true',
-          display: turn.containers[0].style?.display || ''
-        } : null
-      })),
-      selectors,
-      iframe: getIframeDiagnosticsForBundle()
-    };
-  }
-
   function getToolbarOperationDeps() {
     return {
       appVersion: APP_VERSION,
@@ -9819,7 +9707,7 @@
         operationMode,
         featureSettings
       }),
-      AICE_LITE_DISPLAY_LOAD_FULL_ONCE: async () => loadFullConversationInPlace('popup_load_full_lite_off', { disableLite: true }),
+      AICE_LITE_DISPLAY_LOAD_FULL_ONCE: async () => showFullConversationReadOnly('popup_load_full_lite_off'),
       AICE_TOOLBAR_SAVE_MARKDOWN: async () => startToolbarMarkdownSaveFromPopup(),
       AICE_ASSISTANT_LOADING_FAVICON_STATUS: async () => getAssistantLoadingFaviconStatus(),
       AICE_GET_LATEST_ANSWER_SCREENSHOT_TARGET: async () => getLatestAnswerScreenshotTarget(),

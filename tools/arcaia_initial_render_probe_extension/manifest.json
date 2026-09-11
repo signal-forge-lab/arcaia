@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Arcaia Initial Render Probe",
+  "version": "1.0.0",
+  "description": "Records privacy-safe initial render timing for ChatGPT and Arcaia UI.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*"
+  ],
+  "action": {
+    "default_title": "Arcaia Initial Render Probe",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "probe.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}
